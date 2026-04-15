@@ -53,7 +53,7 @@ APP_TITLE = "Flowgrid"
 CONFIG_FILENAME = "Flowgrid_config.json"
 DEPOT_DB_FILENAME = "Flowgrid_depot.db"
 SHARED_SYNC_REFRESH_INTERVAL_MS = 15000
-MIN_PYTHON_VERSION = (3, 8, 0)
+MIN_PYTHON_VERSION = (3, 10, 0)
 _CLI_FLAGS = {str(arg or "").strip().lower() for arg in sys.argv[1:] if str(arg or "").strip()}
 _INSTALLER_FLAGS_ACTIVE = bool({"--install", "--create-shortcut"} & _CLI_FLAGS)
 
@@ -1204,7 +1204,9 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStyle,
     QStyleOptionTab,
+    QStyleOptionViewItem,
     QStylePainter,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTabBar,
@@ -2007,13 +2009,192 @@ def _run_installer_mode(*, launch_after_install: bool) -> int:
     return 0
 
 
-def _can_start_window_drag(root: QWidget, local_pos: QPoint) -> bool:
+def _submission_latest_ts_sql(alias: str = "") -> str:
+    prefix = f"{str(alias).strip()}." if str(alias).strip() else ""
+    return f"COALESCE(NULLIF(TRIM({prefix}updated_at), ''), {prefix}created_at)"
+
+
+def _submission_entry_date_sql(alias: str = "") -> str:
+    prefix = f"{str(alias).strip()}." if str(alias).strip() else ""
+    return f"COALESCE(NULLIF(TRIM({prefix}entry_date), ''), SUBSTR({_submission_latest_ts_sql(alias)}, 1, 10))"
+
+
+def _split_piped_values(text: str) -> list[str]:
+    raw = str(text or "")
+    if raw == "":
+        return []
+    return [str(piece or "").strip() for piece in raw.split(" | ")]
+
+
+def _merged_part_detail_rows(
+    lpn_text: str,
+    part_number_text: str,
+    part_description_text: str,
+    shipping_text: str,
+) -> list[tuple[str, str, str, str]]:
+    lpn_values = _split_piped_values(lpn_text)
+    part_values = _split_piped_values(part_number_text)
+    desc_values = _split_piped_values(part_description_text)
+    ship_values = _split_piped_values(shipping_text)
+    row_count = max(len(lpn_values), len(part_values), len(desc_values), len(ship_values), 0)
+
+    def value_for(values: list[str], idx: int) -> str:
+        if idx < len(values):
+            return str(values[idx] or "").strip()
+        if len(values) == 1 and row_count > 1:
+            return str(values[0] or "").strip()
+        return ""
+
+    rows: list[tuple[str, str, str, str]] = []
+    for idx in range(row_count):
+        rows.append(
+            (
+                value_for(lpn_values, idx),
+                value_for(part_values, idx),
+                value_for(desc_values, idx),
+                value_for(ship_values, idx),
+            )
+        )
+    return rows
+
+
+def _serialize_part_detail_rows(rows: list[tuple[str, str, str, str]]) -> tuple[str, str, str, str]:
+    cleaned = [
+        (
+            str(row[0] or "").strip(),
+            str(row[1] or "").strip(),
+            str(row[2] or "").strip(),
+            str(row[3] or "").strip(),
+        )
+        for row in rows
+        if any(str(piece or "").strip() for piece in row)
+    ]
+    return (
+        " | ".join(row[0] for row in cleaned),
+        " | ".join(row[1] for row in cleaned),
+        " | ".join(row[2] for row in cleaned),
+        " | ".join(row[3] for row in cleaned),
+    )
+
+
+def _installed_key_set_from_text(installed_keys_raw: str) -> set[str]:
+    key_set: set[str] = set()
+    serialized = str(installed_keys_raw or "").strip()
+    if not serialized:
+        return key_set
+    try:
+        parsed = json.loads(serialized)
+        if isinstance(parsed, list):
+            for value in parsed:
+                value_text = str(value or "").strip()
+                if value_text:
+                    key_set.add(value_text)
+            return key_set
+    except Exception:
+        pass
+    for value in serialized.split(" | "):
+        value_text = str(value or "").strip()
+        if value_text:
+            key_set.add(value_text)
+    return key_set
+
+
+def _part_detail_row_key(lpn: str, part_number: str, part_description: str, shipping_info: str) -> str:
+    normalized_lpn = DepotRules.normalize_work_order(lpn)
+    part_no_text = str(part_number or "").strip()
+    part_desc_text = str(part_description or "").strip()
+    shipping_text = str(shipping_info or "").strip()
+    if normalized_lpn:
+        payload = ["lpn", normalized_lpn.casefold()]
+    else:
+        payload = [
+            "line",
+            part_no_text.casefold(),
+            part_desc_text.casefold(),
+            shipping_text.casefold(),
+        ]
+    if payload == ["line", "", "", ""]:
+        return ""
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def _dedupe_part_detail_rows(rows: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
+    ordered_keys: list[str] = []
+    by_key: dict[str, tuple[str, str, str, str]] = {}
+    for row in rows:
+        normalized_row = tuple(str(piece or "").strip() for piece in row)
+        row_key = _part_detail_row_key(*normalized_row)
+        if not row_key:
+            continue
+        if row_key not in by_key:
+            ordered_keys.append(row_key)
+        by_key[row_key] = normalized_row
+    return [by_key[key] for key in ordered_keys]
+
+
+ALERT_QUIET_DEFAULT_HOUR = 9
+
+
+def _next_alert_quiet_until(hour: int = ALERT_QUIET_DEFAULT_HOUR, now: datetime | None = None) -> str:
+    reference = now if isinstance(now, datetime) else datetime.now()
+    quiet_day = reference.date() + timedelta(days=1)
+    quiet_dt = datetime.combine(quiet_day, datetime.min.time()).replace(hour=int(clamp(int(hour), 0, 23)))
+    return quiet_dt.isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime_local(raw_value: str) -> datetime | None:
+    stamp = str(raw_value or "").strip()
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        pass
+    candidate = stamp.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(candidate[: len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _alert_quiet_active(raw_value: str, now: datetime | None = None) -> bool:
+    quiet_until = _parse_iso_datetime_local(raw_value)
+    if quiet_until is None:
+        return False
+    reference = now if isinstance(now, datetime) else datetime.now()
+    return bool(reference < quiet_until)
+
+
+def _serialized_installed_keys(keys: list[str] | set[str] | tuple[str, ...]) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in keys:
+        key_text = str(value or "").strip()
+        if not key_text or key_text in seen:
+            continue
+        seen.add(key_text)
+        ordered.append(key_text)
+    return json.dumps(ordered, ensure_ascii=True, separators=(",", ":")) if ordered else ""
+
+
+def _drag_target_widget(root: QWidget, local_pos: QPoint) -> QWidget:
+    child = root.childAt(local_pos)
+    return child if isinstance(child, QWidget) else root
+
+
+def _is_drag_blocked_widget(widget: QWidget | None) -> bool:
     blocked_types = (
         QLineEdit,
         QTextEdit,
         QAbstractButton,
         QComboBox,
         QSpinBox,
+        QDateEdit,
         QSlider,
         QListWidget,
         QAbstractItemView,
@@ -2021,12 +2202,12 @@ def _can_start_window_drag(root: QWidget, local_pos: QPoint) -> bool:
         QScrollBar,
         QTabBar,
     )
-    child = root.childAt(local_pos)
-    while child is not None and child is not root:
-        if isinstance(child, blocked_types):
-            return False
-        child = child.parentWidget()
-    return True
+    current = widget
+    while current is not None:
+        if isinstance(current, blocked_types):
+            return True
+        current = current.parentWidget()
+    return False
 
 
 def configure_standard_table(
@@ -2042,11 +2223,14 @@ def configure_standard_table(
     table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
     table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
     table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(30)
     table.setAlternatingRowColors(True)
     table.setShowGrid(True)
     table.setGridStyle(Qt.PenStyle.SolidLine)
     table.setWordWrap(False)
     table.setTextElideMode(Qt.TextElideMode.ElideRight)
+    table.setIconSize(QSize(26, 26))
+    table.setItemDelegate(FlowgridIconCenteredDelegate(table))
     table.horizontalHeader().setStretchLastSection(bool(stretch_last))
     table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
     if resize_modes:
@@ -2142,7 +2326,8 @@ def _paint_flowgrid_popup_background(
             app_window.palette_data.get("control_bg", app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE)),
             DEFAULT_THEME_SURFACE,
         )
-        transparent = bool(app_window.config.get("theme_page_transparent_primary_bg", False))
+        requested_transparent = bool(app_window.config.get("theme_page_transparent_primary_bg", False))
+        transparent = app_window._effective_popup_transparency("main")
         bg = app_window.render_background_pixmap(reference_size, kind="main")
     else:
         resolved = app_window._resolved_popup_theme(resolved_kind)
@@ -2150,11 +2335,17 @@ def _paint_flowgrid_popup_background(
             resolved.get("background", app_window.palette_data.get("control_bg", DEFAULT_THEME_SURFACE)),
             app_window.palette_data.get("control_bg", DEFAULT_THEME_SURFACE),
         )
-        transparent = bool(resolved.get("transparent", False))
+        requested_transparent = bool(resolved.get("transparent", False))
+        transparent = app_window._effective_popup_transparency(resolved_kind)
         bg = app_window.render_background_pixmap(reference_size, kind=resolved_kind)
 
     bg_color = QColor(base_bg)
-    bg_color.setAlpha(220 if transparent else 244)
+    if transparent:
+        bg_color.setAlpha(220)
+    elif requested_transparent:
+        bg_color.setAlpha(max(13, int(round(255 * 0.05))))
+    else:
+        bg_color.setAlpha(244)
     painter.fillRect(target_rect, bg_color)
 
     if not bg.isNull():
@@ -2166,12 +2357,12 @@ def _paint_flowgrid_popup_background(
                 int(target_size.width()),
                 int(target_size.height()),
             )
-        painter.setOpacity(0.84 if transparent else 0.94)
+        painter.setOpacity(0.84 if transparent else (0.22 if requested_transparent else 0.94))
         painter.drawPixmap(target_rect, bg, src)
         painter.setOpacity(1.0)
 
     overlay = QColor(app_window.palette_data.get("shell_overlay", base_bg))
-    overlay.setAlpha(56 if transparent else 28)
+    overlay.setAlpha(56 if transparent else (12 if requested_transparent else 28))
     painter.fillRect(target_rect, overlay)
 
 
@@ -2547,6 +2738,49 @@ def _center_table_item(item: QTableWidgetItem) -> QTableWidgetItem:
     return item
 
 
+def _resolve_user_icon_from_agent_meta(
+    user_id: str,
+    agent_meta: dict[str, tuple[str, str]] | None,
+) -> QIcon | None:
+    if not user_id or not agent_meta:
+        return None
+    _, icon_path = agent_meta.get(user_id, ("", ""))
+    if not icon_path:
+        return None
+    if not Path(icon_path).exists():
+        return None
+    icon = QIcon(icon_path)
+    return icon if not icon.isNull() else None
+
+
+def _center_table_icon_item(icon: QIcon | None, text: str = "") -> QTableWidgetItem:
+    item = QTableWidgetItem(icon or QIcon(), str(text or ""))
+    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+    return item
+
+
+class FlowgridIconCenteredDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        icon_data = index.data(Qt.ItemDataRole.DecorationRole)
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        if icon_data and not text.strip():
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            style = QApplication.style() if opt.widget is None else opt.widget.style()
+            painter.save()
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            icon = QIcon(icon_data) if isinstance(icon_data, QIcon) else QIcon(QPixmap(icon_data))
+            available = min(opt.rect.width(), opt.rect.height()) - 6
+            icon_size = max(16, min(available, 32))
+            target_rect = QRect(0, 0, icon_size, icon_size)
+            target_rect.moveCenter(opt.rect.center())
+            painter.drawPixmap(target_rect, icon.pixmap(QSize(icon_size, icon_size)))
+            painter.restore()
+            return
+        super().paint(painter, option, index)
+
+
 def _table_column_index_by_header(table: QTableWidget, header_text: str) -> int:
     for col in range(int(table.columnCount())):
         hdr = table.horizontalHeaderItem(col)
@@ -2665,6 +2899,9 @@ class DepotFramelessToolWindow(QDialog):
         header_row.addStretch(1)
         header_row.addWidget(self.header_close_btn)
         self.root_layout.addLayout(header_row)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def apply_theme_styles(self) -> None:
         if self.app_window is None:
@@ -2683,14 +2920,30 @@ class DepotFramelessToolWindow(QDialog):
     def _load_window_always_on_top_preference(self, config_key: str, default: bool = True) -> bool:
         if self.app_window is None:
             return bool(default)
-        return bool(self.app_window.config.get(config_key, default))
+        resolved_key = str(config_key or "").strip()
+        popup_key = self.app_window._popup_window_on_top_config_key(self._theme_kind)
+        if popup_key:
+            resolved_key = popup_key
+        if resolved_key:
+            self._always_on_top_config_key = resolved_key
+        return bool(self.app_window.config.get(resolved_key, default))
 
     def _apply_window_always_on_top_preference(self, config_key: str, enabled: bool) -> bool:
         keep_on_top = bool(enabled)
-        self.set_window_always_on_top(keep_on_top)
         if self.app_window is not None:
-            self.app_window.config[config_key] = keep_on_top
+            popup_key = self.app_window._popup_window_on_top_config_key(self._theme_kind)
+            resolved_key = popup_key or str(config_key or "").strip()
+            if popup_key:
+                keep_on_top = self.app_window._apply_popup_window_on_top_preference(self._theme_kind, keep_on_top)
+            else:
+                self.set_window_always_on_top(keep_on_top)
+                if resolved_key:
+                    self.app_window.config[resolved_key] = keep_on_top
+            if resolved_key:
+                self._always_on_top_config_key = resolved_key
             self.app_window.queue_save_config()
+        else:
+            self.set_window_always_on_top(keep_on_top)
         return keep_on_top
 
     def _show_themed_message(self, icon: QMessageBox.Icon, title: str, text: str) -> None:
@@ -2757,15 +3010,39 @@ class DepotFramelessToolWindow(QDialog):
         self._copy_notice_host = host
         QTimer.singleShot(max(1200, int(duration_ms)), self._clear_copy_notice)
 
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if (
+            self.isVisible()
+            and isinstance(watched, QWidget)
+            and (watched is self or self.isAncestorOf(watched))
+            and isinstance(event, QMouseEvent)
+        ):
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if not _is_drag_blocked_widget(watched):
+                    self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseMove and self._drag_offset is not None:
+                if event.buttons() & Qt.MouseButton.LeftButton:
+                    self.move(event.globalPosition().toPoint() - self._drag_offset)
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and self._drag_offset is not None:
+                self._drag_offset = None
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and _can_start_window_drag(self, event.position().toPoint()):
+        target = _drag_target_widget(self, event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(target):
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag_offset and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
             event.accept()
             return
@@ -2779,14 +3056,13 @@ class DepotFramelessToolWindow(QDialog):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         if self.app_window is not None:
-            theme = self.app_window._resolved_popup_theme(self._theme_kind)
-            bg_color = QColor(theme.get("background", "#FFFFFF"))
-            if not bool(theme.get("transparent", False)):
-                painter.fillRect(self.rect(), bg_color)
-            bg = self.app_window.render_background_pixmap(self.rect().size(), kind=self._theme_kind)
-            if not bg.isNull():
-                painter.drawPixmap(self.rect(), bg)
+            _paint_flowgrid_popup_background(self, painter, self.app_window, self._theme_kind)
         super().paintEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        self._clear_copy_notice()
+        super().closeEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         key = event.key()
@@ -4870,6 +5146,7 @@ class DepotSchema:
                 CREATE TABLE IF NOT EXISTS submissions (
                     id INTEGER PRIMARY KEY,
                     created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT '',
                     user_id TEXT NOT NULL,
                     work_order TEXT NOT NULL,
                     touch TEXT NOT NULL,
@@ -4920,6 +5197,7 @@ class DepotSchema:
                     is_active INTEGER NOT NULL DEFAULT 1,
                     working_user_id TEXT NOT NULL DEFAULT '',
                     working_updated_at TEXT NOT NULL DEFAULT '',
+                    alert_quiet_until TEXT NOT NULL DEFAULT '',
                     parts_on_hand INTEGER NOT NULL DEFAULT 0,
                     parts_installed INTEGER NOT NULL DEFAULT 0,
                     parts_installed_by TEXT NOT NULL DEFAULT '',
@@ -4989,6 +5267,7 @@ class DepotSchema:
                     assigned_user_id TEXT,
                     work_order TEXT NOT NULL UNIQUE,
                     comments TEXT,
+                    alert_quiet_until TEXT NOT NULL DEFAULT '',
                     followup_last_action TEXT NOT NULL DEFAULT '',
                     followup_last_action_at TEXT NOT NULL DEFAULT '',
                     followup_last_actor TEXT NOT NULL DEFAULT '',
@@ -5046,6 +5325,7 @@ class DepotSchema:
             db._ensure_column("agents", "location", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("agents", "icon_path", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("submissions", "category", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("submissions", "updated_at", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "admin_name", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "position", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "location", "TEXT NOT NULL DEFAULT ''")
@@ -5056,6 +5336,7 @@ class DepotSchema:
             db._ensure_column("parts", "qa_flag_image_path", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("parts", "working_user_id", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("parts", "working_updated_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "alert_quiet_until", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("parts", "parts_on_hand", "INTEGER NOT NULL DEFAULT 0")
             db._ensure_column("parts", "parts_installed", "INTEGER NOT NULL DEFAULT 0")
             db._ensure_column("parts", "parts_installed_by", "TEXT NOT NULL DEFAULT ''")
@@ -5086,6 +5367,106 @@ class DepotSchema:
             db._ensure_column("client_parts", "followup_last_actor", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("client_parts", "followup_no_contact_count", "INTEGER NOT NULL DEFAULT 0")
             db._ensure_column("client_parts", "followup_stage_logged", "INTEGER NOT NULL DEFAULT -1")
+            db._ensure_column("client_parts", "alert_quiet_until", "TEXT NOT NULL DEFAULT ''")
+            cursor.execute(
+                "UPDATE submissions "
+                "SET entry_date=SUBSTR(COALESCE(created_at, ''), 1, 10) "
+                "WHERE TRIM(COALESCE(entry_date, ''))=''"
+            )
+            cursor.execute(
+                "UPDATE submissions "
+                "SET updated_at=COALESCE(NULLIF(TRIM(updated_at), ''), created_at) "
+                "WHERE TRIM(COALESCE(updated_at, ''))=''"
+            )
+            DepotSchema._collapse_duplicate_submissions(db, cursor)
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_submissions_entry_date_user_work_order
+                ON submissions(entry_date, user_id, work_order)
+                """
+            )
+
+    @staticmethod
+    def _collapse_duplicate_submissions(db: DepotDB, cursor: sqlite3.Cursor) -> None:
+        duplicate_groups = cursor.execute(
+            """
+            SELECT entry_date, user_id, work_order, COUNT(*) AS duplicate_count
+            FROM submissions
+            WHERE TRIM(COALESCE(entry_date, '')) <> ''
+            GROUP BY entry_date, user_id, work_order
+            HAVING COUNT(*) > 1
+            ORDER BY entry_date ASC, user_id ASC, work_order ASC
+            """
+        ).fetchall()
+        if not duplicate_groups:
+            return
+
+        merged_groups = 0
+        removed_rows = 0
+        for group in duplicate_groups:
+            entry_date = str(group["entry_date"] or "").strip()
+            user_id = str(group["user_id"] or "").strip()
+            work_order = str(group["work_order"] or "").strip()
+            rows = cursor.execute(
+                f"""
+                SELECT
+                    id,
+                    COALESCE(created_at, '') AS created_at,
+                    {_submission_latest_ts_sql()} AS latest_stamp,
+                    COALESCE(touch, '') AS touch,
+                    COALESCE(category, '') AS category,
+                    COALESCE(client_unit, 0) AS client_unit
+                FROM submissions
+                WHERE entry_date=? AND user_id=? AND work_order=?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (entry_date, user_id, work_order),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+
+            keep_id = int(rows[0]["id"])
+            latest_row = max(
+                rows,
+                key=lambda row: (
+                    str(row["latest_stamp"] or row["created_at"] or ""),
+                    int(row["id"]),
+                ),
+            )
+            latest_stamp = str(latest_row["latest_stamp"] or latest_row["created_at"] or "").strip()
+            cursor.execute(
+                "UPDATE submissions "
+                "SET touch=?, category=?, client_unit=?, updated_at=? "
+                "WHERE id=?",
+                (
+                    str(latest_row["touch"] or "").strip(),
+                    str(latest_row["category"] or "").strip(),
+                    int(max(0, safe_int(latest_row["client_unit"], 0))),
+                    latest_stamp,
+                    keep_id,
+                ),
+            )
+
+            duplicate_ids = [int(row["id"]) for row in rows[1:]]
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            cursor.execute(
+                f"UPDATE parts SET source_submission_id=? WHERE source_submission_id IN ({placeholders})",
+                (keep_id, *duplicate_ids),
+            )
+            cursor.execute(f"DELETE FROM submissions WHERE id IN ({placeholders})", tuple(duplicate_ids))
+            merged_groups += 1
+            removed_rows += len(duplicate_ids)
+
+        _runtime_log_event(
+            "depot.db.submissions_same_day_duplicates_collapsed",
+            severity="info",
+            summary="Collapsed historical duplicate same-day submissions to the newest payload per user/work-order/day.",
+            context={
+                "db_path": str(db.db_path),
+                "merged_groups": int(merged_groups),
+                "removed_rows": int(removed_rows),
+            },
+        )
 
     @staticmethod
     def run_backfills(db: DepotDB) -> None:
@@ -5099,7 +5480,7 @@ class DepotSchema:
                         SELECT s.id
                         FROM submissions s
                         WHERE s.work_order=parts.work_order AND s.touch=?
-                        ORDER BY s.created_at DESC, s.id DESC
+                        ORDER BY COALESCE(NULLIF(TRIM(s.updated_at), ''), s.created_at) DESC, s.id DESC
                         LIMIT 1
                     ), 0)
                     WHERE COALESCE(source_submission_id, 0)=0
@@ -5326,7 +5707,7 @@ class DepotTracker:
                 "DELETE FROM client_parts "
                 "WHERE COALESCE(("
                 "SELECT s.touch FROM submissions s WHERE s.work_order=client_parts.work_order "
-                "ORDER BY s.created_at DESC, s.id DESC LIMIT 1"
+                f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
                 "), '') IN (?, ?, ?)",
                 close_statuses,
             )
@@ -5380,7 +5761,7 @@ class DepotTracker:
             "NULLIF(TRIM(("
             "SELECT ds.category FROM submissions ds "
             f"WHERE ds.work_order={work_order_expr} AND TRIM(COALESCE(ds.category, '')) <> '' "
-            "ORDER BY ds.created_at DESC, ds.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('ds')} DESC, ds.id DESC LIMIT 1"
             ")), ''), "
             "NULLIF(TRIM(("
             "SELECT dp.category FROM parts dp "
@@ -5432,11 +5813,12 @@ class DepotTracker:
 
         if normalized_table == "submissions":
             where_parts: list[str] = []
+            entry_date_expr = _submission_entry_date_sql("s0")
             if start_date:
-                where_parts.append("s0.entry_date >= ?")
+                where_parts.append(f"{entry_date_expr} >= ?")
                 params.append(str(start_date))
             if end_date:
-                where_parts.append("s0.entry_date <= ?")
+                where_parts.append(f"{entry_date_expr} <= ?")
                 params.append(str(end_date))
             normalized_user = DepotRules.normalize_user_id(user_id or "")
             if normalized_user:
@@ -5454,12 +5836,12 @@ class DepotTracker:
                 "CASE "
                 "WHEN s0.touch='Part Order' THEN "
                 "SUM(CASE WHEN s0.touch='Part Order' THEN 1 ELSE 0 END) OVER ("
-                "PARTITION BY s0.user_id, s0.work_order ORDER BY s0.created_at, s0.id "
+                f"PARTITION BY s0.user_id, s0.work_order ORDER BY {_submission_latest_ts_sql('s0')}, s0.id "
                 "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
                 ") "
                 "ELSE 0 "
                 "END AS part_order_count "
-                f"FROM submissions s0{where_clause} ORDER BY s0.created_at DESC, s0.id DESC LIMIT ?"
+                f"FROM submissions s0{where_clause} ORDER BY {_submission_latest_ts_sql('s0')} DESC, s0.id DESC LIMIT ?"
             )
             params.append(max_rows)
             return self.db.fetchall(query, tuple(params))
@@ -6351,6 +6733,30 @@ class DepotTracker:
             "working_updated_at": str(row["working_updated_at"] or "").strip(),
         }
 
+    @staticmethod
+    def next_alert_quiet_until() -> str:
+        return _next_alert_quiet_until()
+
+    @staticmethod
+    def is_alert_quiet(raw_value: str) -> bool:
+        return _alert_quiet_active(raw_value)
+
+    def quiet_part_alert_until_next_morning(self, part_id: int) -> str:
+        quiet_until = self.next_alert_quiet_until()
+        self.db.execute(
+            "UPDATE parts SET alert_quiet_until=? WHERE id=?",
+            (quiet_until, int(part_id)),
+        )
+        return quiet_until
+
+    def quiet_client_followup_until_next_morning(self, client_part_id: int) -> str:
+        quiet_until = self.next_alert_quiet_until()
+        self.db.execute(
+            "UPDATE client_parts SET alert_quiet_until=? WHERE id=?",
+            (quiet_until, int(client_part_id)),
+        )
+        return quiet_until
+
     def list_agent_active_parts(self, user_id: str, search_text: str = "") -> list[sqlite3.Row]:
         normalized_user = DepotRules.normalize_user_id(user_id)
         query = (
@@ -6358,6 +6764,7 @@ class DepotTracker:
             "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
             "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
             "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until, "
             "COALESCE(p.parts_installed, 0) AS parts_installed, "
             "COALESCE(p.parts_installed_by, '') AS parts_installed_by, COALESCE(p.parts_installed_at, '') AS parts_installed_at "
             "FROM parts p "
@@ -6380,6 +6787,7 @@ class DepotTracker:
             "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
             "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
             "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until, "
             "COALESCE(p.parts_installed, 0) AS parts_installed, "
             "COALESCE(p.parts_installed_by, '') AS parts_installed_by, COALESCE(p.parts_installed_at, '') AS parts_installed_at "
             "FROM parts p "
@@ -6403,7 +6811,8 @@ class DepotTracker:
             "SELECT p.id, p.created_at, p.work_order, p.assigned_user_id, p.category, p.client_unit, COALESCE(p.qa_comment, '') AS qa_comment, "
             "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
             "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
-            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at "
+            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until "
             "FROM parts p WHERE p.is_active=1 "
             "AND p.id=("
             "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
@@ -6461,11 +6870,12 @@ class DepotTracker:
             "COALESCE(p.qa_comment, '') AS qa_comment, COALESCE(p.agent_comment, '') AS agent_comment, "
             "COALESCE(p.comments, '') AS comments, COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
             "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
-            "COALESCE(ls.touch, '') AS latest_touch, COALESCE(ls.created_at, '') AS latest_touch_at "
+            "COALESCE(ls.touch, '') AS latest_touch, "
+            f"COALESCE(NULLIF(TRIM(ls.updated_at), ''), COALESCE(ls.created_at, '')) AS latest_touch_at "
             "FROM parts p "
             "LEFT JOIN submissions ls ON ls.id = ("
             "SELECT s2.id FROM submissions s2 WHERE s2.work_order = p.work_order "
-            "ORDER BY s2.created_at DESC, s2.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('s2')} DESC, s2.id DESC LIMIT 1"
             ") "
             "WHERE p.is_active=0 AND COALESCE(ls.touch, '') IN (?, ?, ?)"
         )
@@ -6485,13 +6895,14 @@ class DepotTracker:
                 + ", ''))) = ?"
             )
             params.append(normalized_category.upper())
-        query += " ORDER BY COALESCE(NULLIF(TRIM(ls.created_at), ''), p.created_at) DESC, p.id DESC LIMIT 400"
+        query += f" ORDER BY COALESCE(NULLIF(TRIM(ls.updated_at), ''), COALESCE(ls.created_at, p.created_at)) DESC, p.id DESC LIMIT 400"
         return self.db.fetchall(query, tuple(params))
 
     def list_team_client_followups(self) -> list[sqlite3.Row]:
         return self.db.fetchall(
             "SELECT cp.id, COALESCE(cp.user_id, '') AS user_id, cp.work_order, cp.created_at, "
             "COALESCE(cp.comments, '') AS comments, "
+            "COALESCE(cp.alert_quiet_until, '') AS alert_quiet_until, "
             "COALESCE(cp.followup_last_action, '') AS followup_last_action, "
             "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
             "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
@@ -6500,16 +6911,16 @@ class DepotTracker:
             "SELECT s.touch FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            "ORDER BY s.created_at DESC, s.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch, "
             "COALESCE(("
-            "SELECT s.entry_date FROM submissions s "
+            f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            "ORDER BY s.created_at DESC, s.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch_date, "
             "COALESCE(("
-            "SELECT MAX(s.entry_date) FROM submissions s "
+            f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch='Part Order'"
             "), '') AS last_part_order_date "
@@ -6521,6 +6932,7 @@ class DepotTracker:
         normalized_user = DepotRules.normalize_user_id(user_id)
         return self.db.fetchall(
             "SELECT cp.id, cp.work_order, cp.created_at, COALESCE(cp.comments, '') AS comments, "
+            "COALESCE(cp.alert_quiet_until, '') AS alert_quiet_until, "
             "COALESCE(cp.followup_last_action, '') AS followup_last_action, "
             "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
             "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
@@ -6530,16 +6942,16 @@ class DepotTracker:
             "SELECT s.touch FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            "ORDER BY s.created_at DESC, s.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch, "
             "COALESCE(("
-            "SELECT s.entry_date FROM submissions s "
+            f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            "ORDER BY s.created_at DESC, s.id DESC LIMIT 1"
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch_date, "
             "COALESCE(("
-            "SELECT MAX(s.entry_date) FROM submissions s "
+            f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
             "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch='Part Order'"
             "), '') AS last_part_order_date "
@@ -6557,6 +6969,32 @@ class DepotTracker:
         if row is None:
             return ""
         return DepotRules.normalize_work_order(str(row["work_order"] or ""))
+
+    def list_client_jo_rows(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(user_id, '') AS user_id, "
+            "COALESCE(work_order, '') AS work_order, COALESCE(comments, '') AS comments "
+            "FROM client_jo"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " WHERE work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY created_at DESC, id DESC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_rtv_rows(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(user_id, '') AS user_id, "
+            "COALESCE(work_order, '') AS work_order, COALESCE(comments, '') AS comments "
+            "FROM rtvs"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " WHERE work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY created_at DESC, id DESC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
 
     def upsert_agent(self, user_id: str, agent_name: str, tier: int, icon_path: str = "", location: str = "") -> str:
         normalized_user = DepotRules.normalize_user_id(user_id)
@@ -6603,6 +7041,123 @@ class DepotTracker:
                     context={"user_id": normalized_user, "path": str(existing)},
                 )
 
+    @staticmethod
+    def _normalize_submission_timestamp(submitted_at: datetime | date | str | None) -> datetime:
+        if isinstance(submitted_at, datetime):
+            if submitted_at.tzinfo is not None:
+                return submitted_at.astimezone().replace(tzinfo=None)
+            return submitted_at
+        if isinstance(submitted_at, date):
+            return datetime.combine(submitted_at, datetime.min.time())
+        raw_value = str(submitted_at or "").strip()
+        if not raw_value:
+            return datetime.now()
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except Exception:
+            try:
+                return datetime.combine(datetime.strptime(raw_value, "%Y-%m-%d").date(), datetime.min.time())
+            except Exception:
+                return datetime.now()
+
+    def _find_existing_same_day_submission(
+        self,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+    ) -> sqlite3.Row | None:
+        return self.db.fetchone(
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at "
+            "FROM submissions "
+            "WHERE entry_date=? AND user_id=? AND work_order=? "
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+            (str(entry_date or "").strip(), DepotRules.normalize_user_id(user_id), DepotRules.normalize_work_order(work_order)),
+        )
+
+    def _upsert_same_day_submission(
+        self,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+        touch: str,
+        category_text: str,
+        client_unit_int: int,
+        stamp_text: str,
+    ) -> int:
+        existing = self._find_existing_same_day_submission(entry_date, user_id, work_order)
+        if existing is not None:
+            self.db.execute(
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+            )
+            return int(existing["id"])
+        try:
+            cursor = self.db.execute(
+                "INSERT INTO submissions (created_at, updated_at, user_id, work_order, touch, category, client_unit, entry_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(stamp_text or "").strip(),
+                    str(stamp_text or "").strip(),
+                    DepotRules.normalize_user_id(user_id),
+                    DepotRules.normalize_work_order(work_order),
+                    str(touch or "").strip(),
+                    str(category_text or "").strip(),
+                    int(client_unit_int),
+                    str(entry_date or "").strip(),
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+        except sqlite3.IntegrityError:
+            existing = self._find_existing_same_day_submission(entry_date, user_id, work_order)
+            if existing is None:
+                raise
+            self.db.execute(
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+            )
+            return int(existing["id"])
+
+    def _upsert_same_day_aux_log(
+        self,
+        table_name: str,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+        comments: str,
+        stamp_text: str,
+    ) -> None:
+        normalized_table = str(table_name or "").strip().lower()
+        if normalized_table not in {"rtvs", "client_jo"}:
+            raise ValueError(f"Unsupported same-day aux log table: {table_name}")
+        existing = self.db.fetchone(
+            f"SELECT id FROM {normalized_table} "
+            "WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (
+                DepotRules.normalize_user_id(user_id),
+                DepotRules.normalize_work_order(work_order),
+                str(entry_date or "").strip(),
+            ),
+        )
+        if existing is not None:
+            self.db.execute(
+                f"UPDATE {normalized_table} SET created_at=?, comments=? WHERE id=?",
+                (str(stamp_text or "").strip(), str(comments or ""), int(existing["id"])),
+            )
+            return
+        self.db.execute(
+            f"INSERT INTO {normalized_table} (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+            (
+                str(stamp_text or "").strip(),
+                DepotRules.normalize_user_id(user_id),
+                DepotRules.normalize_work_order(work_order),
+                str(comments or ""),
+            ),
+        )
+
     def submit_work(
         self,
         user_id: str,
@@ -6611,21 +7166,27 @@ class DepotTracker:
         client_unit: bool,
         comments: str | None = None,
         category: str | None = "",
+        submitted_at: datetime | date | str | None = None,
     ) -> None:
-        now_dt = datetime.now()
-        now = now_dt.isoformat(timespec="seconds")
+        stamp_dt = self._normalize_submission_timestamp(submitted_at)
+        stamp_text = stamp_dt.isoformat(timespec="seconds")
         user_id = DepotRules.normalize_user_id(user_id)
         work_order = DepotRules.normalize_work_order(work_order)
-        entry_date = now_dt.date().isoformat()
+        entry_date = stamp_dt.date().isoformat()
         category_text = str(category or "").strip()
+        comments_text = str(comments or "")
         client_unit_int = 1 if client_unit else 0
 
         with self.db.write_transaction("tracker.submit_work"):
-            submission_cursor = self.db.execute(
-                "INSERT INTO submissions (created_at, user_id, work_order, touch, category, client_unit, entry_date) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (now, user_id, work_order, touch, category_text, client_unit_int, entry_date),
+            submission_id = self._upsert_same_day_submission(
+                entry_date,
+                user_id,
+                work_order,
+                touch,
+                category_text,
+                client_unit_int,
+                stamp_text,
             )
-            submission_id = int(submission_cursor.lastrowid or 0)
 
             if touch == DepotRules.TOUCH_PART_ORDER and submission_id > 0:
                 self.db.execute(
@@ -6638,7 +7199,7 @@ class DepotTracker:
                     "WHEN COALESCE(missing_part_order_followup, 0)=1 THEN ? "
                     "ELSE COALESCE(missing_part_order_resolved_by, '') END "
                     "WHERE work_order=? AND is_active=1",
-                    (user_id, submission_id, now, user_id, work_order),
+                    (user_id, submission_id, stamp_text, user_id, work_order),
                 )
                 if category_text:
                     self.db.execute(
@@ -6647,16 +7208,10 @@ class DepotTracker:
                     )
 
             if touch == DepotRules.TOUCH_RTV:
-                self.db.execute(
-                    "INSERT INTO rtvs (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
-                    (now, user_id, work_order, comments or ""),
-                )
+                self._upsert_same_day_aux_log("rtvs", entry_date, user_id, work_order, comments_text, stamp_text)
 
             if client_unit and touch == DepotRules.TOUCH_JUNK:
-                self.db.execute(
-                    "INSERT INTO client_jo (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
-                    (now, user_id, work_order, comments or ""),
-                )
+                self._upsert_same_day_aux_log("client_jo", entry_date, user_id, work_order, comments_text, stamp_text)
 
             if client_unit and touch in (DepotRules.TOUCH_PART_ORDER, DepotRules.TOUCH_OTHER):
                 existing = self.db.fetchone(
@@ -6665,12 +7220,12 @@ class DepotTracker:
                 if existing:
                     self.db.execute(
                         "UPDATE client_parts SET user_id=?, comments=?, created_at=? WHERE work_order = ?",
-                        (user_id, comments or "", now, work_order),
+                        (user_id, comments_text, stamp_text, work_order),
                     )
                 else:
                     self.db.execute(
                         "INSERT INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
-                        (now, user_id, work_order, comments or ""),
+                        (stamp_text, user_id, work_order, comments_text),
                     )
 
             if touch in DepotRules.CLOSING_TOUCHES:
@@ -6695,7 +7250,7 @@ class DepotTracker:
             "SELECT COALESCE(category, '') AS category "
             "FROM submissions "
             "WHERE work_order=? AND TRIM(COALESCE(category, '')) <> '' "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
             (normalized_work_order,),
         )
         if submission_row is not None:
@@ -6722,10 +7277,11 @@ class DepotTracker:
         if not normalized_work_order:
             return None
         row = self.db.fetchone(
-            "SELECT id, user_id, COALESCE(category, '') AS category, COALESCE(created_at, '') AS created_at "
+            "SELECT id, user_id, COALESCE(category, '') AS category, COALESCE(created_at, '') AS created_at, "
+            "COALESCE(updated_at, '') AS updated_at "
             "FROM submissions "
             "WHERE work_order=? AND touch=? "
-            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
             (normalized_work_order, DepotRules.TOUCH_PART_ORDER),
         )
         if row is None:
@@ -6735,6 +7291,7 @@ class DepotTracker:
             "user_id": DepotRules.normalize_user_id(str(row["user_id"] or "")),
             "category": str(row["category"] or "").strip(),
             "created_at": str(row["created_at"] or "").strip(),
+            "updated_at": str(row["updated_at"] or "").strip(),
         }
 
     def update_work_order_category(self, work_order: str, category: str) -> str:
@@ -6747,7 +7304,7 @@ class DepotTracker:
         target_row = {"id": int(latest_part_order["id"])} if latest_part_order is not None else None
         if target_row is None:
             target_row = self.db.fetchone(
-                "SELECT id FROM submissions WHERE work_order=? ORDER BY created_at DESC, id DESC LIMIT 1",
+                f"SELECT id FROM submissions WHERE work_order=? ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
                 (normalized_work_order,),
             )
         if target_row is None:
@@ -7031,6 +7588,8 @@ class DepotTracker:
         part_no_text = str(part_number or "").strip()
         part_desc_text = str(part_description or "").strip()
         shipping_text = str(shipping_info or "").strip()
+        incoming_row = (normalized_lpn, part_no_text, part_desc_text, shipping_text)
+        incoming_key = _part_detail_row_key(*incoming_row)
 
         existing = self.db.fetchone(
             "SELECT COALESCE(lpn, '') AS lpn, COALESCE(part_number, '') AS part_number, "
@@ -7040,6 +7599,8 @@ class DepotTracker:
             (int(part_id),),
         )
         if existing is None:
+            if not incoming_key:
+                return
             self.db.execute(
                 "INSERT INTO part_details (part_id, created_at, lpn, part_number, part_description, shipping_info, delivered) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -7055,66 +7616,13 @@ class DepotTracker:
             )
             return
 
-        def split_piped(text: str) -> list[str]:
-            raw = str(text or "")
-            if raw == "":
-                return []
-            return [str(piece or "").strip() for piece in raw.split(" | ")]
-
-        def line_key(lpn_value: str, part_value: str, desc_value: str, ship_value: str) -> str:
-            return json.dumps(
-                [
-                    str(lpn_value or "").strip().casefold(),
-                    str(part_value or "").strip().casefold(),
-                    str(desc_value or "").strip().casefold(),
-                    str(ship_value or "").strip().casefold(),
-                ],
-                ensure_ascii=True,
-                separators=(",", ":"),
-            )
-
-        def value_for(values: list[str], idx: int, row_count: int) -> str:
-            if idx < len(values):
-                return str(values[idx] or "").strip()
-            # If one value was historically de-duplicated, broadcast it to all line-items.
-            if len(values) == 1 and row_count > 1:
-                return str(values[0] or "").strip()
-            return ""
-
-        lpn_values = split_piped(str(existing["lpn"] or ""))
-        part_no_values = split_piped(str(existing["part_number"] or ""))
-        desc_values = split_piped(str(existing["part_description"] or ""))
-        shipping_values = split_piped(str(existing["shipping_info"] or ""))
-        installed_keys_raw = str(existing["installed_keys"] or "").strip()
-        installed_key_set: set[str] = set()
-        if installed_keys_raw:
-            try:
-                parsed_installed = json.loads(installed_keys_raw)
-                if isinstance(parsed_installed, list):
-                    for value in parsed_installed:
-                        value_text = str(value or "").strip()
-                        if value_text:
-                            installed_key_set.add(value_text)
-            except Exception:
-                for value in installed_keys_raw.split(" | "):
-                    value_text = str(value or "").strip()
-                    if value_text:
-                        installed_key_set.add(value_text)
-        existing_line_count = max(len(lpn_values), len(part_no_values), len(desc_values), len(shipping_values), 0)
-
-        line_rows: list[tuple[str, str, str, str]] = []
-        for idx in range(existing_line_count):
-            line_rows.append(
-                (
-                    value_for(lpn_values, idx, existing_line_count),
-                    value_for(part_no_values, idx, existing_line_count),
-                    value_for(desc_values, idx, existing_line_count),
-                    value_for(shipping_values, idx, existing_line_count),
-                )
-            )
-
-        # Repair previously misaligned rows where one shared shipping value was expected for all lines.
-        non_empty_ship = [row[3] for row in line_rows if str(row[3] or "").strip()]
+        line_rows = _merged_part_detail_rows(
+            str(existing["lpn"] or ""),
+            str(existing["part_number"] or ""),
+            str(existing["part_description"] or ""),
+            str(existing["shipping_info"] or ""),
+        )
+        non_empty_ship = [str(row[3] or "").strip() for row in line_rows if str(row[3] or "").strip()]
         ship_seen: set[str] = set()
         ship_unique: list[str] = []
         for ship in non_empty_ship:
@@ -7129,52 +7637,30 @@ class DepotTracker:
                 (row[0], row[1], row[2], shared_ship if not str(row[3] or "").strip() else str(row[3] or "").strip())
                 for row in line_rows
             ]
+        line_rows = _dedupe_part_detail_rows(line_rows)
 
-        incoming_row = (
-            normalized_lpn,
-            part_no_text,
-            part_desc_text,
-            shipping_text,
-        )
-        if any(str(piece or "").strip() for piece in incoming_row):
-            existing_keys: set[tuple[str, str, str, str]] = {
-                tuple(str(piece or "").strip().casefold() for piece in row)
-                for row in line_rows
-                if any(str(piece or "").strip() for piece in row)
-            }
-            incoming_key = tuple(str(piece or "").strip().casefold() for piece in incoming_row)
-            appended_new_row = False
-            if incoming_key not in existing_keys:
+        appended_new_row = False
+        if incoming_key:
+            replaced = False
+            for idx, row in enumerate(line_rows):
+                if _part_detail_row_key(*row) == incoming_key:
+                    line_rows[idx] = incoming_row
+                    replaced = True
+                    break
+            if not replaced:
                 line_rows.append(incoming_row)
                 appended_new_row = True
-            else:
-                appended_new_row = False
-        else:
-            appended_new_row = False
+        line_rows = _dedupe_part_detail_rows(line_rows)
 
-        # De-duplicate exact line repeats while preserving order.
-        deduped_rows: list[tuple[str, str, str, str]] = []
-        deduped_keys: set[tuple[str, str, str, str]] = set()
-        for row in line_rows:
-            if not any(str(piece or "").strip() for piece in row):
-                continue
-            key = tuple(str(piece or "").strip().casefold() for piece in row)
-            if key in deduped_keys:
-                continue
-            deduped_keys.add(key)
-            deduped_rows.append(tuple(str(piece or "").strip() for piece in row))
-        line_rows = deduped_rows
+        installed_key_set = _installed_key_set_from_text(str(existing["installed_keys"] or "").strip())
 
         retained_installed_keys: list[str] = []
         for row in line_rows:
-            key = line_key(row[0], row[1], row[2], row[3])
+            key = _part_detail_row_key(row[0], row[1], row[2], row[3])
             if key in installed_key_set:
                 retained_installed_keys.append(key)
 
-        merged_lpn = " | ".join(str(row[0] or "").strip() for row in line_rows)
-        merged_part_number = " | ".join(str(row[1] or "").strip() for row in line_rows)
-        merged_part_desc = " | ".join(str(row[2] or "").strip() for row in line_rows)
-        merged_shipping = " | ".join(str(row[3] or "").strip() for row in line_rows)
+        merged_lpn, merged_part_number, merged_part_desc, merged_shipping = _serialize_part_detail_rows(line_rows)
         merged_installed_keys = (
             json.dumps(retained_installed_keys, ensure_ascii=True, separators=(",", ":"))
             if retained_installed_keys
@@ -7230,6 +7716,18 @@ class DepotTracker:
                 by_work_order[existing_work_order] = int(row["id"])
         return by_work_order
 
+    def get_active_part_qa_flag(self, work_order: str) -> str:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        if not normalized_work_order:
+            return ""
+        row = self.db.fetchone(
+            "SELECT COALESCE(qa_flag, '') AS qa_flag FROM parts WHERE is_active=1 AND work_order=? ORDER BY id DESC LIMIT 1",
+            (normalized_work_order,),
+        )
+        if row is None:
+            return ""
+        return str(row["qa_flag"] or "").strip()
+
     def update_part_agent_comment(self, part_id: int, agent_comment: str) -> None:
         self.db.execute(
             "UPDATE parts SET agent_comment=? WHERE id=?",
@@ -7239,6 +7737,7 @@ class DepotTracker:
     def set_part_working_user(self, part_id: int, working_user_id: str) -> None:
         normalized = DepotRules.normalize_user_id(working_user_id)
         stamp = datetime.now().isoformat(timespec="seconds") if normalized else ""
+        quiet_until = self.next_alert_quiet_until() if normalized else ""
         # One agent may actively "work" only one part row at a time.
         with self.db.write_transaction("tracker.set_part_working_user"):
             if normalized:
@@ -7248,85 +7747,60 @@ class DepotTracker:
                     (normalized, int(part_id)),
                 )
             self.db.execute(
-                "UPDATE parts SET working_user_id=?, working_updated_at=? WHERE id=?",
-                (normalized, stamp, int(part_id)),
+                "UPDATE parts SET working_user_id=?, working_updated_at=?, alert_quiet_until=? WHERE id=?",
+                (normalized, stamp, quiet_until, int(part_id)),
             )
 
-    def set_part_installed(self, part_id: int, installed: bool, actor_user_id: str = "") -> None:
-        if bool(installed):
-            actor = DepotRules.normalize_user_id(actor_user_id)
-            stamp = datetime.now().isoformat(timespec="seconds")
-            with self.db.write_transaction("tracker.set_part_installed"):
-                self.db.execute(
-                    "UPDATE parts SET parts_on_hand=1, parts_installed=1, parts_installed_by=?, parts_installed_at=?, "
-                        "working_user_id='', working_updated_at='' WHERE id=?",
-                    (actor, stamp, int(part_id)),
-                )
-                detail = self.db.fetchone(
-                    "SELECT COALESCE(lpn, '') AS lpn, COALESCE(part_number, '') AS part_number, "
-                    "COALESCE(part_description, '') AS part_description, COALESCE(shipping_info, '') AS shipping_info "
-                    "FROM part_details WHERE part_id=?",
-                    (int(part_id),),
-                )
-                if detail is not None:
-                    def split_piped(text: str) -> list[str]:
-                        raw = str(text or "")
-                        if raw == "":
-                            return []
-                        return [str(piece or "").strip() for piece in raw.split(" | ")]
+    def set_part_installed(self, part_id: int, installed_row_keys: list[str] | tuple[str, ...] | set[str], actor_user_id: str = "") -> None:
+        detail = self.db.fetchone(
+            "SELECT COALESCE(lpn, '') AS lpn, COALESCE(part_number, '') AS part_number, "
+            "COALESCE(part_description, '') AS part_description, COALESCE(shipping_info, '') AS shipping_info "
+            "FROM part_details WHERE part_id=?",
+            (int(part_id),),
+        )
+        if detail is None:
+            raise ValueError("Delivered part details were not found for the selected work order.")
 
-                    def value_for(values: list[str], idx: int, row_count: int) -> str:
-                        if idx < len(values):
-                            return str(values[idx] or "").strip()
-                        if len(values) == 1 and row_count > 1:
-                            return str(values[0] or "").strip()
-                        return ""
+        detail_rows = _dedupe_part_detail_rows(
+            _merged_part_detail_rows(
+                str(detail["lpn"] or ""),
+                str(detail["part_number"] or ""),
+                str(detail["part_description"] or ""),
+                str(detail["shipping_info"] or ""),
+            )
+        )
+        valid_keys = {
+            row_key
+            for row_key in (_part_detail_row_key(*row) for row in detail_rows)
+            if row_key
+        }
+        selected_keys: list[str] = []
+        seen: set[str] = set()
+        for value in installed_row_keys:
+            row_key = str(value or "").strip()
+            if not row_key or row_key not in valid_keys or row_key in seen:
+                continue
+            seen.add(row_key)
+            selected_keys.append(row_key)
 
-                    def line_key(lpn_value: str, part_value: str, desc_value: str, ship_value: str) -> str:
-                        return json.dumps(
-                            [
-                                str(lpn_value or "").strip().casefold(),
-                                str(part_value or "").strip().casefold(),
-                                str(desc_value or "").strip().casefold(),
-                                str(ship_value or "").strip().casefold(),
-                            ],
-                            ensure_ascii=True,
-                            separators=(",", ":"),
-                        )
-
-                    lpn_values = split_piped(str(detail["lpn"] or ""))
-                    part_values = split_piped(str(detail["part_number"] or ""))
-                    desc_values = split_piped(str(detail["part_description"] or ""))
-                    ship_values = split_piped(str(detail["shipping_info"] or ""))
-                    row_count = max(len(lpn_values), len(part_values), len(desc_values), len(ship_values), 0)
-                    installed_line_keys: list[str] = []
-                    for idx in range(row_count):
-                        installed_line_keys.append(
-                            line_key(
-                                value_for(lpn_values, idx, row_count),
-                                value_for(part_values, idx, row_count),
-                                value_for(desc_values, idx, row_count),
-                                value_for(ship_values, idx, row_count),
-                            )
-                        )
-                    serialized = (
-                        json.dumps(installed_line_keys, ensure_ascii=True, separators=(",", ":"))
-                        if installed_line_keys
-                        else ""
-                    )
-                    self.db.execute(
-                        "UPDATE part_details SET installed_keys=? WHERE part_id=?",
-                        (serialized, int(part_id)),
-                    )
-            return
-        with self.db.write_transaction("tracker.clear_part_installed"):
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        installed = bool(selected_keys)
+        with self.db.write_transaction("tracker.set_part_installed"):
             self.db.execute(
-                "UPDATE parts SET parts_installed=0, parts_installed_by='', parts_installed_at='' WHERE id=?",
-                (int(part_id),),
+                "UPDATE part_details SET installed_keys=? WHERE part_id=?",
+                (_serialized_installed_keys(selected_keys), int(part_id)),
             )
             self.db.execute(
-                "UPDATE part_details SET installed_keys='' WHERE part_id=?",
-                (int(part_id),),
+                "UPDATE parts SET parts_on_hand=1, parts_installed=?, parts_installed_by=?, parts_installed_at=?, "
+                "working_user_id='', working_updated_at='', alert_quiet_until=? WHERE id=?",
+                (
+                    1 if installed else 0,
+                    actor if installed else "",
+                    stamp if installed else "",
+                    self.next_alert_quiet_until(),
+                    int(part_id),
+                ),
             )
 
     def mark_client_followup_action(self, client_part_id: int, action: str, actor_user_id: str) -> int:
@@ -7380,8 +7854,17 @@ class DepotTracker:
         updated_comments = "\n".join([line for line in lines if str(line).strip()])
         self.db.execute(
             "UPDATE client_parts SET followup_last_action=?, followup_last_action_at=?, "
-            "followup_last_actor=?, followup_no_contact_count=?, followup_stage_logged=?, comments=? WHERE id=?",
-            (normalized_action, stamp, actor, int(existing_count), int(stage_logged), updated_comments, int(client_part_id)),
+            "followup_last_actor=?, followup_no_contact_count=?, followup_stage_logged=?, comments=?, alert_quiet_until=? WHERE id=?",
+            (
+                normalized_action,
+                stamp,
+                actor,
+                int(existing_count),
+                int(stage_logged),
+                updated_comments,
+                self.next_alert_quiet_until(),
+                int(client_part_id),
+            ),
         )
         return int(existing_count)
 
@@ -7432,14 +7915,15 @@ class DepotTracker:
         client_only: bool | None = None,
         category: str | None = None,
     ) -> dict[str, Any]:
-        where = []
+        where: list[str] = []
         params: list[Any] = []
+        entry_date_expr = _submission_entry_date_sql("s0")
 
         if start_date:
-            where.append("s0.entry_date >= ?")
+            where.append(f"{entry_date_expr} >= ?")
             params.append(start_date)
         if end_date:
-            where.append("s0.entry_date <= ?")
+            where.append(f"{entry_date_expr} <= ?")
             params.append(end_date)
         if user_id:
             where.append("s0.user_id = ?")
@@ -7474,15 +7958,15 @@ class DepotTracker:
             tuple(params),
         )
         daily = self.db.fetchall(
-            f"SELECT s0.entry_date AS entry_date, COUNT(*) AS c {from_clause} {where_clause} "
-            "GROUP BY s0.entry_date ORDER BY s0.entry_date DESC LIMIT 30",
+            f"SELECT {entry_date_expr} AS entry_date, COUNT(*) AS c {from_clause} {where_clause} "
+            f"GROUP BY {entry_date_expr} ORDER BY {entry_date_expr} DESC LIMIT 30",
             tuple(params),
         )
         trend_daily = self.db.fetchall(
             f"""
             WITH filtered AS (
                 SELECT
-                    COALESCE(NULLIF(TRIM(s0.entry_date), ''), SUBSTR(COALESCE(s0.created_at, ''), 1, 10)) AS effective_date,
+                    {entry_date_expr} AS effective_date,
                     s0.work_order AS work_order,
                     s0.touch AS touch
                 {from_clause}
@@ -7532,12 +8016,12 @@ class DepotTracker:
         triaged_count = int(max(0, safe_int(by_touch_map.get("Triaged", 0), 0)))
         other_touch_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_OTHER, 0), 0)))
 
-        actividad = {
+        return {
             "total_submissions": int(total["c"] if total else 0),
             "total_units": int(total_units["c"] if total_units else 0),
             "by_touch": by_touch_map,
-            "by_user": {row["user_id"]: row["c"] for row in by_user},
-            "daily": [{"entry_date": r["entry_date"], "count": r["c"]} for r in daily],
+            "by_user": {str(row["user_id"] or "").strip(): int(max(0, safe_int(row["c"], 0))) for row in by_user},
+            "daily": [{"entry_date": str(r["entry_date"] or ""), "count": int(max(0, safe_int(r["c"], 0)))} for r in daily],
             "trend_daily": [
                 {
                     "entry_date": str(row["entry_date"] or ""),
@@ -7563,12 +8047,11 @@ class DepotTracker:
             "avg_units_per_day": float((int(total_units["c"]) if total_units else 0) / day_span) if day_span > 0 else 0.0,
             "avg_complete_per_day": float(complete_count / day_span) if day_span > 0 else 0.0,
             "avg_junk_per_day": float(junk_count / day_span) if day_span > 0 else 0.0,
-            "active_client_follow_up": self.db.fetchone("SELECT COUNT(*) AS c FROM client_parts", ())["c"],
-            "active_parts": self.db.fetchone("SELECT COUNT(*) AS c FROM parts WHERE is_active=1", ())["c"],
-            "rtv_count": self.db.fetchone("SELECT COUNT(*) AS c FROM rtvs", ())["c"],
-            "client_jo_count": self.db.fetchone("SELECT COUNT(*) AS c FROM client_jo", ())["c"],
+            "active_client_follow_up": int(self.db.fetchone("SELECT COUNT(*) AS c FROM client_parts", ())["c"]),
+            "active_parts": int(self.db.fetchone("SELECT COUNT(*) AS c FROM parts WHERE is_active=1", ())["c"]),
+            "rtv_log_count": int(self.db.fetchone("SELECT COUNT(*) AS c FROM rtvs", ())["c"]),
+            "client_jo_count": int(self.db.fetchone("SELECT COUNT(*) AS c FROM client_jo", ())["c"]),
         }
-        return actividad
 
     def import_workbook(self, xlsm_path: Path, import_tables: set[str] | None = None) -> tuple[bool, str]:
         if openpyxl is None:
@@ -7606,7 +8089,7 @@ class DepotTracker:
                     if not user or not work_order or not touch:
                         continue
                     category = str(row[5].value or "").strip() if len(row) > 5 else ""
-                    self.submit_work(user, work_order, touch, client_unit, comments, category)
+                    self.submit_work(user, work_order, touch, client_unit, comments, category, submitted_at=date_time)
                     counts["submissions"] += 1
             elif include("submissions"):
                 missing_sheets.append("Table1")
@@ -7928,18 +8411,7 @@ class PartNotesDialog(QDialog):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         if self.app_window is not None:
-            theme = self.app_window._resolved_popup_theme(self._style_kind)
-            base_bg = normalize_hex(
-                theme.get("background", self.app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE)),
-                self.app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE),
-            )
-            bg_color = QColor(base_bg)
-            if bool(theme.get("transparent", False)):
-                bg_color.setAlpha(220)
-            painter.fillRect(self.rect(), bg_color)
-            bg = self.app_window.render_background_pixmap(self.rect().size(), kind=self._style_kind)
-            if not bg.isNull():
-                painter.drawPixmap(self.rect(), bg)
+            _paint_flowgrid_popup_background(self, painter, self.app_window, self._style_kind)
         super().paintEvent(event)
 
     def values(self) -> dict[str, str]:
@@ -7959,6 +8431,134 @@ class PartNotesDialog(QDialog):
         elif hasattr(self, "work_toggle_check") and self.work_toggle_check.isEnabled():
             out["working_user_id"] = self.current_user if self.work_toggle_check.isChecked() else ""
         return out
+
+
+class DeliveredInstallPickerDialog(FlowgridThemedDialog):
+    def __init__(
+        self,
+        work_order: str,
+        delivered_rows: list[dict[str, str]],
+        selected_keys: set[str],
+        app_window: "QuickInputsWindow" | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, app_window, "agent")
+        self.setWindowTitle(f"Installed Parts - {work_order}")
+        self.setModal(True)
+        self.resize(560, 340)
+        self._checks: list[tuple[QCheckBox, str]] = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        summary = QLabel(
+            f"Work Order: {work_order}\nSelect the delivered part lines that were actually installed."
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget(scroll)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(6)
+
+        for row in delivered_rows:
+            row_key = str(row.get("row_key", "") or "").strip()
+            label_text = (
+                f"LPN: {str(row.get('lpn', '') or '').strip() or '-'}\n"
+                f"Part #: {str(row.get('part_number', '') or '').strip() or '-'}\n"
+                f"Description: {str(row.get('part_description', '') or '').strip() or '-'}\n"
+                f"Shipping: {str(row.get('shipping_info', '') or '').strip() or '-'}"
+            )
+            check = QCheckBox(label_text, content)
+            check.setChecked(row_key in selected_keys)
+            check.setProperty("row_key", row_key)
+            content_layout.addWidget(check)
+            self._checks.append((check, row_key))
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        layout.addWidget(scroll, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setContentsMargins(0, 0, 0, 0)
+        buttons.setSpacing(8)
+        buttons.addStretch(1)
+        save_btn = QPushButton("Save")
+        save_btn.setProperty("actionRole", "save")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setProperty("actionRole", "reset")
+        save_btn.clicked.connect(self.accept)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(save_btn, 0)
+        buttons.addWidget(cancel_btn, 0)
+        layout.addLayout(buttons)
+
+        self.apply_theme_styles(force_opaque_root=True)
+
+    def selected_row_keys(self) -> list[str]:
+        return [row_key for check, row_key in self._checks if check.isChecked() and row_key]
+
+
+def _edit_aux_queue_comment(
+    owner: DepotFramelessToolWindow,
+    tracker: DepotTracker,
+    *,
+    table: QTableWidget,
+    target_key: str,
+    theme_kind: str,
+    title: str,
+) -> bool:
+    row = table.currentRow()
+    if row < 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return False
+    row_id_item = table.item(row, 0)
+    if row_id_item is None:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return False
+    row_id = safe_int(row_id_item.data(Qt.ItemDataRole.UserRole), 0)
+    if row_id <= 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Selected row no longer exists.")
+        return False
+    work_order_item = table.item(row, max(0, _table_column_index_by_header(table, "Work Order")))
+    comments_item = table.item(row, max(0, _table_column_index_by_header(table, "Comments")))
+    work_order = str(work_order_item.text() or "").strip() if work_order_item is not None else ""
+    current_text = str(comments_item.text() or "").strip() if comments_item is not None else ""
+    if comments_item is not None:
+        stored_text = str(comments_item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+        if stored_text:
+            current_text = stored_text
+    note_text, ok = show_flowgrid_themed_input_text(
+        owner,
+        owner.app_window,
+        theme_kind,
+        title,
+        f"Work Order: {work_order or '-'}\nUpdate comment:",
+        current_text if current_text != "(none)" else "",
+    )
+    if not ok:
+        return False
+    try:
+        tracker.update_dashboard_note_value(target_key, int(row_id), str(note_text or "").strip())
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.aux_queue_comment_save_failed",
+            severity="warning",
+            summary="Failed saving queue comment update.",
+            exc=exc,
+            context={"target_key": str(target_key), "row_id": int(row_id), "work_order": str(work_order)},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Warning,
+            "Save Failed",
+            f"Could not save comment:\n{type(exc).__name__}: {exc}",
+        )
+        return False
+    return True
 
 
 def _copy_work_order_with_notice(
@@ -8080,6 +8680,9 @@ def _populate_missing_po_followup_table(
         if assigned_icon and Path(assigned_icon).exists():
             assigned_item.setIcon(QIcon(assigned_icon))
         submitted_item = _center_table_item(QTableWidgetItem(submitted_by or "-"))
+        submitted_icon = _resolve_user_icon_from_agent_meta(submitted_by, agent_meta)
+        if submitted_icon is not None:
+            submitted_item.setIcon(submitted_icon)
         logged_item = _center_table_item(QTableWidgetItem(logged_display))
         if logged_at:
             logged_item.setToolTip(logged_at.replace("T", " "))
@@ -8353,7 +8956,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._is_admin_user = self.tracker.is_admin_user(self.current_user)
         self._current_agent_tier = self._resolve_current_agent_tier()
         self._is_tech3_user = int(self._current_agent_tier) == 3
-        self._can_view_missing_po_tab = self.tracker.can_access_missing_po_followups(self.current_user)
+        # Temporarily disable the Missing PO tab for agents.
+        self._can_view_missing_po_tab = False
 
         self.agent_tabs = QTabWidget(self)
         self._agent_tab_bar = AlertPulseTabBar(self.agent_tabs)
@@ -8364,6 +8968,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self.parts_tab = QWidget()
         self.cat_parts_tab = QWidget()
         self.client_tab = QWidget()
+        self.rtv_tab: QWidget | None = QWidget() if self._is_tech3_user else None
         self.missing_po_tab: QWidget | None = QWidget() if self._can_view_missing_po_tab else None
         self.team_client_tab: QWidget | None = None
 
@@ -8371,6 +8976,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self.agent_tabs.addTab(self.parts_tab, "Parts")
         self.agent_tabs.addTab(self.cat_parts_tab, "Cat Parts")
         self.agent_tabs.addTab(self.client_tab, "Client")
+        if self.rtv_tab is not None:
+            self.agent_tabs.addTab(self.rtv_tab, "RTV")
         if self.missing_po_tab is not None:
             self.agent_tabs.addTab(self.missing_po_tab, "Missing PO")
         if self.team_client_tab is not None:
@@ -8381,21 +8988,29 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             "cat_parts": int(self.agent_tabs.indexOf(self.cat_parts_tab)),
             "client": int(self.agent_tabs.indexOf(self.client_tab)),
         }
+        if self.rtv_tab is not None:
+            self._tab_indices["rtv"] = int(self.agent_tabs.indexOf(self.rtv_tab))
         if self.missing_po_tab is not None:
             self._tab_indices["missing_po"] = int(self.agent_tabs.indexOf(self.missing_po_tab))
         if self.team_client_tab is not None:
             self._tab_indices["team_client"] = int(self.agent_tabs.indexOf(self.team_client_tab))
         self._tab_titles: dict[str, str] = {"parts": "Parts", "cat_parts": "Cat Parts", "client": "Client"}
+        if self.rtv_tab is not None:
+            self._tab_titles["rtv"] = "RTV"
         if self.missing_po_tab is not None:
             self._tab_titles["missing_po"] = "Missing PO"
         if self.team_client_tab is not None:
             self._tab_titles["team_client"] = "Team Client"
         self._tab_alert_states: dict[str, bool] = {"parts": False, "cat_parts": False, "client": False}
+        if self.rtv_tab is not None:
+            self._tab_alert_states["rtv"] = False
         if self.missing_po_tab is not None:
             self._tab_alert_states["missing_po"] = False
         if self.team_client_tab is not None:
             self._tab_alert_states["team_client"] = False
         self._tab_alert_ack_states: dict[str, bool] = {"parts": False, "cat_parts": False, "client": False}
+        if self.rtv_tab is not None:
+            self._tab_alert_ack_states["rtv"] = False
         if self.missing_po_tab is not None:
             self._tab_alert_ack_states["missing_po"] = False
         if self.team_client_tab is not None:
@@ -8425,6 +9040,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._build_parts_tab()
         self._build_cat_parts_tab()
         self._build_client_tab()
+        if self.rtv_tab is not None:
+            self._build_rtv_tab()
         if self.missing_po_tab is not None:
             self._build_missing_po_tab()
         if self.team_client_tab is not None:
@@ -8540,6 +9157,11 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         super().apply_theme_styles()
         self._apply_tab_alert_visuals()
 
+    def closeEvent(self, event) -> None:  # noqa: N802
+        super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
+
     def _resolve_current_agent_tier(self) -> int:
         return int(self.tracker.get_agent_tier(self.current_user, default=1))
 
@@ -8606,6 +9228,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             )
         )
         self._set_tab_alert("client", client_alert)
+        if "rtv" in self._tab_alert_states:
+            self._set_tab_alert("rtv", False, acknowledged=True)
         if "missing_po" in self._tab_alert_states:
             missing_po_alert = bool(getattr(self, "_missing_po_followup_ids", set()))
             missing_po_ack = bool(self._tab_alert_ack_states.get("missing_po", False))
@@ -8673,8 +9297,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             "SELECT touch, COUNT(*) AS c "
             "FROM submissions "
             "WHERE user_id=? "
-            "AND COALESCE(NULLIF(TRIM(entry_date), ''), SUBSTR(created_at, 1, 10))>=? "
-            "AND COALESCE(NULLIF(TRIM(entry_date), ''), SUBSTR(created_at, 1, 10))<=? "
+            f"AND {_submission_entry_date_sql()}>=? "
+            f"AND {_submission_entry_date_sql()}<=? "
             "GROUP BY touch",
             (self.current_user, start_date, end_date),
         )
@@ -8788,8 +9412,10 @@ class DepotAgentWindow(DepotFramelessToolWindow):
     def _refresh_recent_submissions_label(self) -> None:
         try:
             rows = self.tracker.db.fetchall(
-                "SELECT work_order, touch, COALESCE(category, '') AS category, client_unit, created_at "
-                "FROM submissions WHERE user_id=? ORDER BY created_at DESC LIMIT 3",
+                "SELECT work_order, touch, COALESCE(category, '') AS category, client_unit, "
+                f"{_submission_latest_ts_sql()} AS latest_stamp "
+                "FROM submissions WHERE user_id=? "
+                f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 3",
                 (self.current_user,),
             )
         except Exception as exc:
@@ -8821,8 +9447,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             touch = str(row["touch"])
             category = self.tracker.resolve_work_order_category(wo, str(row["category"] or "").strip()) or "Other"
             client_marker = " \u2713" if int(row["client_unit"] or 0) else ""
-            created = str(row["created_at"] or "")
-            stamp = created[11:16] if len(created) >= 16 else created
+            latest_stamp = str(row["latest_stamp"] or "")
+            stamp = latest_stamp[11:16] if len(latest_stamp) >= 16 else latest_stamp
             lines.append(f"{index}. {wo} ({touch} | {category}{client_marker}) [{stamp}]")
 
         for index in range(len(rows) + 1, 4):
@@ -9021,6 +9647,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             image_path = str(row["qa_flag_image_path"] or "").strip()
             if not flag and not image_path:
                 continue
+            if self.tracker.is_alert_quiet(str(row["alert_quiet_until"] or "").strip()):
+                continue
             working_user = DepotRules.normalize_user_id(str(row["working_user_id"] or ""))
             working_stamp = str(row["working_updated_at"] or "").strip()
             if working_user and not self._is_working_flag_stale(working_stamp):
@@ -9035,7 +9663,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         try:
             part_rows = self.tracker.db.fetchall(
                 "SELECT COALESCE(qa_flag, '') AS qa_flag, COALESCE(qa_flag_image_path, '') AS qa_flag_image_path, "
-                "COALESCE(working_user_id, '') AS working_user_id, COALESCE(working_updated_at, '') AS working_updated_at "
+                "COALESCE(working_user_id, '') AS working_user_id, COALESCE(working_updated_at, '') AS working_updated_at, "
+                "COALESCE(alert_quiet_until, '') AS alert_quiet_until "
                 "FROM parts WHERE assigned_user_id=? AND is_active=1",
                 (self.current_user,),
             )
@@ -9047,7 +9676,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             if self._is_tech3_user:
                 cat_rows = self.tracker.db.fetchall(
                     "SELECT COALESCE(qa_flag, '') AS qa_flag, COALESCE(qa_flag_image_path, '') AS qa_flag_image_path, "
-                    "COALESCE(working_user_id, '') AS working_user_id, COALESCE(working_updated_at, '') AS working_updated_at "
+                    "COALESCE(working_user_id, '') AS working_user_id, COALESCE(working_updated_at, '') AS working_updated_at, "
+                    "COALESCE(alert_quiet_until, '') AS alert_quiet_until "
                     "FROM parts WHERE is_active=1"
                 )
                 cat_urgent, cat_in_progress = self._flag_alert_counts_from_rows(cat_rows)
@@ -9115,13 +9745,16 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             )
             self._show_themed_message(QMessageBox.Icon.Critical, "Save Failed", f"Could not update flag:\n{type(exc).__name__}: {exc}")
             return
+        if self.app_window is not None:
+            self.app_window._refresh_visible_depot_views(
+                "agent_parts",
+                "agent_category",
+                "qa_assigned",
+                "qa_delivered",
+            )
+            return
         self._refresh_agent_parts()
         self._refresh_category_parts()
-        if self.app_window is not None:
-            qa_window = getattr(self.app_window, "active_qa_window", None)
-            if qa_window is not None and qa_window.isVisible():
-                qa_window._refresh_assigned_parts()
-                qa_window._refresh_delivered_parts()
 
     def _toggle_selected_part_installed(self, table: QTableWidget) -> None:
         part_id = _selected_part_id_from_table(table)
@@ -9129,16 +9762,61 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
             return
         row = self.tracker.db.fetchone(
-            "SELECT COALESCE(parts_installed, 0) AS parts_installed "
+            "SELECT COALESCE(parts_installed, 0) AS parts_installed, COALESCE(work_order, '') AS work_order "
             "FROM parts WHERE id=?",
             (int(part_id),),
         )
         if row is None:
             self._show_themed_message(QMessageBox.Icon.Warning, "Missing", "Selected part no longer exists.")
             return
-        next_state = 0 if int(row["parts_installed"] or 0) else 1
+        work_order = DepotRules.normalize_work_order(str(row["work_order"] or ""))
+        delivered_rows = self.tracker.list_delivered_part_details(work_order)
+        delivered_options: list[dict[str, str]] = []
+        preselected_keys: set[str] = set()
+        for detail in delivered_rows:
+            installed_keys = _installed_key_set_from_text(str(detail["installed_keys"] or ""))
+            merged_rows = _dedupe_part_detail_rows(
+                _merged_part_detail_rows(
+                    str(detail["lpn"] or ""),
+                    str(detail["part_number"] or ""),
+                    str(detail["part_description"] or ""),
+                    str(detail["shipping_info"] or ""),
+                )
+            )
+            for lpn_value, part_value, desc_value, ship_value in merged_rows:
+                row_key = _part_detail_row_key(lpn_value, part_value, desc_value, ship_value)
+                if not row_key:
+                    continue
+                delivered_options.append(
+                    {
+                        "row_key": row_key,
+                        "lpn": lpn_value,
+                        "part_number": part_value,
+                        "part_description": desc_value,
+                        "shipping_info": ship_value,
+                    }
+                )
+                if row_key in installed_keys:
+                    preselected_keys.add(row_key)
+        if not delivered_options:
+            self._show_themed_message(
+                QMessageBox.Icon.Information,
+                "Installed Parts",
+                "No delivered part lines are available yet for this work order.",
+            )
+            return
+        dialog = DeliveredInstallPickerDialog(
+            work_order,
+            delivered_options,
+            preselected_keys,
+            app_window=self.app_window,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected_keys = dialog.selected_row_keys()
         try:
-            self.tracker.set_part_installed(part_id, bool(next_state), self.current_user)
+            self.tracker.set_part_installed(part_id, selected_keys, self.current_user)
         except Exception as exc:
             _runtime_log_event(
                 "ui.agent_set_part_installed_failed",
@@ -9148,7 +9826,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 context={
                     "user_id": str(self.current_user),
                     "part_id": int(part_id),
-                    "next_state": int(next_state),
+                    "selected_keys": list(selected_keys),
                 },
             )
             self._show_themed_message(
@@ -9157,13 +9835,16 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 f"Could not update installed state:\n{type(exc).__name__}: {exc}",
             )
             return
+        if self.app_window is not None:
+            self.app_window._refresh_visible_depot_views(
+                "agent_parts",
+                "agent_category",
+                "qa_assigned",
+                "qa_delivered",
+            )
+            return
         self._refresh_agent_parts()
         self._refresh_category_parts()
-        if self.app_window is not None:
-            qa_window = getattr(self.app_window, "active_qa_window", None)
-            if qa_window is not None and qa_window.isVisible():
-                qa_window._refresh_assigned_parts()
-                qa_window._refresh_delivered_parts()
 
     def _on_parts_table_cell_clicked(self, tab_key: str, table: QTableWidget, row: int, col: int) -> None:
         if row < 0 or col < 0:
@@ -9225,12 +9906,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             parts_installed = bool(int(r["parts_installed"] or 0))
             parts_installed_by = DepotRules.normalize_user_id(str(r["parts_installed_by"] or ""))
             parts_installed_at = str(r["parts_installed_at"] or "").strip()
+            alert_quiet_until = str(r["alert_quiet_until"] or "").strip()
             image_abs = self.tracker.resolve_qa_flag_icon(
                 str(r["qa_flag"] or "").strip(),
                 str(r["qa_flag_image_path"] or ""),
             )
             has_flag = bool(str(flag).strip() or str(image_abs).strip())
-            if has_flag:
+            if has_flag and not self.tracker.is_alert_quiet(alert_quiet_until):
                 if working_user and not self._is_working_flag_stale(working_stamp):
                     in_progress_flagged_rows += 1
                 else:
@@ -9454,12 +10136,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             parts_installed = bool(int(r["parts_installed"] or 0))
             parts_installed_by = DepotRules.normalize_user_id(str(r["parts_installed_by"] or ""))
             parts_installed_at = str(r["parts_installed_at"] or "").strip()
+            alert_quiet_until = str(r["alert_quiet_until"] or "").strip()
             image_abs = self.tracker.resolve_qa_flag_icon(
                 str(r["qa_flag"] or "").strip(),
                 str(r["qa_flag_image_path"] or ""),
             )
             has_flag = bool(str(flag).strip() or str(image_abs).strip())
-            if has_flag:
+            if has_flag and not self.tracker.is_alert_quiet(alert_quiet_until):
                 if working_user and not self._is_working_flag_stale(working_stamp):
                     in_progress_flagged_rows += 1
                 else:
@@ -9541,7 +10224,10 @@ class DepotAgentWindow(DepotFramelessToolWindow):
 
     def _build_client_tab(self):
         layout = QVBoxLayout(self.client_tab)
-        summary = QLabel("Client follow-up queue for this agent (Client + Other daily, Part Order after 21 days).")
+        if self._is_tech3_user:
+            summary = QLabel("Client follow-up queue for all agents (Client + Other daily, Part Order after 21 days).")
+        else:
+            summary = QLabel("Client follow-up queue for this agent (Client + Other daily, Part Order after 21 days).")
         summary.setWordWrap(True)
         summary.setProperty("muted", True)
         layout.addWidget(summary)
@@ -9559,17 +10245,30 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         layout.addWidget(self.client_due_summary)
 
         self.client_followup_table = QTableWidget()
-        configure_standard_table(
-            self.client_followup_table,
-            ["Due", "Work Order", "Status", "Last Update", "Age", "Notes"],
-            resize_modes={
+        headers = ["Due", "Work Order", "Status", "Last Update", "Age", "Notes"]
+        resize_modes = {
+            0: QHeaderView.ResizeMode.ResizeToContents,
+            1: QHeaderView.ResizeMode.ResizeToContents,
+            2: QHeaderView.ResizeMode.ResizeToContents,
+            3: QHeaderView.ResizeMode.ResizeToContents,
+            4: QHeaderView.ResizeMode.ResizeToContents,
+            5: QHeaderView.ResizeMode.Stretch,
+        }
+        if self._is_tech3_user:
+            headers = ["Agent", "Due", "Work Order", "Status", "Last Update", "Age", "Notes"]
+            resize_modes = {
                 0: QHeaderView.ResizeMode.ResizeToContents,
                 1: QHeaderView.ResizeMode.ResizeToContents,
                 2: QHeaderView.ResizeMode.ResizeToContents,
                 3: QHeaderView.ResizeMode.ResizeToContents,
                 4: QHeaderView.ResizeMode.ResizeToContents,
-                5: QHeaderView.ResizeMode.Stretch,
-            },
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.Stretch,
+            }
+        configure_standard_table(
+            self.client_followup_table,
+            headers,
+            resize_modes=resize_modes,
             stretch_last=True,
         )
         self.client_followup_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -9585,6 +10284,114 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._client_due_flash_timer.timeout.connect(self._on_client_due_flash_tick)
         self._client_due_flash_timer.start()
         self._refresh_client_followup()
+
+    def _build_rtv_tab(self) -> None:
+        if self.rtv_tab is None:
+            return
+        layout = QVBoxLayout(self.rtv_tab)
+        summary = QLabel("Tech 3 RTV queue with shared comment updates.")
+        summary.setWordWrap(True)
+        summary.setProperty("muted", True)
+        layout.addWidget(summary)
+
+        self.agent_rtv_table = QTableWidget()
+        configure_standard_table(
+            self.agent_rtv_table,
+            ["Work Order", "Logged At", "Logged By", "Comments"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.agent_rtv_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.agent_rtv_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        self.agent_rtv_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.agent_rtv_table.customContextMenuRequested.connect(
+            lambda pos: self._open_agent_rtv_comment_from_context(pos)
+        )
+
+        self.agent_rtv_refresh_btn = QPushButton("Refresh")
+        self.agent_rtv_refresh_btn.clicked.connect(self._refresh_rtv_rows)
+        self.agent_rtv_open_notes_btn = QPushButton("Open Notes / Update Comment")
+        self.agent_rtv_open_notes_btn.setProperty("actionRole", "pick")
+        self.agent_rtv_open_notes_btn.clicked.connect(self._open_selected_agent_rtv_comment)
+        self.agent_rtv_workorder_search = QLineEdit()
+        self.agent_rtv_workorder_search.setPlaceholderText("Search work order...")
+        self.agent_rtv_workorder_search.setClearButtonEnabled(True)
+        self.agent_rtv_workorder_search.textChanged.connect(self._refresh_rtv_rows)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Work Order:"))
+        controls.addWidget(self.agent_rtv_workorder_search, 1)
+        controls.addWidget(self.agent_rtv_refresh_btn)
+        controls.addWidget(self.agent_rtv_open_notes_btn)
+        layout.addLayout(controls)
+        layout.addWidget(self.agent_rtv_table, 1)
+        self._refresh_rtv_rows()
+
+    def _refresh_rtv_rows(self) -> None:
+        if not hasattr(self, "agent_rtv_table"):
+            return
+        search_text = str(self.agent_rtv_workorder_search.text() or "").strip() if hasattr(self, "agent_rtv_workorder_search") else ""
+        try:
+            rows = self.tracker.list_rtv_rows(search_text)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.agent_rtv_refresh_failed",
+                severity="warning",
+                summary="Failed loading RTV queue for Agent window.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self.agent_rtv_table.setRowCount(0)
+            return
+        agent_meta = self._agent_meta_lookup()
+        self.agent_rtv_table.setRowCount(0)
+        for row_idx, row in enumerate(rows):
+            self.agent_rtv_table.insertRow(row_idx)
+            work_item = self._center_item(QTableWidgetItem(str(row["work_order"] or "").strip()))
+            work_item.setData(Qt.ItemDataRole.UserRole, int(row["id"] or 0))
+            logged_item = self._center_item(QTableWidgetItem(self._format_working_updated_stamp(str(row["created_at"] or "").strip()) or "-"))
+            logged_item.setToolTip(str(row["created_at"] or "").strip())
+            normalized_user = DepotRules.normalize_user_id(str(row["user_id"] or ""))
+            user_item = self._center_item(QTableWidgetItem(normalized_user or "-"))
+            user_icon = _resolve_user_icon_from_agent_meta(normalized_user, agent_meta)
+            if user_icon is not None:
+                user_item.setIcon(user_icon)
+            comment_text = str(row["comments"] or "").strip()
+            comment_item = self._center_item(QTableWidgetItem(self._note_preview(comment_text)))
+            comment_item.setData(Qt.ItemDataRole.UserRole + 1, comment_text)
+            comment_item.setToolTip(f"Comments: {comment_text if comment_text else '(none)'}")
+            self.agent_rtv_table.setItem(row_idx, 0, work_item)
+            self.agent_rtv_table.setItem(row_idx, 1, logged_item)
+            self.agent_rtv_table.setItem(row_idx, 2, user_item)
+            self.agent_rtv_table.setItem(row_idx, 3, comment_item)
+
+    def _open_agent_rtv_comment_from_context(self, pos: QPoint) -> None:
+        if not hasattr(self, "agent_rtv_table"):
+            return
+        if not _select_table_row_by_context_pos(self.agent_rtv_table, pos):
+            return
+        self._open_selected_agent_rtv_comment()
+
+    def _open_selected_agent_rtv_comment(self) -> None:
+        if not hasattr(self, "agent_rtv_table"):
+            return
+        if not _edit_aux_queue_comment(
+            self,
+            self.tracker,
+            table=self.agent_rtv_table,
+            target_key="rtvs.comments",
+            theme_kind="agent",
+            title="RTV Comment",
+        ):
+            return
+        self._refresh_rtv_rows()
+        if self.app_window is not None:
+            self.app_window._refresh_visible_depot_views("dashboard_notes")
 
     def _agent_meta_lookup(self) -> dict[str, tuple[str, str]]:
         try:
@@ -9818,6 +10625,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
 
         today = datetime.now().date()
         today_iso = today.isoformat()
+        agent_meta = self._agent_meta_lookup()
         self.team_client_followup_table.setRowCount(0)
         kept_row = 0
         due_total = 0
@@ -9833,6 +10641,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             last_action = DepotRules.normalize_followup_action(str(r["followup_last_action"] or ""))
             last_action_at = str(r["followup_last_action_at"] or "").strip()
             last_action_actor = DepotRules.normalize_user_id(str(r["followup_last_actor"] or ""))
+            alert_quiet_until = str(r["alert_quiet_until"] or "").strip()
+            quiet_active = self.tracker.is_alert_quiet(alert_quiet_until)
             no_contact_count = int(max(0, safe_int(r["followup_no_contact_count"], 0)))
             action_date = self._parse_iso_date(last_action_at)
             days_since_action = max(0, (today - action_date).days) if action_date is not None else -1
@@ -9867,10 +10677,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             if not due:
                 continue
             has_action = bool(last_action)
-            due_active = bool(due and not has_action)
+            due_active = bool(due and not quiet_active and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED)
 
             self.team_client_followup_table.insertRow(kept_row)
             agent_item = self._center_item(QTableWidgetItem(user_id if user_id else "-"))
+            agent_icon = _resolve_user_icon_from_agent_meta(user_id, agent_meta)
+            if agent_icon is not None:
+                agent_item.setIcon(agent_icon)
             due_item = self._center_item(QTableWidgetItem(""))
             if due_active:
                 due_item.setText(DepotRules.followup_stage_label(0))
@@ -9887,7 +10700,12 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             actor_line = f" by {last_action_actor}" if last_action_actor else ""
             when_line = f" ({self._format_working_updated_stamp(last_action_at)})" if last_action_at else ""
             attempt_line = f"\nNo-contact follow-ups: {no_contact_count}" if no_contact_count > 0 else ""
-            due_item.setToolTip(f"{due_reason}{action_line}{actor_line}{when_line}{attempt_line}")
+            quiet_line = (
+                f"\nAlert quiet until: {self._format_working_updated_stamp(alert_quiet_until)}"
+                if quiet_active
+                else ""
+            )
+            due_item.setToolTip(f"{due_reason}{action_line}{actor_line}{when_line}{attempt_line}{quiet_line}")
 
             work_item = self._center_item(QTableWidgetItem(work_order))
             status_item = self._center_item(QTableWidgetItem(latest_touch))
@@ -9920,7 +10738,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         if not hasattr(self, "client_followup_table"):
             return
         try:
-            rows = self.tracker.list_client_followups(self.current_user)
+            rows = self.tracker.list_team_client_followups() if self._is_tech3_user else self.tracker.list_client_followups(self.current_user)
         except Exception as exc:
             _runtime_log_event(
                 "ui.agent_client_followup_query_failed",
@@ -9939,11 +10757,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
 
         today = datetime.now().date()
         today_iso = today.isoformat()
+        agent_meta = self._agent_meta_lookup()
         self.client_followup_table.setRowCount(0)
         previous_active_ids = set(getattr(self, "_client_due_active_ids", set()))
         due_items: list[QTableWidgetItem] = []
         due_count = 0
         due_active_ids: set[int] = set()
+        due_quiet_count = 0
         kept_row = 0
         for r in rows:
             client_part_id = int(r["id"])
@@ -9956,6 +10776,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             last_action = DepotRules.normalize_followup_action(str(r["followup_last_action"] or ""))
             last_action_at = str(r["followup_last_action_at"] or "").strip()
             last_action_actor = DepotRules.normalize_user_id(str(r["followup_last_actor"] or ""))
+            alert_quiet_until = str(r["alert_quiet_until"] or "").strip()
+            quiet_active = self.tracker.is_alert_quiet(alert_quiet_until)
             no_contact_count = int(max(0, safe_int(r["followup_no_contact_count"], 0)))
             stage_logged = int(safe_int(r["followup_stage_logged"], -1))
             action_date = self._parse_iso_date(last_action_at)
@@ -9995,16 +10817,22 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                         due_reason = f"Part Order follow-up due ({po_days} days)."
 
             has_action = bool(last_action)
-            due_active = bool(due and not has_action)
+            due_active = bool(due and not quiet_active and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED)
 
             self.client_followup_table.insertRow(kept_row)
             due_item = self._center_item(QTableWidgetItem(""))
             due_item.setData(Qt.ItemDataRole.UserRole, client_part_id)
             due_item.setData(Qt.ItemDataRole.UserRole + 1, 1 if due else 0)
             due_item.setData(Qt.ItemDataRole.UserRole + 2, 1 if has_action else 0)
+            due_item.setData(Qt.ItemDataRole.UserRole + 3, 1 if quiet_active else 0)
             if due_active:
-                due_item.setText(DepotRules.followup_stage_label(0))
-                due_item.setIcon(self._followup_clock_icon("#21B46D"))
+                if has_action and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED:
+                    clock_icon, stage_text = self._followup_wait_icon_by_days(days_since_action)
+                    due_item.setText(stage_text)
+                    due_item.setIcon(clock_icon)
+                else:
+                    due_item.setText(DepotRules.followup_stage_label(0))
+                    due_item.setIcon(self._followup_clock_icon("#21B46D"))
             elif due and has_action:
                 if last_action == DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED:
                     due_item.setText("")
@@ -10036,6 +10864,11 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 actor_line = f" by {last_action_actor}" if last_action_actor else ""
                 when_line = f" ({self._format_working_updated_stamp(last_action_at)})" if last_action_at else ""
                 attempt_line = f"\nNo-contact follow-ups: {no_contact_count}" if no_contact_count > 0 else ""
+                quiet_line = (
+                    f"\nAlert quiet until: {self._format_working_updated_stamp(alert_quiet_until)}"
+                    if quiet_active
+                    else ""
+                )
                 if has_action and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED and days_since_action >= 0:
                     stage_name = DepotRules.followup_stage_label(0 if days_since_action <= 0 else (1 if days_since_action == 1 else 2))
                     wait_line = f"\nWaiting Stage: {stage_name}"
@@ -10043,12 +10876,12 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                     wait_line = ""
                 if has_action and last_action:
                     due_item.setToolTip(
-                        f"{due_reason}{wait_line}{action_line}{actor_line}{when_line}{attempt_line}\n"
+                        f"{due_reason}{wait_line}{action_line}{actor_line}{when_line}{attempt_line}{quiet_line}\n"
                         "Click this cell to log another follow-up action."
                     )
                 else:
                     due_item.setToolTip(
-                        f"{due_reason}{action_line}{actor_line}{when_line}{attempt_line}\n"
+                        f"{due_reason}{action_line}{actor_line}{when_line}{attempt_line}{quiet_line}\n"
                         "Click this cell to log follow-up action."
                     )
             else:
@@ -10060,17 +10893,33 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             note_item = self._center_item(QTableWidgetItem(self._note_preview(notes)))
             note_item.setToolTip(f"Comments: {notes if notes else '(none)'}")
 
-            self.client_followup_table.setItem(kept_row, 0, due_item)
-            self.client_followup_table.setItem(kept_row, 1, work_item)
-            self.client_followup_table.setItem(kept_row, 2, status_item)
-            self.client_followup_table.setItem(kept_row, 3, update_item)
-            self.client_followup_table.setItem(kept_row, 4, age_item)
-            self.client_followup_table.setItem(kept_row, 5, note_item)
+            if self._is_tech3_user:
+                user_id = DepotRules.normalize_user_id(str(r["user_id"] or ""))
+                agent_item = self._center_item(QTableWidgetItem(user_id if user_id else "-"))
+                user_icon = _resolve_user_icon_from_agent_meta(user_id, agent_meta)
+                if user_icon is not None:
+                    agent_item.setIcon(user_icon)
+                self.client_followup_table.setItem(kept_row, 0, agent_item)
+                self.client_followup_table.setItem(kept_row, 1, due_item)
+                self.client_followup_table.setItem(kept_row, 2, work_item)
+                self.client_followup_table.setItem(kept_row, 3, status_item)
+                self.client_followup_table.setItem(kept_row, 4, update_item)
+                self.client_followup_table.setItem(kept_row, 5, age_item)
+                self.client_followup_table.setItem(kept_row, 6, note_item)
+            else:
+                self.client_followup_table.setItem(kept_row, 0, due_item)
+                self.client_followup_table.setItem(kept_row, 1, work_item)
+                self.client_followup_table.setItem(kept_row, 2, status_item)
+                self.client_followup_table.setItem(kept_row, 3, update_item)
+                self.client_followup_table.setItem(kept_row, 4, age_item)
+                self.client_followup_table.setItem(kept_row, 5, note_item)
             if due_active:
                 due_active_ids.add(client_part_id)
                 if int(client_part_id) not in self._client_due_ack_ids:
                     due_items.append(due_item)
                 due_count += 1
+            elif due and quiet_active:
+                due_quiet_count += 1
             kept_row += 1
 
         self._client_due_ack_ids.intersection_update(due_active_ids)
@@ -10082,27 +10931,33 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._apply_client_due_flash_visuals()
         self._update_tab_alert_states()
         if due_count > 0:
-            self.client_due_summary.setText(f"Follow-up due now: {due_count}")
+            suffix = f" | Quieted: {due_quiet_count}" if due_quiet_count > 0 else ""
+            self.client_due_summary.setText(f"Follow-up due now: {due_count}{suffix}")
+        elif due_quiet_count > 0:
+            self.client_due_summary.setText(f"Follow-up alerts quieted until tomorrow morning: {due_quiet_count}")
         else:
             self.client_due_summary.setText("No follow-up alerts.")
 
     def _on_client_followup_cell_clicked(self, row: int, col: int) -> None:
-        if col != 0:
+        due_col = 1 if self._is_tech3_user else 0
+        work_col = 2 if self._is_tech3_user else 1
+        if col != due_col:
             return
         if row < 0 or row >= int(self.client_followup_table.rowCount()):
             return
-        due_item = self.client_followup_table.item(row, 0)
-        work_item = self.client_followup_table.item(row, 1)
+        due_item = self.client_followup_table.item(row, due_col)
+        work_item = self.client_followup_table.item(row, work_col)
         if due_item is None or work_item is None:
             return
         is_due_row = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 1), 0) > 0
         has_logged_action = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 2), 0) > 0
+        quiet_active = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 3), 0) > 0
         if not is_due_row and not has_logged_action:
             return
         client_part_id = safe_int(due_item.data(Qt.ItemDataRole.UserRole), 0)
         if client_part_id <= 0:
             return
-        if is_due_row and client_part_id in self._client_due_active_ids:
+        if is_due_row and not quiet_active and client_part_id in self._client_due_active_ids:
             self._client_due_ack_ids.add(int(client_part_id))
             due_item.setBackground(QColor(0, 0, 0, 0))
             self._client_due_items = [
@@ -10166,6 +11021,11 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         if not hasattr(self, "_client_due_items"):
             return
         if not self._client_due_items:
+            if hasattr(self, "client_followup_table"):
+                for row_idx in range(int(self.client_followup_table.rowCount())):
+                    item = self.client_followup_table.item(row_idx, 0)
+                    if item is not None:
+                        item.setBackground(QColor(0, 0, 0, 0))
             return
         on_color = QColor("#D95A5A")
         on_color.setAlpha(105)
@@ -10204,12 +11064,20 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.submit_tab = QWidget()
         self.assigned_tab = QWidget()
         self.delivered_tab = QWidget()
+        self.qa_cat_parts_tab = QWidget()
+        self.qa_client_tab = QWidget()
+        self.qa_rtv_tab = QWidget()
+        self.client_jo_tab = QWidget()
         if self._can_view_missing_po_tab:
             self.missing_po_followup_tab = QWidget()
 
         self.qa_tabs.addTab(self.submit_tab, "Submit")
         self.qa_tabs.addTab(self.assigned_tab, "Active Parts")
         self.qa_tabs.addTab(self.delivered_tab, "Parts Delivered")
+        self.qa_tabs.addTab(self.qa_cat_parts_tab, "Cat Parts")
+        self.qa_tabs.addTab(self.qa_client_tab, "Client")
+        self.qa_tabs.addTab(self.qa_rtv_tab, "RTV")
+        self.qa_tabs.addTab(self.client_jo_tab, "Client JO")
         if self._can_view_missing_po_tab:
             self.qa_tabs.addTab(self.missing_po_followup_tab, "Missing PO")
 
@@ -10218,6 +11086,22 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._qa_tab_alert_states: dict[str, bool] = {}
         self._qa_tab_alert_ack_states: dict[str, bool] = {}
         self._qa_missing_po_followup_ids: set[int] = set()
+        self._qa_tab_indices["cat_parts"] = int(self.qa_tabs.indexOf(self.qa_cat_parts_tab))
+        self._qa_tab_titles["cat_parts"] = "Cat Parts"
+        self._qa_tab_alert_states["cat_parts"] = False
+        self._qa_tab_alert_ack_states["cat_parts"] = False
+        self._qa_tab_indices["client"] = int(self.qa_tabs.indexOf(self.qa_client_tab))
+        self._qa_tab_titles["client"] = "Client"
+        self._qa_tab_alert_states["client"] = False
+        self._qa_tab_alert_ack_states["client"] = False
+        self._qa_tab_indices["rtv"] = int(self.qa_tabs.indexOf(self.qa_rtv_tab))
+        self._qa_tab_titles["rtv"] = "RTV"
+        self._qa_tab_alert_states["rtv"] = False
+        self._qa_tab_alert_ack_states["rtv"] = False
+        self._qa_tab_indices["client_jo"] = int(self.qa_tabs.indexOf(self.client_jo_tab))
+        self._qa_tab_titles["client_jo"] = "Client JO"
+        self._qa_tab_alert_states["client_jo"] = False
+        self._qa_tab_alert_ack_states["client_jo"] = False
         if self._can_view_missing_po_tab:
             self._qa_tab_indices["missing_po"] = int(self.qa_tabs.indexOf(self.missing_po_followup_tab))
             self._qa_tab_titles["missing_po"] = "Missing PO"
@@ -10233,6 +11117,10 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._build_qa_submit_tab()
         self._build_qa_assigned_tab()
         self._build_qa_delivered_tab()
+        self._build_qa_cat_parts_tab()
+        self._build_qa_client_followup_tab()
+        self._build_qa_rtv_tab()
+        self._build_qa_client_jo_tab()
         if self._can_view_missing_po_tab:
             self._build_qa_missing_po_followup_tab()
 
@@ -10287,6 +11175,15 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._apply_qa_tab_alert_visuals()
 
     def _update_qa_tab_alert_states(self) -> None:
+        self._set_qa_tab_alert("cat_parts", False, acknowledged=True)
+        client_alert = bool(
+            any(
+                int(part_id) not in getattr(self, "_qa_client_due_ack_ids", set())
+                for part_id in getattr(self, "_qa_client_due_active_ids", set())
+            )
+        )
+        self._set_qa_tab_alert("client", client_alert)
+        self._set_qa_tab_alert("rtv", False, acknowledged=True)
         if "missing_po" not in self._qa_tab_alert_states:
             return
         missing_po_alert = bool(getattr(self, "_qa_missing_po_followup_ids", set()))
@@ -10414,6 +11311,38 @@ class DepotQAWindow(DepotFramelessToolWindow):
             return
         owner_user_id = DepotRules.normalize_user_id(str(source_submission.get("user_id", "") or ""))
         self.qa_repair_owner.setText(owner_user_id if owner_user_id else "Repair owner unavailable")
+
+    def _confirm_qa_flag_retention(self, work_order: str, selected_flag: str) -> str | None:
+        selected_flag_text = str(selected_flag or "").strip()
+        if selected_flag_text:
+            return selected_flag_text
+
+        existing_flag = self.tracker.get_active_part_qa_flag(work_order)
+        if not existing_flag:
+            return ""
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Question)
+        dialog.setWindowTitle("Confirm QA Flag")
+        dialog.setText(
+            "This work order already has an existing QA flag. "
+            "Submitting with no flag selected will clear the existing QA flag."
+        )
+        dialog.setInformativeText(
+            f"Existing QA flag: {existing_flag}\n\nDo you want to keep the existing flag?"
+        )
+        keep_button = dialog.addButton("Keep Existing Flag", QMessageBox.ButtonRole.YesRole)
+        clear_button = dialog.addButton("Clear Flag", QMessageBox.ButtonRole.NoRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(keep_button)
+        dialog.exec()
+
+        clicked = dialog.clickedButton()
+        if clicked == keep_button:
+            return existing_flag
+        if clicked == clear_button:
+            return ""
+        return None
 
     def _qa_agent_choice_items(self, work_order: str) -> tuple[list[str], dict[str, str], int]:
         return self.tracker.part_owner_choice_items(work_order)
@@ -10562,6 +11491,9 @@ class DepotQAWindow(DepotFramelessToolWindow):
         selected_flag = str(self.qa_flag_combo.currentText() if hasattr(self, "qa_flag_combo") else "").strip()
         if selected_flag.lower() == "none":
             selected_flag = ""
+        selected_flag = self._confirm_qa_flag_retention(wo, selected_flag)
+        if selected_flag is None:
+            return
 
         try:
             if assigned_user_id:
@@ -10611,6 +11543,10 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._refresh_recent_submissions_label()
         self._refresh_assigned_parts()
         self._refresh_delivered_parts()
+        self._refresh_qa_category_parts()
+        self._refresh_qa_client_followup()
+        self._refresh_qa_rtv_rows()
+        self._refresh_qa_client_jo_rows()
         self._refresh_missing_po_followups()
         if self.app_window is not None:
             agent_window = getattr(self.app_window, "active_agent_window", None)
@@ -10618,15 +11554,23 @@ class DepotQAWindow(DepotFramelessToolWindow):
                 try:
                     agent_window._refresh_agent_parts()
                     agent_window._refresh_category_parts()
+                    agent_window._refresh_client_followup()
+                    if getattr(agent_window, "rtv_tab", None) is not None:
+                        agent_window._refresh_rtv_rows()
                     agent_window._refresh_missing_po_followups()
                 except Exception as exc:
                     _runtime_log_event(
                         "ui.qa_agent_window_refresh_failed",
                         severity="warning",
                         summary="QA submit succeeded but paired agent window refresh failed.",
-                        exc=exc,
-                        context={"user_id": str(self.current_user)},
-                    )
+                    exc=exc,
+                    context={"user_id": str(self.current_user)},
+                )
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
 
     def _show_qa_bulk_parts_context_menu(self, pos: QPoint) -> None:
         if not hasattr(self, "qa_bulk_parts_input"):
@@ -10681,14 +11625,17 @@ class DepotQAWindow(DepotFramelessToolWindow):
         selected_flag = str(self.qa_flag_combo.currentText() if hasattr(self, "qa_flag_combo") else "").strip()
         if selected_flag.lower() == "none":
             selected_flag = ""
+        selected_flag = self._confirm_qa_flag_retention(form_work_order, selected_flag)
+        if selected_flag is None:
+            return
         base_comment = str(self.qa_comments.text() or "").strip()
 
-        parsed_rows: list[tuple[int, str, str, str, str]] = []
+        parsed_row_order: list[str] = []
+        parsed_row_map: dict[str, tuple[int, str, str, str, str]] = {}
         duplicate_rows_in_paste = 0
         skipped_not_delivered = 0
         skipped_missing_lpn = 0
         skipped_bad_format = 0
-        seen_row_signatures: set[tuple[str, str, str, str]] = set()
 
         for line_no, raw_line in enumerate(raw_text.splitlines(), start=1):
             line = str(raw_line or "").strip()
@@ -10713,18 +11660,17 @@ class DepotQAWindow(DepotFramelessToolWindow):
             if not re.match(r"^delivered\b", shipping_info_normalized):
                 skipped_not_delivered += 1
                 continue
-            row_sig = (
-                lpn,
-                part_number.strip().casefold(),
-                part_description.strip().casefold(),
-                shipping_info_normalized,
-            )
-            if row_sig in seen_row_signatures:
-                duplicate_rows_in_paste += 1
+            row_key = _part_detail_row_key(lpn, part_number, part_description, shipping_info)
+            if not row_key:
+                skipped_bad_format += 1
                 continue
+            if row_key in parsed_row_map:
+                duplicate_rows_in_paste += 1
+            else:
+                parsed_row_order.append(row_key)
+            parsed_row_map[row_key] = (line_no, lpn, part_number, part_description, shipping_info)
 
-            seen_row_signatures.add(row_sig)
-            parsed_rows.append((line_no, lpn, part_number, part_description, shipping_info))
+        parsed_rows: list[tuple[int, str, str, str, str]] = [parsed_row_map[key] for key in parsed_row_order]
 
         inserted_count = 0
         updated_existing = 0
@@ -10949,6 +11895,654 @@ class DepotQAWindow(DepotFramelessToolWindow):
         layout.addWidget(self.qa_delivered_table)
         self._refresh_delivered_parts()
 
+    def _build_qa_cat_parts_tab(self) -> None:
+        layout = QVBoxLayout(self.qa_cat_parts_tab)
+        filter_layout = QHBoxLayout()
+        self.qa_cat_filter = QComboBox()
+        self._refresh_qa_category_filter_options()
+        self.qa_cat_filter.currentTextChanged.connect(self._refresh_qa_category_parts)
+        filter_layout.addWidget(QLabel("Category:"))
+        filter_layout.addWidget(self.qa_cat_filter, 1)
+        self.qa_cat_workorder_search = QLineEdit()
+        self.qa_cat_workorder_search.setPlaceholderText("Search work order...")
+        self.qa_cat_workorder_search.setClearButtonEnabled(True)
+        self.qa_cat_workorder_search.textChanged.connect(self._refresh_qa_category_parts)
+        filter_layout.addWidget(QLabel("Work Order:"))
+        filter_layout.addWidget(self.qa_cat_workorder_search, 1)
+        self.qa_cat_refresh_btn = QPushButton("Refresh")
+        self.qa_cat_refresh_btn.clicked.connect(self._refresh_qa_category_parts)
+        filter_layout.addWidget(self.qa_cat_refresh_btn, 0)
+        self.qa_cat_open_notes_btn = QPushButton("Open Notes / Flag")
+        self.qa_cat_open_notes_btn.setProperty("actionRole", "pick")
+        self.qa_cat_open_notes_btn.clicked.connect(lambda: self._open_selected_qa_notes_for_table(self.qa_cat_parts_table))
+        filter_layout.addWidget(self.qa_cat_open_notes_btn, 0)
+        layout.addLayout(filter_layout)
+
+        self.qa_cat_parts_table = QTableWidget()
+        configure_standard_table(
+            self.qa_cat_parts_table,
+            ["Work Order", "Client", "Flag", "Age", "Working", "Installed", "Agent", "Category", "QA Note"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.ResizeToContents,
+                7: QHeaderView.ResizeMode.ResizeToContents,
+                8: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.qa_cat_parts_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qa_cat_parts_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        self.qa_cat_parts_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.qa_cat_parts_table.customContextMenuRequested.connect(
+            lambda pos: self._open_qa_notes_from_context(self.qa_cat_parts_table, pos)
+        )
+        layout.addWidget(self.qa_cat_parts_table)
+        self._refresh_qa_category_parts()
+
+    def _refresh_qa_category_filter_options(self) -> None:
+        if not hasattr(self, "qa_cat_filter"):
+            return
+        previous = self.qa_cat_filter.currentText().strip() or "All"
+        categories: list[str] = ["All", "Appliance", "Audio", "PC", "TV", "Other"]
+        try:
+            rows = self.tracker.db.fetchall(
+                "SELECT DISTINCT work_order, COALESCE(category, '') AS category "
+                "FROM parts WHERE is_active=1 ORDER BY work_order ASC"
+            )
+            for row in rows:
+                value = self.tracker.resolve_work_order_category(
+                    str(row["work_order"] or "").strip(),
+                    str(row["category"] or "").strip(),
+                )
+                if value and value not in categories:
+                    categories.append(value)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.qa_category_filter_query_failed",
+                severity="warning",
+                summary="Failed loading QA category filter options; continuing with defaults.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+        self.qa_cat_filter.blockSignals(True)
+        self.qa_cat_filter.clear()
+        self.qa_cat_filter.addItems(categories)
+        if previous in categories:
+            self.qa_cat_filter.setCurrentText(previous)
+        else:
+            self.qa_cat_filter.setCurrentIndex(0)
+        self.qa_cat_filter.blockSignals(False)
+
+    def _refresh_qa_category_parts(self) -> None:
+        if not hasattr(self, "qa_cat_parts_table"):
+            return
+        self._refresh_qa_category_filter_options()
+        search_text = str(self.qa_cat_workorder_search.text() or "").strip() if hasattr(self, "qa_cat_workorder_search") else ""
+        category_filter = str(self.qa_cat_filter.currentText() or "").strip() if hasattr(self, "qa_cat_filter") else "All"
+        agent_meta = self._qa_agent_meta_lookup()
+        rows = self.tracker.list_category_active_parts(search_text)
+        self.qa_cat_parts_table.setRowCount(0)
+        row_idx = 0
+        for r in rows:
+            work_order = str(r["work_order"] or "").strip()
+            category = self.tracker.resolve_work_order_category(work_order, str(r["category"] or "").strip()) or "Other"
+            if category_filter and category_filter != "All" and category != category_filter:
+                continue
+            self.qa_cat_parts_table.insertRow(row_idx)
+            part_id = int(r["id"])
+            assigned = DepotRules.normalize_user_id(str(r["assigned_user_id"] or ""))
+            assigned_name, assigned_icon = agent_meta.get(assigned, ("", ""))
+            age_text = DepotAgentWindow._part_age_label(str(r["created_at"] or ""))
+            qa_comment = str(r["qa_comment"] or r["comments"] or "").strip()
+            agent_comment = str(r["agent_comment"] or "").strip()
+            flag = str(r["qa_flag"] or "").strip()
+            working_user = DepotRules.normalize_user_id(str(r["working_user_id"] or ""))
+            working_stamp = str(r["working_updated_at"] or "").strip()
+            parts_installed = bool(int(r["parts_installed"] or 0))
+            parts_installed_by = DepotRules.normalize_user_id(str(r["parts_installed_by"] or ""))
+            parts_installed_at = str(r["parts_installed_at"] or "").strip()
+            image_abs = self.tracker.resolve_qa_flag_icon(
+                str(r["qa_flag"] or "").strip(),
+                str(r["qa_flag_image_path"] or ""),
+            )
+
+            work_item = _center_table_item(QTableWidgetItem(work_order))
+            work_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            client_item = _center_table_item(QTableWidgetItem(""))
+            client_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            if int(r["client_unit"] or 0):
+                client_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+            flag_item = _center_table_item(QTableWidgetItem("" if image_abs else (flag if flag else "")))
+            flag_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            flag_item.setToolTip(DepotAgentWindow._flag_tooltip(flag, qa_comment, agent_comment, bool(image_abs)))
+            if image_abs:
+                flag_item.setIcon(QIcon(image_abs))
+            working_item = _center_table_item(QTableWidgetItem("\U0001F527" if working_user else ""))
+            if working_user:
+                working_tip = f"Agent working this unit: {working_user}"
+                friendly_stamp = DepotAgentWindow._format_working_updated_stamp(working_stamp)
+                if friendly_stamp:
+                    working_tip += f"\nUpdated: {friendly_stamp}"
+                working_item.setToolTip(working_tip)
+            installed_item = _center_table_item(QTableWidgetItem(""))
+            if parts_installed:
+                installed_icon = QIcon.fromTheme("applications-engineering")
+                if installed_icon.isNull():
+                    installed_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+                installed_item.setIcon(installed_icon)
+                tip = "Parts installed."
+                if parts_installed_by:
+                    tip += f"\nBy: {parts_installed_by}"
+                friendly_stamp = DepotAgentWindow._format_working_updated_stamp(parts_installed_at)
+                if friendly_stamp:
+                    tip += f"\nAt: {friendly_stamp}"
+                installed_item.setToolTip(tip)
+            assigned_text = f"{assigned} - {assigned_name}" if assigned and assigned_name else (assigned or "-")
+            assigned_item = _center_table_item(QTableWidgetItem(assigned_text))
+            if assigned_icon and Path(assigned_icon).exists():
+                assigned_item.setIcon(QIcon(assigned_icon))
+            category_item = _center_table_item(QTableWidgetItem(category))
+            age_item = _center_table_item(QTableWidgetItem(age_text))
+            note_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._note_preview(qa_comment)))
+            note_item.setToolTip(f"QA Note: {qa_comment if qa_comment else '(none)'}")
+
+            self.qa_cat_parts_table.setItem(row_idx, 0, work_item)
+            self.qa_cat_parts_table.setItem(row_idx, 1, client_item)
+            self.qa_cat_parts_table.setItem(row_idx, 2, flag_item)
+            self.qa_cat_parts_table.setItem(row_idx, 3, age_item)
+            self.qa_cat_parts_table.setItem(row_idx, 4, working_item)
+            self.qa_cat_parts_table.setItem(row_idx, 5, installed_item)
+            self.qa_cat_parts_table.setItem(row_idx, 6, assigned_item)
+            self.qa_cat_parts_table.setItem(row_idx, 7, category_item)
+            self.qa_cat_parts_table.setItem(row_idx, 8, note_item)
+            row_idx += 1
+
+    def _build_qa_client_followup_tab(self) -> None:
+        layout = QVBoxLayout(self.qa_client_tab)
+        summary = QLabel("Client follow-up queue for all agents (Client + Other daily, Part Order after 21 days).")
+        summary.setWordWrap(True)
+        summary.setProperty("muted", True)
+        layout.addWidget(summary)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Follow-up Queue"), 0)
+        controls.addStretch(1)
+        self.qa_client_refresh_btn = QPushButton("Refresh")
+        self.qa_client_refresh_btn.clicked.connect(self._refresh_qa_client_followup)
+        controls.addWidget(self.qa_client_refresh_btn, 0)
+        layout.addLayout(controls)
+
+        self.qa_client_due_summary = QLabel("No follow-up alerts.")
+        self.qa_client_due_summary.setProperty("section", True)
+        layout.addWidget(self.qa_client_due_summary)
+
+        self.qa_client_followup_table = QTableWidget()
+        configure_standard_table(
+            self.qa_client_followup_table,
+            ["Agent", "Due", "Work Order", "Status", "Last Update", "Age", "Notes"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.qa_client_followup_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qa_client_followup_table.cellClicked.connect(self._on_qa_client_followup_cell_clicked)
+        self.qa_client_followup_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        layout.addWidget(self.qa_client_followup_table, 1)
+        self._qa_client_due_items = []
+        self._qa_client_due_active_ids = set()
+        self._qa_client_due_ack_ids = set()
+        self._qa_client_due_flash_on = True
+        self._qa_client_due_flash_timer = QTimer(self)
+        self._qa_client_due_flash_timer.setInterval(700)
+        self._qa_client_due_flash_timer.timeout.connect(self._on_qa_client_due_flash_tick)
+        self._qa_client_due_flash_timer.start()
+        self._refresh_qa_client_followup()
+
+    def _refresh_qa_client_followup(self) -> None:
+        if not hasattr(self, "qa_client_followup_table"):
+            return
+        try:
+            rows = self.tracker.list_team_client_followups()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.qa_client_followup_query_failed",
+                severity="warning",
+                summary="Failed loading QA client follow-up rows.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self.qa_client_followup_table.setRowCount(0)
+            self.qa_client_due_summary.setText("Client follow-up unavailable. Details were logged.")
+            self._qa_client_due_items = []
+            self._qa_client_due_active_ids = set()
+            self._qa_client_due_ack_ids = set()
+            self._update_qa_tab_alert_states()
+            return
+
+        today = datetime.now().date()
+        today_iso = today.isoformat()
+        self.qa_client_followup_table.setRowCount(0)
+        previous_active_ids = set(getattr(self, "_qa_client_due_active_ids", set()))
+        due_items: list[QTableWidgetItem] = []
+        due_count = 0
+        due_quiet_count = 0
+        due_active_ids: set[int] = set()
+        kept_row = 0
+        for r in rows:
+            client_part_id = int(r["id"])
+            latest_touch = str(r["latest_touch"] or "").strip()
+            if latest_touch not in {DepotRules.TOUCH_PART_ORDER, DepotRules.TOUCH_OTHER}:
+                continue
+            work_order = str(r["work_order"] or "").strip()
+            if not work_order:
+                continue
+            user_id = DepotRules.normalize_user_id(str(r["user_id"] or ""))
+            last_action = DepotRules.normalize_followup_action(str(r["followup_last_action"] or ""))
+            last_action_at = str(r["followup_last_action_at"] or "").strip()
+            last_action_actor = DepotRules.normalize_user_id(str(r["followup_last_actor"] or ""))
+            alert_quiet_until = str(r["alert_quiet_until"] or "").strip()
+            quiet_active = self.tracker.is_alert_quiet(alert_quiet_until)
+            no_contact_count = int(max(0, safe_int(r["followup_no_contact_count"], 0)))
+            action_date = self._parse_iso_date(last_action_at)
+            days_since_action = max(0, (today - action_date).days) if action_date is not None else -1
+            last_update = str(r["latest_touch_date"] or "").strip() or str(r["created_at"] or "")[:10]
+            age_days = -1
+            if len(last_update) >= 10:
+                try:
+                    age_days = max(0, (today - datetime.strptime(last_update[:10], "%Y-%m-%d").date()).days)
+                except Exception:
+                    age_days = -1
+            age_text = f"{age_days}d" if age_days >= 0 else "-"
+            notes = str(r["comments"] or "").strip()
+
+            due = False
+            due_reason = ""
+            if latest_touch == DepotRules.TOUCH_OTHER:
+                due = bool(last_update and last_update < today_iso)
+                if due:
+                    due_reason = "Daily follow-up required for Client + Other."
+            elif latest_touch == DepotRules.TOUCH_PART_ORDER:
+                part_order_date = str(r["last_part_order_date"] or "").strip() or last_update
+                if len(part_order_date) >= 10:
+                    try:
+                        po_days = max(0, (today - datetime.strptime(part_order_date[:10], "%Y-%m-%d").date()).days)
+                    except Exception:
+                        po_days = 0
+                    if po_days >= 21:
+                        due = True
+                        due_reason = f"Part Order follow-up due ({po_days} days)."
+
+            has_action = bool(last_action)
+            due_active = bool(due and not quiet_active and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED)
+
+            self.qa_client_followup_table.insertRow(kept_row)
+            agent_item = _center_table_item(QTableWidgetItem(user_id if user_id else "-"))
+            due_item = _center_table_item(QTableWidgetItem(""))
+            due_item.setData(Qt.ItemDataRole.UserRole, client_part_id)
+            due_item.setData(Qt.ItemDataRole.UserRole + 1, 1 if due else 0)
+            due_item.setData(Qt.ItemDataRole.UserRole + 2, 1 if has_action else 0)
+            due_item.setData(Qt.ItemDataRole.UserRole + 3, 1 if quiet_active else 0)
+            if due_active:
+                if has_action and last_action != DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED:
+                    clock_icon, stage_text = DepotAgentWindow._followup_wait_icon_by_days(self, days_since_action)
+                    due_item.setText(stage_text)
+                    due_item.setIcon(clock_icon)
+                else:
+                    due_item.setText(DepotRules.followup_stage_label(0))
+                    due_item.setIcon(DepotAgentWindow._followup_clock_icon(self, "#21B46D"))
+            elif due and has_action:
+                if last_action == DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED:
+                    due_item.setIcon(DepotAgentWindow._followup_done_icon(self))
+                else:
+                    clock_icon, stage_text = DepotAgentWindow._followup_wait_icon_by_days(self, days_since_action)
+                    due_item.setText(stage_text)
+                    due_item.setIcon(clock_icon)
+            quiet_line = f"\nAlert quiet until: {DepotAgentWindow._format_working_updated_stamp(alert_quiet_until)}" if quiet_active else ""
+            action_line = f"\nLast follow-up: {last_action}" if last_action else ""
+            actor_line = f" by {last_action_actor}" if last_action_actor else ""
+            when_line = f" ({DepotAgentWindow._format_working_updated_stamp(last_action_at)})" if last_action_at else ""
+            attempt_line = f"\nNo-contact follow-ups: {no_contact_count}" if no_contact_count > 0 else ""
+            due_item.setToolTip(f"{due_reason}{action_line}{actor_line}{when_line}{attempt_line}{quiet_line}")
+
+            work_item = _center_table_item(QTableWidgetItem(work_order))
+            status_item = _center_table_item(QTableWidgetItem(latest_touch))
+            update_item = _center_table_item(QTableWidgetItem(last_update if last_update else "-"))
+            age_item = _center_table_item(QTableWidgetItem(age_text))
+            note_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._note_preview(notes)))
+            note_item.setToolTip(f"Comments: {notes if notes else '(none)'}")
+
+            self.qa_client_followup_table.setItem(kept_row, 0, agent_item)
+            self.qa_client_followup_table.setItem(kept_row, 1, due_item)
+            self.qa_client_followup_table.setItem(kept_row, 2, work_item)
+            self.qa_client_followup_table.setItem(kept_row, 3, status_item)
+            self.qa_client_followup_table.setItem(kept_row, 4, update_item)
+            self.qa_client_followup_table.setItem(kept_row, 5, age_item)
+            self.qa_client_followup_table.setItem(kept_row, 6, note_item)
+            if due_active:
+                due_active_ids.add(client_part_id)
+                if int(client_part_id) not in self._qa_client_due_ack_ids:
+                    due_items.append(due_item)
+                due_count += 1
+            elif due and quiet_active:
+                due_quiet_count += 1
+            kept_row += 1
+
+        self._qa_client_due_ack_ids.intersection_update(due_active_ids)
+        self._qa_client_due_active_ids = due_active_ids
+        if due_active_ids.difference(previous_active_ids):
+            self._qa_tab_alert_ack_states["client"] = False
+        self._qa_client_due_items = due_items
+        self._qa_client_due_flash_on = True
+        self._apply_qa_client_due_flash_visuals()
+        self._update_qa_tab_alert_states()
+        if due_count > 0:
+            suffix = f" | Quieted: {due_quiet_count}" if due_quiet_count > 0 else ""
+            self.qa_client_due_summary.setText(f"Follow-up due now: {due_count}{suffix}")
+        elif due_quiet_count > 0:
+            self.qa_client_due_summary.setText(f"Follow-up alerts quieted until tomorrow morning: {due_quiet_count}")
+        else:
+            self.qa_client_due_summary.setText("No follow-up alerts.")
+
+    def _on_qa_client_followup_cell_clicked(self, row: int, col: int) -> None:
+        if col != 1:
+            return
+        if row < 0 or row >= int(self.qa_client_followup_table.rowCount()):
+            return
+        due_item = self.qa_client_followup_table.item(row, 1)
+        work_item = self.qa_client_followup_table.item(row, 2)
+        if due_item is None or work_item is None:
+            return
+        is_due_row = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 1), 0) > 0
+        has_logged_action = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 2), 0) > 0
+        quiet_active = safe_int(due_item.data(Qt.ItemDataRole.UserRole + 3), 0) > 0
+        if not is_due_row and not has_logged_action:
+            return
+        client_part_id = safe_int(due_item.data(Qt.ItemDataRole.UserRole), 0)
+        if client_part_id <= 0:
+            return
+        if is_due_row and not quiet_active and client_part_id in self._qa_client_due_active_ids:
+            self._qa_client_due_ack_ids.add(int(client_part_id))
+            due_item.setBackground(QColor(0, 0, 0, 0))
+            self._qa_client_due_items = [
+                item
+                for item in self._qa_client_due_items
+                if item is not None and safe_int(item.data(Qt.ItemDataRole.UserRole), 0) != int(client_part_id)
+            ]
+            self._apply_qa_client_due_flash_visuals()
+            self._update_qa_tab_alert_states()
+        work_order = str(work_item.text() or "").strip() or "(unknown)"
+        action, ok = show_flowgrid_themed_input_item(
+            self,
+            self.app_window,
+            "qa",
+            "Client Follow-up",
+            f"Work Order: {work_order}\nSelect follow-up outcome:",
+            list(DepotRules.CLIENT_FOLLOWUP_ACTIONS),
+            0,
+            False,
+        )
+        if not ok:
+            return
+        action_text = DepotRules.normalize_followup_action(str(action or ""))
+        if not action_text:
+            return
+        try:
+            no_contact_count = self.tracker.mark_client_followup_action(client_part_id, action_text, self.current_user)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.qa_client_followup_mark_failed",
+                severity="warning",
+                summary="Failed recording QA client follow-up action.",
+                exc=exc,
+                context={"user_id": str(self.current_user), "client_part_id": int(client_part_id), "work_order": str(work_order), "action": str(action_text)},
+            )
+            self._show_themed_message(QMessageBox.Icon.Warning, "Follow-up", f"Could not save follow-up update:\n{type(exc).__name__}: {exc}")
+            return
+        self._refresh_qa_client_followup()
+        if action_text in DepotRules.CLIENT_FOLLOWUP_NO_CONTACT_ACTIONS and int(no_contact_count) == 3:
+            self._show_themed_message(QMessageBox.Icon.Warning, "No Contact Alert", "Please ship unit back to store due to no contact from client.")
+
+    def _apply_qa_client_due_flash_visuals(self) -> None:
+        if not hasattr(self, "_qa_client_due_items"):
+            return
+        if not self._qa_client_due_items:
+            if hasattr(self, "qa_client_followup_table"):
+                for row_idx in range(int(self.qa_client_followup_table.rowCount())):
+                    item = self.qa_client_followup_table.item(row_idx, 1)
+                    if item is not None:
+                        item.setBackground(QColor(0, 0, 0, 0))
+            return
+        on_color = QColor("#D95A5A")
+        on_color.setAlpha(105)
+        off_color = QColor(0, 0, 0, 0)
+        for item in list(self._qa_client_due_items):
+            if item is None:
+                continue
+            item.setBackground(on_color if self._qa_client_due_flash_on else off_color)
+
+    def _on_qa_client_due_flash_tick(self) -> None:
+        if not hasattr(self, "_qa_client_due_items"):
+            return
+        if not self._qa_client_due_items:
+            self._qa_client_due_flash_on = True
+            return
+        self._qa_client_due_flash_on = not bool(getattr(self, "_qa_client_due_flash_on", False))
+        self._apply_qa_client_due_flash_visuals()
+
+    def _build_qa_rtv_tab(self) -> None:
+        layout = QVBoxLayout(self.qa_rtv_tab)
+        summary = QLabel("RTV queue mirrored from the Agent Tech 3 view.")
+        summary.setWordWrap(True)
+        summary.setProperty("muted", True)
+        layout.addWidget(summary)
+
+        self.qa_rtv_table = QTableWidget()
+        configure_standard_table(
+            self.qa_rtv_table,
+            ["Work Order", "Logged At", "Logged By", "Comments"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.qa_rtv_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qa_rtv_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        self.qa_rtv_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.qa_rtv_table.customContextMenuRequested.connect(
+            lambda pos: self._open_qa_rtv_comment_from_context(pos)
+        )
+
+        self.qa_rtv_refresh_btn = QPushButton("Refresh")
+        self.qa_rtv_refresh_btn.clicked.connect(self._refresh_qa_rtv_rows)
+        self.qa_rtv_open_notes_btn = QPushButton("Open Notes / Update Comment")
+        self.qa_rtv_open_notes_btn.setProperty("actionRole", "pick")
+        self.qa_rtv_open_notes_btn.clicked.connect(self._open_selected_qa_rtv_comment)
+        self.qa_rtv_workorder_search = QLineEdit()
+        self.qa_rtv_workorder_search.setPlaceholderText("Search work order...")
+        self.qa_rtv_workorder_search.setClearButtonEnabled(True)
+        self.qa_rtv_workorder_search.textChanged.connect(self._refresh_qa_rtv_rows)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Work Order:"))
+        controls.addWidget(self.qa_rtv_workorder_search, 1)
+        controls.addWidget(self.qa_rtv_refresh_btn)
+        controls.addWidget(self.qa_rtv_open_notes_btn)
+        layout.addLayout(controls)
+        layout.addWidget(self.qa_rtv_table)
+        self._refresh_qa_rtv_rows()
+
+    def _refresh_qa_rtv_rows(self) -> None:
+        if not hasattr(self, "qa_rtv_table"):
+            return
+        search_text = str(self.qa_rtv_workorder_search.text() or "").strip() if hasattr(self, "qa_rtv_workorder_search") else ""
+        try:
+            rows = self.tracker.list_rtv_rows(search_text)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.qa_rtv_refresh_failed",
+                severity="warning",
+                summary="Failed loading QA RTV queue.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self.qa_rtv_table.setRowCount(0)
+            return
+        self.qa_rtv_table.setRowCount(0)
+        for row_idx, row in enumerate(rows):
+            self.qa_rtv_table.insertRow(row_idx)
+            work_item = _center_table_item(QTableWidgetItem(str(row["work_order"] or "").strip()))
+            work_item.setData(Qt.ItemDataRole.UserRole, int(row["id"] or 0))
+            logged_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._format_working_updated_stamp(str(row["created_at"] or "").strip()) or "-"))
+            logged_item.setToolTip(str(row["created_at"] or "").strip())
+            user_item = _center_table_item(QTableWidgetItem(DepotRules.normalize_user_id(str(row["user_id"] or "")) or "-"))
+            comment_text = str(row["comments"] or "").strip()
+            comment_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._note_preview(comment_text)))
+            comment_item.setData(Qt.ItemDataRole.UserRole + 1, comment_text)
+            comment_item.setToolTip(f"Comments: {comment_text if comment_text else '(none)'}")
+            self.qa_rtv_table.setItem(row_idx, 0, work_item)
+            self.qa_rtv_table.setItem(row_idx, 1, logged_item)
+            self.qa_rtv_table.setItem(row_idx, 2, user_item)
+            self.qa_rtv_table.setItem(row_idx, 3, comment_item)
+
+    def _open_qa_rtv_comment_from_context(self, pos: QPoint) -> None:
+        if not hasattr(self, "qa_rtv_table"):
+            return
+        if not _select_table_row_by_context_pos(self.qa_rtv_table, pos):
+            return
+        self._open_selected_qa_rtv_comment()
+
+    def _open_selected_qa_rtv_comment(self) -> None:
+        if not hasattr(self, "qa_rtv_table"):
+            return
+        if not _edit_aux_queue_comment(
+            self,
+            self.tracker,
+            table=self.qa_rtv_table,
+            target_key="rtvs.comments",
+            theme_kind="qa",
+            title="RTV Comment",
+        ):
+            return
+        self._refresh_qa_rtv_rows()
+        if self.app_window is not None:
+            self.app_window._refresh_visible_depot_views("dashboard_notes", "agent_rtv")
+
+    def _build_qa_client_jo_tab(self) -> None:
+        layout = QVBoxLayout(self.client_jo_tab)
+        summary = QLabel("Client-unit Junk Out queue sourced from the existing client_jo table.")
+        summary.setWordWrap(True)
+        summary.setProperty("muted", True)
+        layout.addWidget(summary)
+
+        self.qa_client_jo_table = QTableWidget()
+        configure_standard_table(
+            self.qa_client_jo_table,
+            ["Work Order", "Agent/User", "Logged At", "Comments"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.qa_client_jo_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.qa_client_jo_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        self.qa_client_jo_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.qa_client_jo_table.customContextMenuRequested.connect(
+            lambda pos: self._open_qa_client_jo_comment_from_context(pos)
+        )
+
+        self.qa_client_jo_refresh = QPushButton("Refresh")
+        self.qa_client_jo_refresh.clicked.connect(self._refresh_qa_client_jo_rows)
+        self.qa_client_jo_open_notes_btn = QPushButton("Open Notes / Update Comment")
+        self.qa_client_jo_open_notes_btn.setProperty("actionRole", "pick")
+        self.qa_client_jo_open_notes_btn.clicked.connect(self._open_selected_qa_client_jo_comment)
+        self.qa_client_jo_workorder_search = QLineEdit()
+        self.qa_client_jo_workorder_search.setPlaceholderText("Search work order...")
+        self.qa_client_jo_workorder_search.setClearButtonEnabled(True)
+        self.qa_client_jo_workorder_search.textChanged.connect(self._refresh_qa_client_jo_rows)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Work Order:"))
+        controls.addWidget(self.qa_client_jo_workorder_search, 1)
+        controls.addWidget(self.qa_client_jo_refresh)
+        controls.addWidget(self.qa_client_jo_open_notes_btn)
+        layout.addLayout(controls)
+        layout.addWidget(self.qa_client_jo_table)
+        self._refresh_qa_client_jo_rows()
+
+    def _refresh_qa_client_jo_rows(self) -> None:
+        if not hasattr(self, "qa_client_jo_table"):
+            return
+        search_text = str(self.qa_client_jo_workorder_search.text() or "").strip() if hasattr(self, "qa_client_jo_workorder_search") else ""
+        try:
+            rows = self.tracker.list_client_jo_rows(search_text)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.qa_client_jo_refresh_failed",
+                severity="warning",
+                summary="Failed loading QA Client JO queue.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self.qa_client_jo_table.setRowCount(0)
+            return
+        self.qa_client_jo_table.setRowCount(0)
+        for row_idx, row in enumerate(rows):
+            self.qa_client_jo_table.insertRow(row_idx)
+            work_item = _center_table_item(QTableWidgetItem(str(row["work_order"] or "").strip()))
+            work_item.setData(Qt.ItemDataRole.UserRole, int(row["id"] or 0))
+            user_item = _center_table_item(QTableWidgetItem(DepotRules.normalize_user_id(str(row["user_id"] or "")) or "-"))
+            logged_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._format_working_updated_stamp(str(row["created_at"] or "").strip()) or "-"))
+            logged_item.setToolTip(str(row["created_at"] or "").strip())
+            comment_text = str(row["comments"] or "").strip()
+            comment_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._note_preview(comment_text)))
+            comment_item.setData(Qt.ItemDataRole.UserRole + 1, comment_text)
+            comment_item.setToolTip(f"Comments: {comment_text if comment_text else '(none)'}")
+            self.qa_client_jo_table.setItem(row_idx, 0, work_item)
+            self.qa_client_jo_table.setItem(row_idx, 1, user_item)
+            self.qa_client_jo_table.setItem(row_idx, 2, logged_item)
+            self.qa_client_jo_table.setItem(row_idx, 3, comment_item)
+
+    def _open_qa_client_jo_comment_from_context(self, pos: QPoint) -> None:
+        if not hasattr(self, "qa_client_jo_table"):
+            return
+        if not _select_table_row_by_context_pos(self.qa_client_jo_table, pos):
+            return
+        self._open_selected_qa_client_jo_comment()
+
+    def _open_selected_qa_client_jo_comment(self) -> None:
+        if not hasattr(self, "qa_client_jo_table"):
+            return
+        if not _edit_aux_queue_comment(
+            self,
+            self.tracker,
+            table=self.qa_client_jo_table,
+            target_key="client_jo.comments",
+            theme_kind="qa",
+            title="Client JO Comment",
+        ):
+            return
+        self._refresh_qa_client_jo_rows()
+        if self.app_window is not None:
+            self.app_window._refresh_visible_depot_views("dashboard_notes")
+
     def _build_qa_missing_po_followup_tab(self):
         layout = QVBoxLayout(self.missing_po_followup_tab)
         summary = QLabel("Missing PO rows waiting for Part Order follow up.")
@@ -11074,6 +12668,10 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._refresh_recent_submissions_label()
         self._refresh_assigned_parts()
         self._refresh_delivered_parts()
+        self._refresh_qa_category_parts()
+        self._refresh_qa_client_followup()
+        self._refresh_qa_rtv_rows()
+        self._refresh_qa_client_jo_rows()
         self._refresh_missing_po_followups()
 
     def _reassign_selected_missing_po_followup(self) -> None:
@@ -11111,12 +12709,14 @@ class DepotQAWindow(DepotFramelessToolWindow):
             return
         self._refresh_assigned_parts()
         self._refresh_delivered_parts()
+        self._refresh_qa_category_parts()
         self._refresh_missing_po_followups()
         if self.app_window is not None:
             agent_window = getattr(self.app_window, "active_agent_window", None)
             if agent_window is not None and agent_window.isVisible():
                 agent_window._refresh_agent_parts()
                 agent_window._refresh_category_parts()
+                agent_window._refresh_client_followup()
                 agent_window._refresh_missing_po_followups()
 
     def _qa_agent_meta_lookup(self) -> dict[str, tuple[str, str]]:
@@ -11208,14 +12808,6 @@ class DepotQAWindow(DepotFramelessToolWindow):
         if not hasattr(self, "qa_delivered_table"):
             return
 
-        def _split_merged_values(raw_value: str) -> list[str]:
-            values = [
-                str(piece or "").strip()
-                for piece in str(raw_value or "").split(" | ")
-                if str(piece or "").strip()
-            ]
-            return values if values else [""]
-
         search_text = ""
         if hasattr(self, "qa_delivered_workorder_search"):
             search_text = str(self.qa_delivered_workorder_search.text() or "").strip()
@@ -11244,55 +12836,19 @@ class DepotQAWindow(DepotFramelessToolWindow):
             detail_rows = self.tracker.list_delivered_part_details(work_order)
             detail_line_items: list[tuple[str, str, str, str, bool]] = []
             for detail in detail_rows:
-                lpn_values = _split_merged_values(str(detail["lpn"] or ""))
-                part_values = _split_merged_values(str(detail["part_number"] or ""))
-                desc_values = _split_merged_values(str(detail["part_description"] or ""))
-                ship_values = _split_merged_values(str(detail["shipping_info"] or ""))
-                max_len = max(len(lpn_values), len(part_values), len(desc_values), len(ship_values), 1)
-                installed_keys_raw = str(detail["installed_keys"] or "").strip()
-                installed_key_set: set[str] = set()
-                if installed_keys_raw:
-                    try:
-                        parsed = json.loads(installed_keys_raw)
-                        if isinstance(parsed, list):
-                            for value in parsed:
-                                value_text = str(value or "").strip()
-                                if value_text:
-                                    installed_key_set.add(value_text)
-                    except Exception:
-                        for value in installed_keys_raw.split(" | "):
-                            value_text = str(value or "").strip()
-                            if value_text:
-                                installed_key_set.add(value_text)
-
-                def _value_for(values: list[str], idx: int) -> str:
-                    if idx < len(values):
-                        return str(values[idx] or "").strip()
-                    if len(values) == 1 and max_len > 1:
-                        return str(values[0] or "").strip()
-                    return ""
-
-                def _line_key(lpn_value: str, part_value: str, desc_value: str, ship_value: str) -> str:
-                    return json.dumps(
-                        [
-                            str(lpn_value or "").strip().casefold(),
-                            str(part_value or "").strip().casefold(),
-                            str(desc_value or "").strip().casefold(),
-                            str(ship_value or "").strip().casefold(),
-                        ],
-                        ensure_ascii=True,
-                        separators=(",", ":"),
+                merged_rows = _dedupe_part_detail_rows(
+                    _merged_part_detail_rows(
+                        str(detail["lpn"] or ""),
+                        str(detail["part_number"] or ""),
+                        str(detail["part_description"] or ""),
+                        str(detail["shipping_info"] or ""),
                     )
-
-                for idx in range(max_len):
-                    lpn_value = _value_for(lpn_values, idx)
-                    part_value = _value_for(part_values, idx)
-                    desc_value = _value_for(desc_values, idx)
-                    ship_value = _value_for(ship_values, idx)
-                    if not (lpn_value or part_value or desc_value or ship_value):
-                        continue
-                    key = _line_key(lpn_value, part_value, desc_value, ship_value)
-                    row_installed = bool(key in installed_key_set)
+                )
+                installed_key_set = _installed_key_set_from_text(str(detail["installed_keys"] or ""))
+                for row in merged_rows:
+                    lpn_value, part_value, desc_value, ship_value = row
+                    key = _part_detail_row_key(lpn_value, part_value, desc_value, ship_value)
+                    row_installed = bool(key and key in installed_key_set)
                     if not installed_key_set and parts_installed:
                         # Legacy fallback before per-line install snapshots existed.
                         row_installed = True
@@ -11709,6 +13265,11 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         if self.app_window is None:
             return
         super().apply_theme_styles()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
 
     def _build_agents_tab(self) -> None:
         layout = QVBoxLayout(self.agent_tab)
@@ -12998,6 +14559,8 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         }
         self.app_window.queue_save_config()
         super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
 
     def apply_theme_styles(self) -> None:
         if self.app_window is None:
@@ -13983,7 +15546,7 @@ class QuickInputsWindow(QMainWindow):
         self._ui_opacity_anim = QVariantAnimation(self)
         self._ui_opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self._ui_opacity_anim.valueChanged.connect(lambda value: self._set_ui_opacity(float(value)))
-        self._ui_opacity_effects: list[QGraphicsOpacityEffect] = []
+        self._ui_opacity_effects: list[tuple[QGraphicsOpacityEffect, float, float]] = []
         self._corner_radius = 14
         self._drag_offset: QPoint | None = None
 
@@ -14694,9 +16257,44 @@ class QuickInputsWindow(QMainWindow):
             if not bool(layer.get("visible", True)):
                 continue
             path = str(layer.get("image_path", "")).strip()
-            if path and Path(path).exists():
+            if not path or not Path(path).exists():
+                continue
+            if float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)) <= 0.01:
+                continue
+            if path:
                 return True
         return False
+
+    def _window_has_background_layers(self, kind: str) -> bool:
+        normalized_kind = str(kind or "main").strip().lower() or "main"
+        if normalized_kind == "main":
+            return self._has_visible_background_layers()
+        resolved = self._resolved_popup_theme(normalized_kind)
+        for layer in resolved.get("image_layers", []):
+            if not isinstance(layer, dict):
+                continue
+            if not bool(layer.get("visible", True)):
+                continue
+            path = str(layer.get("image_path", "")).strip()
+            if not path or not Path(path).exists():
+                continue
+            if float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)) <= 0.01:
+                continue
+            return True
+        return False
+
+    def _effective_popup_transparency(self, kind: str) -> bool:
+        normalized_kind = str(kind or "main").strip().lower() or "main"
+        if normalized_kind == "main":
+            return bool(not self._background_tint_enabled() and self._window_has_background_layers("main"))
+        resolved = self._resolved_popup_theme(normalized_kind)
+        return bool(resolved.get("transparent", False) and self._window_has_background_layers(normalized_kind))
+
+    def _effective_shell_idle_opacity(self) -> float:
+        requested = self._base_opacity()
+        if self._window_has_background_layers("main"):
+            return float(clamp(requested, 0.0, 1.0))
+        return float(clamp(requested, 0.05, 1.0))
 
     def paint_background(self, painter: QPainter, rect: QRect) -> None:
         shell_opacity = float(clamp(getattr(self, "_ui_opacity_current", 1.0), 0.0, 1.0))
@@ -14935,6 +16533,8 @@ class QuickInputsWindow(QMainWindow):
                 agent_window._refresh_recent_submissions_label()
             if "agent_client_followup" in requested:
                 agent_window._refresh_client_followup()
+            if "agent_rtv" in requested and getattr(agent_window, "rtv_tab", None) is not None:
+                agent_window._refresh_rtv_rows()
             if "agent_team_client_followup" in requested and getattr(agent_window, "team_client_tab", None) is not None:
                 agent_window._refresh_team_client_followup()
             if "agent_parts" in requested:
@@ -14954,8 +16554,16 @@ class QuickInputsWindow(QMainWindow):
                 qa_window._refresh_recent_submissions_label()
             if "qa_assigned" in requested:
                 qa_window._refresh_assigned_parts()
+            if "qa_category" in requested:
+                qa_window._refresh_qa_category_parts()
+            if "qa_client_followup" in requested:
+                qa_window._refresh_qa_client_followup()
+            if "qa_rtv" in requested:
+                qa_window._refresh_qa_rtv_rows()
             if "qa_delivered" in requested:
                 qa_window._refresh_delivered_parts()
+            if "qa_client_jo" in requested:
+                qa_window._refresh_qa_client_jo_rows()
             if "qa_missing_po" in requested:
                 qa_window._refresh_missing_po_followups()
 
@@ -15021,11 +16629,16 @@ class QuickInputsWindow(QMainWindow):
             "agent_missing_po",
             "agent_parts",
             "agent_recent",
+            "agent_rtv",
             "agent_team_client_followup",
             "dashboard_completed",
             "dashboard_metrics",
             "dashboard_notes",
             "qa_assigned",
+            "qa_category",
+            "qa_client_followup",
+            "qa_rtv",
+            "qa_client_jo",
             "qa_delivered",
             "qa_flags",
             "qa_missing_po",
@@ -16138,6 +17751,13 @@ class QuickInputsWindow(QMainWindow):
         title_min_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.20), 0.62)
         title_min_border = rgba_css(shift(p["accent"], -0.42), 0.84)
         title_min_hover = rgba_css(shift(blend(p["button_bg"], p["surface"], 0.20), 0.10), 0.76)
+        titlebar_bg = rgba_css(blend(p["shell_overlay"], p["surface"], 0.18), 0.84)
+        title_badge_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.15), 0.74)
+        title_badge_border = rgba_css(shift(p["accent"], -0.42), 0.82)
+        checkbox_fill = rgba_css(blend(p["input_bg"], p["surface"], 0.18), 0.92)
+        checkbox_fill_checked = rgba_css(blend(p["accent"], p["input_bg"], 0.18), 0.96)
+        checkbox_fill_disabled = rgba_css(p["input_bg"], 0.58)
+        checkbox_border = shift(p["input_bg"], -0.46)
 
         self.surface.setStyleSheet("background: transparent;")
         self.body.setStyleSheet("background: transparent;")
@@ -16152,10 +17772,17 @@ class QuickInputsWindow(QMainWindow):
 
         self.titlebar.setStyleSheet(
             "QWidget {"
-            f"background: rgba({QColor(p['shell_overlay']).red()}, {QColor(p['shell_overlay']).green()}, {QColor(p['shell_overlay']).blue()}, 135);"
+            f"background: {titlebar_bg};"
             f"color: {p['label_text']};"
             "}"
-            "QLabel#TitleText { font-size: 13px; font-weight: 600; background: transparent; }"
+            "QLabel#TitleText {"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            f"background: {title_badge_bg};"
+            f"border: 1px solid {title_badge_border};"
+            "border-radius: 11px;"
+            "padding: 2px 10px;"
+            "}"
             "QToolButton {"
             "background: transparent;"
             "border: none;"
@@ -16211,7 +17838,9 @@ class QuickInputsWindow(QMainWindow):
             "}"
             f"QTextEdit {{ padding: {text_edit_padding}; }}"
             f"QCheckBox {{ background: transparent; spacing: {checkbox_spacing}px; font-weight: 700; }}"
-            f"QCheckBox::indicator {{ width: {checkbox_indicator_px}px; height: {checkbox_indicator_px}px; }}"
+            f"QCheckBox::indicator {{ width: {checkbox_indicator_px}px; height: {checkbox_indicator_px}px; border-radius: 3px; background: {checkbox_fill}; border: 1px solid {checkbox_border}; }}"
+            f"QCheckBox::indicator:checked {{ background: {checkbox_fill_checked}; border: 1px solid {shift(p['accent'], -0.45)}; }}"
+            f"QCheckBox::indicator:disabled {{ background: {checkbox_fill_disabled}; border: 1px solid {shift(checkbox_border, 0.08)}; }}"
             "QCheckBox[switch='true']::indicator {"
             "width: 44px;"
             "height: 20px;"
@@ -16473,22 +18102,24 @@ class QuickInputsWindow(QMainWindow):
     def _init_ui_opacity_effects(self) -> None:
         self._ui_opacity_effects.clear()
         targets = [
-            self.titlebar,
-            self.sidebar,
-            self.settings_page,
-            self.quick_actions_button,
+            (self.titlebar, 0.05, 0.00),
+            (self.sidebar, 0.05, 0.00),
+            (self.settings_page, 0.05, 0.00),
+            (self.quick_actions_button, 0.05, 0.00),
         ]
-        for widget in targets:
+        for widget, no_bg_floor, with_bg_floor in targets:
             effect = QGraphicsOpacityEffect(widget)
             widget.setGraphicsEffect(effect)
-            self._ui_opacity_effects.append(effect)
-        self._set_ui_opacity(self._base_opacity())
+            self._ui_opacity_effects.append((effect, float(no_bg_floor), float(with_bg_floor)))
+        self._set_ui_opacity(self._effective_shell_idle_opacity())
 
     def _set_ui_opacity(self, value: float) -> None:
-        opacity = float(clamp(value, 0.0, 1.0))
-        self._ui_opacity_current = opacity
-        for effect in self._ui_opacity_effects:
-            effect.setOpacity(opacity)
+        requested_opacity = float(clamp(value, 0.0, 1.0))
+        has_background_layers = self._window_has_background_layers("main")
+        self._ui_opacity_current = requested_opacity if has_background_layers else float(max(requested_opacity, 0.05))
+        for effect, no_bg_floor, with_bg_floor in self._ui_opacity_effects:
+            floor = with_bg_floor if has_background_layers else no_bg_floor
+            effect.setOpacity(float(max(requested_opacity, floor)))
         self.surface.update()
 
     def _has_active_popup(self) -> bool:
@@ -16510,7 +18141,7 @@ class QuickInputsWindow(QMainWindow):
         self._hover_inside = False
         self._hover_revealed = False
         self._hover_delay_timer.stop()
-        self._start_opacity_animation(self._base_opacity(), self._hover_fade_out_ms())
+        self._start_opacity_animation(self._effective_shell_idle_opacity(), self._hover_fade_out_ms())
 
     def _on_popup_leave_check(self) -> None:
         if self._has_active_popup():
@@ -17714,13 +19345,16 @@ class QuickInputsWindow(QMainWindow):
         self.queue_save_config()
         self._refresh_popup_themes()
 
-    def _popup_control_fill_css(self, popup_theme: dict[str, Any], field_bg: str) -> str:
+    def _popup_control_fill_css(self, kind: str, popup_theme: dict[str, Any], field_bg: str) -> str:
         style = str(popup_theme.get("control_style", "Fade Left to Right") or "Fade Left to Right").strip()
         if style not in {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}:
             style = "Fade Left to Right"
         fade_strength = int(clamp(safe_int(popup_theme.get("control_fade_strength", 65), 65), 0, 100))
+        effective_transparent = self._effective_popup_transparency(kind)
         base_alpha = float(clamp(safe_int(popup_theme.get("control_opacity", 82), 82), 0, 100)) / 100.0
         tail_alpha = float(clamp(safe_int(popup_theme.get("control_tail_opacity", 0), 0), 0, 100)) / 100.0
+        base_alpha = max(base_alpha, 0.54 if effective_transparent else 0.34)
+        tail_alpha = max(tail_alpha, 0.28 if effective_transparent else 0.14)
         if style == "Solid" or fade_strength <= 0:
             return rgba_css(field_bg, base_alpha)
 
@@ -17793,11 +19427,11 @@ class QuickInputsWindow(QMainWindow):
         header_padding = "3px 5px" if compact_mode else "4px 6px"
         button_padding = "1px 7px" if compact_mode else "2px 8px"
         check_indicator_px = 12 if compact_mode else 14
-        transparent = bool(theme.get("transparent", False))
+        effective_transparent = self._effective_popup_transparency(kind)
         bg = normalize_hex(theme.get("background", self.palette_data["surface"]), self.palette_data["surface"])
         text = normalize_hex(theme.get("text", self.palette_data["label_text"]), self.palette_data["label_text"])
         field_bg = normalize_hex(theme.get("field_bg", self.palette_data["input_bg"]), self.palette_data["input_bg"])
-        field_fill = self._popup_control_fill_css(theme, field_bg)
+        field_fill = self._popup_control_fill_css(kind, theme, field_bg)
         field_border = shift(field_bg, -0.38)
         selection_bg = self.palette_data["accent"]
         selection_text = readable_text(selection_bg)
@@ -17834,7 +19468,21 @@ class QuickInputsWindow(QMainWindow):
         new_bg_css = rgba_css(new_bg, 0.82)
         pick_bg_css = rgba_css(pick_bg, 0.82)
         reset_bg_css = rgba_css(reset_bg, 0.82)
-        root_bg = bg if (force_opaque_root or not transparent) else "transparent"
+        title_badge_bg = rgba_css(blend(header_bg, bg, 0.18), 0.82 if effective_transparent else 0.62)
+        title_badge_border = rgba_css(shift(header_bg, -0.38), 0.90)
+        checkbox_fill = rgba_css(blend(field_bg, bg, 0.16), 0.88 if effective_transparent else 0.94)
+        checkbox_fill_checked = rgba_css(blend(selection_bg, field_bg, 0.20), 0.96)
+        checkbox_fill_disabled = rgba_css(field_bg, 0.58)
+        checkbox_border = shift(field_bg, -0.46)
+        requested_transparent = bool(theme.get("transparent", False))
+        if force_opaque_root:
+            root_bg = bg
+        elif effective_transparent:
+            root_bg = "transparent"
+        elif requested_transparent:
+            root_bg = rgba_css(bg, 0.05)
+        else:
+            root_bg = bg
         tab_bg = "transparent"
         tab_hover = rgba_css(selection_bg, 0.26)
         tab_selected_bg = rgba_css(selection_bg, 0.34)
@@ -17855,6 +19503,7 @@ class QuickInputsWindow(QMainWindow):
             f"color: {text};"
             "font-weight: 700;"
             "}"
+            f"QLabel[section='true'] {{ background-color: {title_badge_bg}; border: 1px solid {title_badge_border}; border-radius: 7px; padding: 2px 8px; }}"
             + container_transparent_css
             + (
             "QTabWidget::pane {"
@@ -17888,7 +19537,9 @@ class QuickInputsWindow(QMainWindow):
             f"selection-background-color: {selection_bg};"
             f"selection-color: {selection_text};"
             "}"
-            f"QCheckBox::indicator {{ width: {check_indicator_px}px; height: {check_indicator_px}px; }}"
+            f"QCheckBox::indicator {{ width: {check_indicator_px}px; height: {check_indicator_px}px; border-radius: 3px; background: {checkbox_fill}; border: 1px solid {checkbox_border}; }}"
+            f"QCheckBox::indicator:checked {{ background: {checkbox_fill_checked}; border: 1px solid {shift(selection_bg, -0.42)}; }}"
+            f"QCheckBox::indicator:disabled {{ background: {checkbox_fill_disabled}; border: 1px solid {shift(checkbox_border, 0.08)}; }}"
             "QTableWidget, QListView, QTreeView {"
             "gridline-color: "
             f"{shift(field_border, -0.10)};"
@@ -18396,7 +20047,7 @@ class QuickInputsWindow(QMainWindow):
         self.hover_fade_in_value.setText(f"{self.config['hover_fade_in_s']}s")
         self.hover_fade_out_value.setText(f"{self.config['hover_fade_out_s']}s")
         if not self._hover_inside:
-            self._set_ui_opacity(self._base_opacity())
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
         self.queue_save_config()
 
     def _base_opacity(self) -> float:
@@ -18437,7 +20088,7 @@ class QuickInputsWindow(QMainWindow):
         if self._hover_revealed:
             self._set_ui_opacity(1.0)
         else:
-            self._set_ui_opacity(opacity)
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
         self.queue_save_config()
 
     def _apply_window_flags(self) -> None:
@@ -18447,7 +20098,7 @@ class QuickInputsWindow(QMainWindow):
         if self._hover_revealed:
             self._set_ui_opacity(1.0)
         else:
-            self._set_ui_opacity(self._base_opacity())
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802
         if event.type() == QEvent.Type.Resize:
@@ -18463,9 +20114,23 @@ class QuickInputsWindow(QMainWindow):
                     exc=exc,
                     context={"watched": repr(watched)},
                 )
-        if event.type() == QEvent.Type.MouseButtonPress and isinstance(watched, QWidget):
-            if watched is self or self.isAncestorOf(watched):
+        if isinstance(watched, QWidget) and watched is not None and (watched is self or self.isAncestorOf(watched)):
+            if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
                 self._reveal_immediately()
+                if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(watched):
+                    self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                    self.move(event.globalPosition().toPoint() - self._drag_offset)
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and self._drag_offset is not None:
+                self._drag_offset = None
+                if isinstance(event, QMouseEvent):
+                    event.accept()
+                    return True
         return super().eventFilter(watched, event)
 
     # ---------------------- Icon / Titlebar ------------------------- #
@@ -18569,14 +20234,16 @@ class QuickInputsWindow(QMainWindow):
             self.move(clamped_x, clamped_y)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and _can_start_window_drag(self, event.position().toPoint()):
+        target = _drag_target_widget(self, event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(target):
+            self._reveal_immediately()
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
-        if self._drag_offset and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_offset)
             event.accept()
             return
@@ -18664,6 +20331,85 @@ class QuickInputsWindow(QMainWindow):
             self.quick_editor_dialog.close()
         self.save_config()
         super().closeEvent(event)
+
+
+def _iter_flowgrid_shell_windows() -> list["QuickInputsWindow"]:
+    app = QApplication.instance()
+    quick_inputs_cls = globals().get("QuickInputsWindow")
+    if app is None or quick_inputs_cls is None:
+        return []
+    shells: list["QuickInputsWindow"] = []
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, quick_inputs_cls):
+            shells.append(widget)
+    return shells
+
+
+def _visible_flowgrid_shell_window() -> "QuickInputsWindow" | None:
+    for shell in _iter_flowgrid_shell_windows():
+        try:
+            if shell.isVisible():
+                return shell
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_shell_window_available(preferred_shell: "QuickInputsWindow" | None) -> "QuickInputsWindow" | None:
+    visible_shell = _visible_flowgrid_shell_window()
+    if visible_shell is not None:
+        try:
+            if visible_shell.isMinimized():
+                visible_shell.showNormal()
+            visible_shell.raise_()
+            visible_shell.activateWindow()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.shell_window_activate_failed",
+                severity="warning",
+                summary="Failed activating the existing Flowgrid shell window.",
+                exc=exc,
+            )
+        return visible_shell
+
+    candidate_shells: list["QuickInputsWindow"] = []
+    if preferred_shell is not None:
+        candidate_shells.append(preferred_shell)
+    for shell in _iter_flowgrid_shell_windows():
+        if shell not in candidate_shells:
+            candidate_shells.append(shell)
+
+    for shell in candidate_shells:
+        try:
+            if shell.isMinimized():
+                shell.showNormal()
+            else:
+                shell.show()
+            shell.raise_()
+            shell.activateWindow()
+            return shell
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.shell_window_restore_failed",
+                severity="warning",
+                summary="Failed restoring an existing Flowgrid shell window; trying the next candidate.",
+                exc=exc,
+            )
+
+    try:
+        shell = QuickInputsWindow()
+        shell.show()
+        shell.raise_()
+        shell.activateWindow()
+        return shell
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.shell_window_create_failed",
+            severity="error",
+            summary="Failed creating a replacement Flowgrid shell window.",
+            exc=exc,
+        )
+        return None
 
 
 def main() -> int:

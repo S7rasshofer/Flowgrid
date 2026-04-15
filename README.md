@@ -23,22 +23,24 @@ The Input Grid is a highly customizable workspace for quick buttons speeding up 
 ### Tracker Hub
 
 Tracker Hub is the operational home page for workflow tools. 
-* Launch buttons for the Agent window, QA/WCS window, workbook import, Admin Panel, and Data Dashboard 
+* Launch buttons for the Workflow windows and reporting.
+    * Agent, QA/WCS, Admin Panel, and Data Dashboard.
 
-#### Agent Window
+#### Agent 
 
 The Agent window is where technicians log day-to-day repair activity and track part-related follow-up. 
 * The Work tab records work order status updates
 * Parts and Client tabs help agents review their own requested part updates, aging, notes, and items that attention.
 * 'Parts' lists out any parts needing installed by the requestor, 'Cat. Parts' (or category parts) lists out any parts needing work for the entire category, requestor agnostic (Tech 3 and admins can see the requestor).
 
-#### QA/WCS Window
+#### QA/WCS 
 
 The QA/WCS window manages part submissions and fulfillment tracking. 
 * Users submit parts (preferably, when all parts are delivered) against a work order.
 * QA/WCS can apply flags and comments for follow ups
 * Bulk import delivered parts by simply copy pasting rows when needed ("delivered" parts will be submitted)
-* Monitor progress through the Assigned Parts, Parts Delivered, and Missing PO follow-up views.
+* Monitor progress through the Assigned Parts, Parts Delivered, and Completed tabs.
+* If a part order is missed and a QA submits parts this will be logged in a 'Missing PO' that only admins and Tech 3s can see.
 
 #### Admin Panel
 
@@ -54,7 +56,6 @@ The Data Dashboard is the reporting and inspection window for shared tracker dat
 * The table will show a bargraph of the productivity window selected.
 * The list will filter down the specific units that have been submitted.
 * Both utilize the same filter by timeframe/user.
-* The Completed tab is the canonical completed-parts review surface.
 * Use the Notes tab to inspect and edit supported note fields directly on existing records.
 * Export results to CSV.
 
