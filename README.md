@@ -5,8 +5,12 @@
 Flowgrid is a desktop productivity and workflow tool for repair operations. 
 It combines a quick-launch input grid, a tracker hub for repair activity, inventory/parts coordination, admin maintenance, and dashboard reporting for a repair process.
 
-> Please put the assets folder, flowgrid.pyw, and flowgrid_installer.pyw into a shared location to establish your database and home for this project.
-> Using the installer will download the assets and main Flowgrid.pyw into your documents folder creating a config file to save any customizations.
+> Put `Assets`, `Flowgrid.pyw`, `Flowgrid_installer.pyw`, and `flowgrid_app` in the shared Flowgrid source location.
+> Run `Flowgrid_installer.pyw` from the shared source to install the local runtime in `Documents\\Flowgrid`.
+> `python Flowgrid.pyw --create-shortcut` creates or repairs the local desktop shortcut.
+> `python Flowgrid.pyw --install` remains a legacy alias for local shortcut setup.
+> `python Flowgrid.pyw --diagnose-install` runs a read-only install preflight.
+> `python Flowgrid.pyw --smoke-ui` runs the offscreen UI smoke harness against the shared DB in read-only mode.
 
 ## Main Window
 
@@ -24,7 +28,7 @@ The Input Grid is a highly customizable workspace for quick buttons speeding up 
 
 Tracker Hub is the operational home page for workflow tools. 
 * Launch buttons for the Workflow windows and reporting.
-    * Agent, QA/WCS, Admin Panel, and Data Dashboard.
+    * Agent, QA/WCS, User Setup, and Data Dashboard.
 
 #### Agent 
 
@@ -40,14 +44,15 @@ The QA/WCS window manages part submissions and fulfillment tracking.
 * QA/WCS can apply flags and comments for follow ups
 * Bulk import delivered parts by simply copy pasting rows when needed ("delivered" parts will be submitted)
 * Monitor progress through the Assigned Parts, Parts Delivered, and Completed tabs.
-* If a part order is missed and a QA submits parts this will be logged in a 'Missing PO' that only admins and Tech 3s can see.
+* If a part order is missed and a QA submits parts this will be logged in a 'Missing PO' follow-up view for elevated reporting/admin access.
 
-#### Admin Panel
+#### User Setup
 
-The Admin Panel maintains user access, reference data and access-controlled records. 
-* Administrators use it to add, update, or remove admins/agents.
+The User Setup window maintains user access, reference data and access-controlled records. 
+* Administrators use it to add, update, or remove users from a merged user list.
+* Users can be assigned one operational Role plus optional Access for reporting or full administration.
+* Administrators can maintain the centralized Roles list that drives the Role dropdown in User Setup.
 * Add/modify QA flags so the operational windows always draw from a current centralized list.
-* Admins are tracked separatly.
 
 #### Data Dashboard
 

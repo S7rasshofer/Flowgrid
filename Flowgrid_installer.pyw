@@ -6,9 +6,8 @@ This installer runs from the shared drive and installs Flowgrid locally.
 No .CMD files, no PowerShell, no external scripts.
 
 Requirements:
-- Python 3.8+
+- Python 3.10+
 - PySide6 (required, will be auto-installed if missing)
-- openpyxl (optional, used for workbook import support)
 - Run from shared drive by double-clicking this .pyw file
 
 Installation steps:
@@ -33,13 +32,21 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from flowgrid_app.installer import (
+    DESKTOP_SHORTCUT_FILENAME,
+    MANAGED_SHORTCUT_ICON_FILENAME,
+    WINDOWS_SHORTCUT_DESCRIPTION,
+    _create_or_update_windows_shortcut,
+    _preferred_gui_python_executable,
+)
+
 APP_TITLE = "Flowgrid"
 CONFIG_FILENAME = "Flowgrid_config.json"
 LOCAL_APP_FOLDER_NAME = APP_TITLE
+LOGS_DIR_NAME = "Logs"
 MIN_PYTHON_VERSION = (3, 8, 0)
 DEPENDENCY_SPECS: Tuple[Tuple[str, str, bool], ...] = (
     ("PySide6", "PySide6", True),
-    ("openpyxl", "openpyxl", False),
 )
 _FLOWGRID_PATHS_CONFIG: Optional[Dict[str, Any]] = None
 
@@ -255,7 +262,7 @@ def get_source_root() -> Path:
 def get_installer_error_log_path() -> Path:
     """Get path for installer error log on shared drive."""
     shared_root = find_actual_shared_root()
-    log_path = shared_root / "Flowgrid_installer_errors.log"
+    log_path = shared_root / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     return log_path
 
@@ -288,8 +295,9 @@ def log_installer_error(error_code: str, summary: str, details: str = "") -> Non
             with log_path.open("a", encoding="utf-8") as handle:
                 handle.write("\n".join(lines))
         except Exception as write_exc:
-            fallback_path = get_script_root() / "Flowgrid_installer_errors.log"
+            fallback_path = get_script_root() / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
             try:
+                fallback_path.parent.mkdir(parents=True, exist_ok=True)
                 with fallback_path.open("a", encoding="utf-8") as handle:
                     handle.write("\n".join(lines))
                     handle.write("\n[FAILOVER] Failed to write to shared log path: " + str(write_exc) + "\n")
@@ -419,37 +427,6 @@ def install_package(package_name: str) -> Tuple[bool, str]:
 
 
 def ensure_dependencies() -> Tuple[bool, str]:
-    """Check and install required dependencies."""
-    packages = get_required_packages()
-    failed_packages = []
-
-    for package in packages:
-        print(f"Checking {package}...")
-
-        # Check if already installed
-        installed, error = check_package_import(package)
-        if installed:
-            print(f"✓ {package} is already installed")
-            continue
-
-        # Try to install
-        success, install_error = install_package(package)
-        if not success:
-            failed_packages.append(f"{package}: {install_error}")
-            continue
-
-        # Verify installation worked
-        installed, error = check_package_import(package)
-        if not installed:
-            failed_packages.append(f"{package}: Import failed after install - {error}")
-
-    if failed_packages:
-        return False, f"Failed to install: {', '.join(failed_packages)}"
-
-    return True, ""
-
-
-def ensure_dependencies() -> Tuple[bool, str]:
     """Check/install required dependencies and report optional-package state."""
     dependency_specs = get_dependency_specs()
     failed_packages: List[str] = []
@@ -520,7 +497,11 @@ def copy_directory_recursive(src: Path, dst: Path, description: str) -> bool:
         print(f"Copying {description}...")
         if dst.exists():
             shutil.rmtree(dst)
-        shutil.copytree(src, dst)
+        shutil.copytree(
+            src,
+            dst,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
         return True
     except Exception as e:
         log_installer_error("COPY_DIR_FAILED", f"Failed to copy {description}", str(e))
@@ -550,9 +531,9 @@ def _managed_local_runtime_targets(paths: Dict[str, Path]) -> List[Tuple[Path, s
     """Return installer-managed local runtime artifacts used for reinstall/update detection."""
     return [
         (paths["local_app"], "local Flowgrid application"),
+        (paths["local_package"], "local Flowgrid package folder"),
         (paths["local_paths_config"], "local shared-root manifest"),
         (paths["local_assets"], "local packaged Assets folder"),
-        (paths["local_app_folder"] / "Flowgrid_shortcut.ico", "local managed shortcut icon"),
     ]
 
 
@@ -698,12 +679,14 @@ def get_installation_paths() -> Dict[str, Path]:
         "shared_root": shared_root,
         "source_root": source_root,
         "shared_app": source_root / "Flowgrid.pyw",
+        "shared_package": source_root / "flowgrid_app",
         "shared_assets": shared_assets,
         "shared_db": shared_root / "Flowgrid_depot.db",
         "shared_config": shared_root / CONFIG_FILENAME,
         "documents_folder": documents_folder,
         "local_app_folder": local_app_folder,
         "local_app": local_app_folder / "Flowgrid.pyw",
+        "local_package": local_app_folder / "flowgrid_app",
         "local_config_folder": local_config_folder,
         "local_config": local_config_folder / CONFIG_FILENAME,
         "local_data_folder": local_data_folder,
@@ -840,7 +823,7 @@ def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str
         errors.append(f"Expected shared drive root is not a directory: {expected_shared_root}")
     else:
         # Check for required files at the configured shared root
-        required_files = ["Flowgrid.pyw", "Assets"]
+        required_files = ["Flowgrid.pyw", "flowgrid_app", "Assets"]
         for req in required_files:
             req_path = expected_shared_root / req
             if not req_path.exists():
@@ -848,6 +831,9 @@ def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str
 
     if not paths["shared_app"].exists():
         errors.append(f"Flowgrid.pyw not found at source location: {paths['shared_app']}")
+
+    if not paths["shared_package"].exists() or not paths["shared_package"].is_dir():
+        errors.append(f"flowgrid_app package not found at source location: {paths['shared_package']}")
 
     if not paths["shared_assets"].exists():
         errors.append(f"Assets folder not found at source location: {paths['shared_assets']}")
@@ -862,6 +848,15 @@ def copy_app_files(paths: Dict[str, Path]) -> bool:
         return False
 
     return copy_file_with_progress(paths["shared_app"], paths["local_app"], "Flowgrid application")
+
+
+def copy_app_package(paths: Dict[str, Path]) -> bool:
+    """Copy flowgrid_app package to local folder."""
+    if not paths["shared_package"].exists() or not paths["shared_package"].is_dir():
+        log_installer_error("PACKAGE_NOT_FOUND", "flowgrid_app package not found on shared drive", str(paths["shared_package"]))
+        return False
+
+    return copy_directory_recursive(paths["shared_package"], paths["local_package"], "flowgrid_app package")
 
 
 def copy_assets(paths: Dict[str, Path]) -> bool:
@@ -920,15 +915,39 @@ def initialize_database(paths: Dict[str, Path]) -> bool:
                     admin_name TEXT NOT NULL DEFAULT '',
                     position TEXT NOT NULL DEFAULT '',
                     location TEXT NOT NULL DEFAULT '',
-                    icon_path TEXT NOT NULL DEFAULT ''
+                    icon_path TEXT NOT NULL DEFAULT '',
+                    access_level TEXT NOT NULL DEFAULT 'admin'
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS role_definitions (
+                    id INTEGER PRIMARY KEY,
+                    role_name TEXT NOT NULL UNIQUE,
+                    role_slot TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            default_roles = (
+                ("Tech 1", "tech1", 1),
+                ("Tech 2", "tech2", 2),
+                ("Tech 3", "tech3", 3),
+                ("MP", "mp", 4),
+                ("QA", "qa", 5),
+                ("Other", "none", 6),
+            )
+            for role_name, role_slot, sort_order in default_roles:
+                conn.execute(
+                    "INSERT OR IGNORE INTO role_definitions (role_name, role_slot, sort_order) VALUES (?, ?, ?)",
+                    (role_name, role_slot, int(sort_order)),
+                )
             row = conn.execute("SELECT COUNT(*) FROM admin_users").fetchone()
             admin_count = int(row[0] if row is not None else 0)
             if admin_count == 0:
                 conn.execute(
-                    "INSERT INTO admin_users (user_id, admin_name, position, location, icon_path) VALUES (?, ?, 'Admin', '', '')",
+                    "INSERT INTO admin_users (user_id, admin_name, position, location, icon_path, access_level) VALUES (?, ?, 'Other', '', '', 'admin')",
                     (current_user, current_user),
                 )
             conn.commit()
@@ -969,8 +988,12 @@ def _resolve_windows_desktop_directory() -> Path | None:
     return None
 
 
+def _managed_shortcut_icon_path(paths: Dict[str, Path]) -> Path:
+    return paths["shared_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME
+
+
 def create_desktop_shortcut(paths: Dict[str, Path]) -> bool:
-    """Create desktop shortcut using native Windows desktop path lookup."""
+    """Create desktop shortcut using the shared .lnk contract."""
     try:
         print("Creating desktop shortcut...")
 
@@ -979,24 +1002,39 @@ def create_desktop_shortcut(paths: Dict[str, Path]) -> bool:
             raise RuntimeError("Unable to resolve desktop folder")
 
         icon_source = _find_default_wrench_icon(paths["source_root"], paths["shared_root"])
-        icon_file = None
-        if icon_source is not None:
-            icon_file = paths["local_app_folder"] / "Flowgrid_shortcut.ico"
-            try:
-                _create_shortcut_icon(icon_source, icon_file)
-            except Exception as e:
-                log_installer_error("ICON_CREATE_FAILED", "Failed to create shortcut icon", str(e))
-                icon_file = None
+        if icon_source is None:
+            raise RuntimeError("Unable to locate the default wrench icon for desktop shortcut creation.")
 
-        shortcut_path = desktop_path / "Flowgrid.url"
-        icon_line = f"IconFile={icon_file}\n" if icon_file is not None else ""
-        url_content = f"""[InternetShortcut]\nURL={paths['local_app'].as_uri()}\n{icon_line}IconIndex=0\n"""
-        shortcut_path.write_text(url_content, encoding="utf-8")
+        from flowgrid_app.icon_io import _write_managed_shortcut_icon
+
+        managed_icon_path = _managed_shortcut_icon_path(paths)
+        managed_icon_path.parent.mkdir(parents=True, exist_ok=True)
+        _write_managed_shortcut_icon(icon_source, managed_icon_path)
+
+        launcher_path = _preferred_gui_python_executable()
+        script_path = paths["local_app"]
+        if not launcher_path.exists() or not launcher_path.is_file():
+            raise RuntimeError(f"Python launcher not found: {launcher_path}")
+        if not script_path.exists() or not script_path.is_file():
+            raise RuntimeError(f"Installed Flowgrid.pyw not found: {script_path}")
+
+        shortcut_path = desktop_path / DESKTOP_SHORTCUT_FILENAME
+        arguments = f'"{script_path}"'
+        ok, detail = _create_or_update_windows_shortcut(
+            shortcut_path,
+            launcher_path,
+            arguments,
+            script_path.parent,
+            managed_icon_path,
+            WINDOWS_SHORTCUT_DESCRIPTION,
+        )
+        if not ok:
+            raise RuntimeError(detail or "Unknown desktop shortcut save failure.")
         return True
 
     except Exception as e:
         log_installer_error("SHORTCUT_FAILED", "Failed to create desktop shortcut", str(e))
-        return True
+        return False
 
 
 def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]], is_update_install: bool = False) -> str:
@@ -1006,6 +1044,7 @@ def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]
         headline,
         "",
         f"Local install: {paths['local_app_folder']}",
+        f"Local package: {paths['local_package']}",
         f"Shared root: {paths['shared_root']}",
         f"Shared DB: {paths['shared_db']}",
         "",
@@ -1053,6 +1092,20 @@ def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
         "ok" if local_app.exists() and local_app.is_file() else "failed",
         "Local runtime entrypoint present." if local_app.exists() and local_app.is_file() else "Local Flowgrid.pyw missing after install.",
         str(local_app),
+    )
+
+    local_package = paths["local_package"]
+    package_init = local_package / "__init__.py"
+    _record_step(
+        results,
+        "flowgrid_app package installed",
+        "ok" if local_package.exists() and local_package.is_dir() and package_init.exists() and package_init.is_file() else "failed",
+        (
+            "Local runtime support package present."
+            if local_package.exists() and local_package.is_dir() and package_init.exists() and package_init.is_file()
+            else "Local flowgrid_app package missing after install."
+        ),
+        str(local_package),
     )
 
     local_assets = paths["local_assets"]
@@ -1231,6 +1284,7 @@ def run_installer() -> int:
     print(f"Source root: {paths['source_root']}")
     print(f"Shared root: {paths['shared_root']}")
     print(f"Local app folder: {paths['local_app_folder']}")
+    print(f"Local package folder: {paths['local_package']}")
     print(f"Local assets folder: {paths['local_assets']}")
     is_update_install = detect_existing_local_install(paths)
     log_installer_status(
@@ -1242,6 +1296,7 @@ def run_installer() -> int:
                 f"shared_root={paths['shared_root']}",
                 f"shared_db={paths['shared_db']}",
                 f"local_app={paths['local_app']}",
+                f"local_package={paths['local_package']}",
                 f"local_manifest={paths['local_paths_config']}",
                 "workflow_db_source_of_truth=shared_root/Flowgrid_depot.db",
             ]
@@ -1259,7 +1314,7 @@ def run_installer() -> int:
     if source_errors:
         error_msg = (
             "Installer cannot continue because source materials are unavailable. "
-            "Please ensure Flowgrid.pyw and the Assets folder are visible from the shared drive or the downloaded package."
+            "Please ensure Flowgrid.pyw, flowgrid_app, and the Assets folder are visible from the shared drive or the downloaded package."
         )
         details = "\n".join(source_errors)
         _record_step(install_steps, "Source materials", "failed", details, str(paths["shared_root"]))
@@ -1307,8 +1362,19 @@ def run_installer() -> int:
     print("[OK] Application installed")
     print()
 
-    # Step 8: Copy assets
-    print("Step 8: Installing assets...")
+    # Step 8: Copy support package
+    print("Step 8: Installing support package...")
+    if not copy_app_package(paths):
+        error_msg = "Failed to copy flowgrid_app package"
+        _record_step(install_steps, "flowgrid_app install", "failed", error_msg, str(paths["local_package"]))
+        show_installation_dialog("Installation Failed", error_msg, is_error=True)
+        return 1
+    _record_step(install_steps, "flowgrid_app install", "ok", "Local flowgrid_app package copied successfully.", str(paths["local_package"]))
+    print("[OK] Support package installed")
+    print()
+
+    # Step 9: Copy assets
+    print("Step 9: Installing assets...")
     if not copy_assets(paths):
         error_msg = "Failed to copy assets folder"
         _record_step(install_steps, "Packaged Assets install", "failed", error_msg, str(paths["local_assets"]))
@@ -1318,8 +1384,8 @@ def run_installer() -> int:
     print("[OK] Assets installed")
     print()
 
-    # Step 9: Initialize database
-    print("Step 9: Initializing database...")
+    # Step 10: Initialize database
+    print("Step 10: Initializing database...")
     if not initialize_database(paths):
         error_msg = "Failed to initialize database"
         _record_step(install_steps, "Shared DB initialization", "failed", error_msg, str(paths["shared_db"]))
@@ -1332,8 +1398,8 @@ def run_installer() -> int:
     print("[OK] Database initialized")
     print()
 
-    # Step 10: Create desktop shortcut
-    print("Step 10: Creating desktop shortcut...")
+    # Step 11: Create desktop shortcut
+    print("Step 11: Creating desktop shortcut...")
     if not create_desktop_shortcut(paths):
         _record_step(install_steps, "Desktop shortcut", "warning", "Desktop shortcut could not be created.", str(paths["local_app_folder"]))
         print("[WARN] Desktop shortcut creation failed, but installation continues")
@@ -1342,7 +1408,7 @@ def run_installer() -> int:
         print("[OK] Desktop shortcut created")
     print()
 
-    # Step 11: Show completion dialog
+    # Step 12: Show completion dialog
     completion_msg = build_installation_report(
         paths,
         [*install_steps, *verify_installed_state(paths)],

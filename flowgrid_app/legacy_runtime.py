@@ -1,0 +1,17605 @@
+﻿#!/usr/bin/env python3
+"""Flowgrid - PySide6 production/part tracking desktop utility.
+"""
+
+from __future__ import annotations
+
+import csv
+import ctypes
+import getpass
+import importlib
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+import traceback
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+FLOWGRID_PACKAGE_DIR = Path(__file__).resolve().parent
+FLOWGRID_PROJECT_ROOT = FLOWGRID_PACKAGE_DIR.parent
+__file__ = str(FLOWGRID_PROJECT_ROOT / "Flowgrid.pyw")
+
+import sqlite3
+from datetime import date, datetime, timedelta
+
+from flowgrid_app import AppContext, PermissionDeniedError, PermissionService, UserRepository, WindowManager
+from flowgrid_app.depot_rules import DepotRules as _SharedDepotRules
+from flowgrid_app.runtime_logging import (
+    _brief_runtime_context as _shared_brief_runtime_context,
+    _json_safe as _shared_json_safe,
+    _runtime_log_event as _shared_runtime_log_event,
+    _runtime_log_path as _shared_runtime_log_path,
+    configure_runtime_logging,
+    detect_current_user_id as _shared_detect_current_user_id,
+)
+from flowgrid_app.ui_utils import (
+    blend as _shared_blend,
+    clamp as _shared_clamp,
+    compute_palette as _shared_compute_palette,
+    contrast_ratio as _shared_contrast_ratio,
+    normalize_hex as _shared_normalize_hex,
+    readable_text as _shared_readable_text,
+    rgba_css as _shared_rgba_css,
+    safe_int as _shared_safe_int,
+    safe_layer_defaults as _shared_safe_layer_defaults,
+    shift as _shared_shift,
+)
+from flowgrid_app.window.common import TouchDistributionBar as _SharedTouchDistributionBar
+from flowgrid_app.window.popup_support import (
+    DepotFramelessToolWindow as _SharedDepotFramelessToolWindow,
+    FlowgridThemedDialog as _SharedFlowgridThemedDialog,
+    _ensure_shell_window_available as _shared_ensure_shell_window_available,
+    _visible_flowgrid_shell_window as _shared_visible_flowgrid_shell_window,
+    configure_flowgrid_shell_factory,
+    mark_flowgrid_shell_window,
+    show_flowgrid_themed_color as _shared_show_flowgrid_themed_color,
+    show_flowgrid_themed_existing_directory as _shared_show_flowgrid_themed_existing_directory,
+    show_flowgrid_themed_input_int as _shared_show_flowgrid_themed_input_int,
+    show_flowgrid_themed_input_item as _shared_show_flowgrid_themed_input_item,
+    show_flowgrid_themed_input_text as _shared_show_flowgrid_themed_input_text,
+    show_flowgrid_themed_message as _shared_show_flowgrid_themed_message,
+    show_flowgrid_themed_open_file_name as _shared_show_flowgrid_themed_open_file_name,
+    show_flowgrid_themed_open_file_names as _shared_show_flowgrid_themed_open_file_names,
+    show_flowgrid_themed_save_file_name as _shared_show_flowgrid_themed_save_file_name,
+)
+from flowgrid_app.window.query_support import (
+    _alert_quiet_active as _shared_alert_quiet_active,
+    _dedupe_part_detail_rows as _shared_dedupe_part_detail_rows,
+    _installed_key_set_from_text as _shared_installed_key_set_from_text,
+    _merged_part_detail_rows as _shared_merged_part_detail_rows,
+    _next_alert_quiet_until as _shared_next_alert_quiet_until,
+    _parse_iso_datetime_local as _shared_parse_iso_datetime_local,
+    _part_detail_row_key as _shared_part_detail_row_key,
+    _serialize_part_detail_rows as _shared_serialize_part_detail_rows,
+    _serialized_installed_keys as _shared_serialized_installed_keys,
+    _submission_entry_date_sql as _shared_submission_entry_date_sql,
+    _submission_latest_ts_sql as _shared_submission_latest_ts_sql,
+)
+from flowgrid_app.window.shared_actions import (
+    PartNotesDialog as _SharedPartNotesDialog,
+    _copy_work_order_with_notice as _shared_copy_work_order_with_notice,
+    _edit_aux_queue_comment as _shared_edit_aux_queue_comment,
+    _edit_part_notes as _shared_edit_part_notes,
+    _populate_missing_po_followup_table as _shared_populate_missing_po_followup_table,
+    _reassign_missing_po_followup as _shared_reassign_missing_po_followup,
+    _resolve_missing_po_followup as _shared_resolve_missing_po_followup,
+)
+from flowgrid_app.window.table_support import (
+    _center_table_item as _shared_center_table_item,
+    _resolve_user_icon_from_agent_meta as _shared_resolve_user_icon_from_agent_meta,
+    _selected_part_id_from_table as _shared_selected_part_id_from_table,
+    _select_table_row_by_context_pos as _shared_select_table_row_by_context_pos,
+    configure_standard_table as _shared_configure_standard_table,
+)
+
+
+DATA_ROOT_ENV_VAR = "FLOWGRID_DATA_ROOT"
+DEFAULT_SHARED_DATA_ROOT = Path(r"Z:\DATA\Flowgrid")
+LAUNCH_LOG_FILENAME = "Flowgrid_launch_errors.log"
+LOGS_DIR_NAME = "Logs"
+RUNTIME_LOG_FILENAME_PREFIX = "Flowgrid_runtime"
+RUNTIME_LOG_FILENAME_SUFFIX = ".log.jsonl"
+RUNTIME_LOG_MAX_BYTES = 10 * 1024 * 1024
+RUNTIME_LOG_MAX_BACKUPS = 20
+RUNTIME_PROMPT_TITLE = "Flowgrid Runtime Issue"
+_RESOLVED_DATA_ROOT: Path | None = None
+_DATA_ROOT_FALLBACK_DETAILS = ""
+_DATA_ROOT_FALLBACK_NOTIFIED = False
+_RUNTIME_ESCALATED_EVENTS: set[str] = set()
+_RUNTIME_LOG_WRITE_IN_PROGRESS = False
+_LAUNCH_LOGGED_ONCE_EVENTS: set[str] = set()
+ASSETS_DIR_NAME = "Assets"
+FLOWGRID_ICON_PACK_DIR_NAME = "Flowgrid Icons"
+ASSET_AGENT_ICON_DIR_NAME = "agent_icons"
+ASSET_ADMIN_ICON_DIR_NAME = "admin_icons"
+ASSET_QA_FLAG_ICON_DIR_NAME = "qa_flag_icons"
+ASSET_PART_FLAG_IMAGE_DIR_NAME = "part_flag_images"
+ASSET_UI_ICON_COMPAT_DIR_NAME = "ui_icons"
+APP_TITLE = "Flowgrid"
+CONFIG_FILENAME = "Flowgrid_config.json"
+DEPOT_DB_FILENAME = "Flowgrid_depot.db"
+SHARED_SYNC_REFRESH_INTERVAL_MS = 15000
+DEPOT_SEARCH_REFRESH_DEBOUNCE_MS = 250
+DEPOT_VIEW_TTL_MS = 4000
+DEPOT_RECENT_VIEW_TTL_MS = 5000
+DEPOT_BACKGROUND_AUTO_REFRESH_MS = 30000
+DEPOT_DB_REOPEN_COOLDOWN_MS = 5000
+MIN_PYTHON_VERSION = (3, 10, 0)
+_CLI_FLAGS = {str(arg or "").strip().lower() for arg in sys.argv[1:] if str(arg or "").strip()}
+_INSTALLER_FLAGS_ACTIVE = bool({"--install", "--create-shortcut"} & _CLI_FLAGS)
+_STARTUP_INITIALIZED = False
+
+# ============================================================================
+# CENTRALIZED PATH CONFIGURATION SYSTEM
+# ============================================================================
+# Flowgrid_paths.json lives in the local installed runtime folder and defines the shared root.
+# User should not place this config on the shared drive.
+# The runtime reads this local manifest to determine the shared database root.
+
+_FLOWGRID_PATHS_CONFIG: dict[str, Any] | None = None
+_FLOWGRID_PATHS_CONFIG_ERROR: str = ""
+
+
+def _find_local_paths_config() -> Path | None:
+    """Locate the local Flowgrid_paths.json beside the installed runtime."""
+    candidates: list[Path] = []
+
+    env_override = str(os.environ.get("FLOWGRID_PATHS_CONFIG", "") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override))
+
+    try:
+        script_dir = Path(__file__).resolve().parent
+        candidates.append(script_dir / "Flowgrid_paths.json")
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        except Exception:
+            pass
+
+    return None
+
+
+def _load_paths_config() -> dict[str, Any]:
+    """Load and cache Flowgrid_paths.json from the local install root."""
+    global _FLOWGRID_PATHS_CONFIG, _FLOWGRID_PATHS_CONFIG_ERROR
+
+    if _FLOWGRID_PATHS_CONFIG is not None:
+        return _FLOWGRID_PATHS_CONFIG
+
+    config_path = _find_local_paths_config()
+    if config_path is None:
+        _FLOWGRID_PATHS_CONFIG_ERROR = (
+            "Flowgrid_paths.json is missing from the installed runtime folder. "
+            "The app cannot determine the shared data root."
+        )
+        raise RuntimeError(_FLOWGRID_PATHS_CONFIG_ERROR)
+
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except Exception as exc:
+        _FLOWGRID_PATHS_CONFIG_ERROR = f"Failed to parse {config_path}: {type(exc).__name__}: {exc}"
+        raise RuntimeError(_FLOWGRID_PATHS_CONFIG_ERROR)
+
+    if not isinstance(loaded, dict):
+        _FLOWGRID_PATHS_CONFIG_ERROR = f"Flowgrid_paths.json must contain a JSON object. Found {type(loaded).__name__}."
+        raise RuntimeError(_FLOWGRID_PATHS_CONFIG_ERROR)
+
+    _FLOWGRID_PATHS_CONFIG = loaded
+    return _FLOWGRID_PATHS_CONFIG
+
+
+def _resolve_windows_documents_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+
+    try:
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0005, None, 0, buffer)
+        if result == 0 and str(buffer.value).strip():
+            path = Path(str(buffer.value).strip())
+            if path.exists() and path.is_dir():
+                return path
+    except Exception:
+        pass
+
+    userprofile = str(os.environ.get("USERPROFILE", "") or "").strip()
+    if userprofile:
+        candidate = Path(userprofile) / "Documents"
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    candidate = Path.home() / "Documents"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+
+    return None
+
+
+def _substitute_path_variables(template: str, shared_root: Path | None = None) -> str:
+    """Substitute {DOCUMENTS}, {SHARED_ROOT}, etc. in path strings."""
+    if not template:
+        return ""
+
+    result = str(template)
+
+    if "{DOCUMENTS}" in result:
+        documents = _resolve_windows_documents_directory() or (Path.home() / "Documents")
+        result = result.replace("{DOCUMENTS}", str(documents))
+
+    if "{SHARED_ROOT}" in result:
+        if shared_root is None:
+            raise RuntimeError("Shared root is required to substitute {SHARED_ROOT}.")
+        result = result.replace("{SHARED_ROOT}", str(shared_root))
+
+    return result
+
+
+def _resolve_path_from_config(config_key: str, default: str | Path | None = None, shared_root: Path | None = None) -> Path:
+    """Retrieve a path from the config, with substitution and fallback."""
+    config = _load_paths_config()
+    
+    # Navigate nested keys (e.g., "local_paths.database_folder")
+    parts = str(config_key).split(".")
+    value = config
+    for part in parts:
+        if isinstance(value, dict):
+            value = value.get(part)
+        else:
+            value = None
+            break
+    
+    if value is None:
+        if default is None:
+            return Path.cwd()
+        return Path(_substitute_path_variables(str(default), shared_root))
+    
+    return Path(_substitute_path_variables(str(value), shared_root))
+
+
+def _get_shared_root_from_config() -> Path:
+    """Get the configured shared drive root from Flowgrid_paths.json."""
+    config = _load_paths_config()
+    shared_root_str = str(config.get("shared_drive_root") or "").strip()
+    if not shared_root_str:
+        raise RuntimeError("Flowgrid_paths.json does not define shared_drive_root.")
+
+    shared_root = Path(shared_root_str)
+    if not shared_root.exists() or not shared_root.is_dir():
+        raise RuntimeError(f"Configured shared drive root is not accessible: {shared_root}")
+
+    return shared_root.resolve()
+
+
+def _get_local_config_folder() -> Path:
+    r"""Get the local config folder (e.g., Documents\Flowgrid\Config)."""
+    shared_root = _get_shared_root_from_config()
+    config_folder = _resolve_path_from_config("local_paths.config_folder", "{DOCUMENTS}\\Flowgrid\\Config", shared_root)
+    config_folder.mkdir(parents=True, exist_ok=True)
+    return config_folder
+
+
+def _get_local_config_path() -> Path:
+    """Get the local configuration file path for the current user."""
+    folder = _get_local_config_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / CONFIG_FILENAME
+
+
+def _shared_workflow_db_path() -> Path:
+    """Return the authoritative shared workflow database path."""
+    shared_root = _resolve_data_root()
+    return shared_root / DEPOT_DB_FILENAME
+
+
+def _local_data_root() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception as exc:
+        fallback = Path.cwd()
+        _runtime_log_event(
+            "bootstrap.local_data_root_fallback",
+            severity="warning",
+            summary="Fell back to current working directory for local data root.",
+            exc=exc,
+            context={"fallback_path": str(fallback)},
+        )
+        return fallback
+
+
+def _configured_data_root() -> Path:
+    """Return the canonical shared data root from the install manifest."""
+    return _get_shared_root_from_config()
+
+
+def _paths_equal(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.paths_equal_resolve_failed",
+            severity="warning",
+            summary="Path resolution failed while comparing paths; using string comparison fallback.",
+            exc=exc,
+            context={"left": str(left), "right": str(right)},
+        )
+        return str(left) == str(right)
+
+
+def _legacy_data_candidates(filename: str) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(__file__).with_name(filename))
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.legacy_candidate_file_dir_failed",
+            severity="warning",
+            summary="Unable to derive __file__-relative legacy data candidate.",
+            exc=exc,
+            context={"filename": filename},
+        )
+    candidates.append(Path.cwd() / filename)
+
+    unique: list[Path] = []
+    for path in candidates:
+        if any(_paths_equal(path, existing) for existing in unique):
+            continue
+        unique.append(path)
+    return unique
+
+
+def _resolve_data_root() -> Path:
+    global _RESOLVED_DATA_ROOT
+    if _RESOLVED_DATA_ROOT is not None:
+        return _RESOLVED_DATA_ROOT
+
+    target = _configured_data_root()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        _RESOLVED_DATA_ROOT = target
+        return _RESOLVED_DATA_ROOT
+    except Exception as exc:
+        raise RuntimeError(
+            f"Unable to access shared data root {target}: {type(exc).__name__}: {exc}"
+        )
+
+
+def _data_file_path(filename: str, migrate_legacy: bool = True) -> Path:
+    """
+    Resolve path for a data file.
+
+    Shared data files use the shared root as the canonical source of truth.
+    User-specific settings are stored locally in Documents to avoid cross-user conflicts.
+    """
+    if filename == CONFIG_FILENAME:
+        target = _get_local_config_path()
+        if target.exists() or not migrate_legacy:
+            return target
+
+        legacy_shared = _resolve_data_root() / filename
+        if legacy_shared.exists() and legacy_shared.is_file():
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(legacy_shared, target)
+            except Exception as exc:
+                _runtime_log_event(
+                    "bootstrap.config_migration_failed",
+                    severity="warning",
+                    summary="Failed to migrate shared root config to local per-user config.",
+                    exc=exc,
+                    context={"shared_config": str(legacy_shared), "local_config": str(target)},
+                )
+        return target
+
+    # All other workflow data files go to shared root for centralized reading
+    target = _resolve_data_root() / filename
+    
+    if not migrate_legacy or target.exists():
+        return target
+
+    for legacy in _legacy_data_candidates(filename):
+        if _paths_equal(legacy, target):
+            continue
+        if not legacy.exists() or not legacy.is_file():
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy, target)
+            break
+        except Exception as exc:
+            _runtime_log_event(
+                "bootstrap.data_file_legacy_copy_failed",
+                severity="warning",
+                summary="Legacy data file copy failed; continuing without migration for this source.",
+                exc=exc,
+                context={
+                    "filename": filename,
+                    "legacy_path": str(legacy),
+                    "target_path": str(target),
+                },
+            )
+            continue
+    return target
+
+
+def _migrate_legacy_agent_icons(target_db_path: Path) -> None:
+    data_root = target_db_path.parent
+    assets_root = data_root / ASSETS_DIR_NAME
+    managed_folders = (
+        ASSET_AGENT_ICON_DIR_NAME,
+        ASSET_ADMIN_ICON_DIR_NAME,
+        ASSET_QA_FLAG_ICON_DIR_NAME,
+        ASSET_PART_FLAG_IMAGE_DIR_NAME,
+        ASSET_UI_ICON_COMPAT_DIR_NAME,
+        FLOWGRID_ICON_PACK_DIR_NAME,
+    )
+    try:
+        assets_root.mkdir(parents=True, exist_ok=True)
+        for folder in managed_folders:
+            (assets_root / folder).mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.assets_dir_create_failed",
+            severity="warning",
+            summary="Unable to create Assets folders; skipping legacy asset migration.",
+            exc=exc,
+            context={"assets_root": str(assets_root)},
+        )
+        return
+
+    candidate_roots: list[Path] = []
+    try:
+        candidate_roots.append(Path(__file__).resolve().parent)
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.legacy_asset_root_resolve_failed",
+            severity="warning",
+            summary="Unable to resolve module directory while gathering legacy asset roots.",
+            exc=exc,
+            context={"target_db_path": str(target_db_path)},
+        )
+    candidate_roots.append(Path.cwd())
+    candidate_roots.append(data_root)
+
+    unique_roots: list[Path] = []
+    for root in candidate_roots:
+        if any(_paths_equal(root, existing) for existing in unique_roots):
+            continue
+        unique_roots.append(root)
+
+    legacy_to_assets = {
+        ASSET_AGENT_ICON_DIR_NAME: ASSET_AGENT_ICON_DIR_NAME,
+        ASSET_ADMIN_ICON_DIR_NAME: ASSET_ADMIN_ICON_DIR_NAME,
+        ASSET_QA_FLAG_ICON_DIR_NAME: ASSET_QA_FLAG_ICON_DIR_NAME,
+        ASSET_PART_FLAG_IMAGE_DIR_NAME: ASSET_PART_FLAG_IMAGE_DIR_NAME,
+        "ui_icons": ASSET_UI_ICON_COMPAT_DIR_NAME,
+    }
+
+    for root in unique_roots:
+        for legacy_folder, asset_folder in legacy_to_assets.items():
+            source_dir = root / legacy_folder
+            target_dir = assets_root / asset_folder
+            if not source_dir.exists() or not source_dir.is_dir():
+                continue
+            try:
+                if _paths_equal(source_dir, target_dir):
+                    continue
+            except Exception as exc:
+                _runtime_log_event(
+                    "bootstrap.legacy_asset_path_compare_failed",
+                    severity="warning",
+                    summary="Failed comparing legacy and target asset directories; continuing migration scan.",
+                    exc=exc,
+                    context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
+                )
+            try:
+                for source_file in source_dir.rglob("*"):
+                    if not source_file.is_file():
+                        continue
+                    rel = source_file.relative_to(source_dir)
+                    target_file = target_dir / rel
+                    if target_file.exists():
+                        continue
+                    target_file.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        shutil.copy2(source_file, target_file)
+                    except Exception as exc:
+                        _runtime_log_event(
+                            "bootstrap.legacy_asset_copy_failed",
+                            severity="warning",
+                            summary="Failed copying a legacy asset file into Assets.",
+                            exc=exc,
+                            context={
+                                "source_file": str(source_file),
+                                "target_file": str(target_file),
+                            },
+                        )
+                        continue
+            except Exception as exc:
+                _runtime_log_event(
+                    "bootstrap.legacy_asset_root_scan_failed",
+                    severity="warning",
+                    summary="Failed scanning a legacy asset source directory.",
+                    exc=exc,
+                    context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
+                )
+                continue
+
+
+def _error_log_path() -> Path:
+    try:
+        target = _get_local_config_folder() / LOGS_DIR_NAME
+        target.mkdir(parents=True, exist_ok=True)
+        return target / LAUNCH_LOG_FILENAME
+    except Exception as exc:
+        runtime_dir = _local_data_root() / LOGS_DIR_NAME
+        try:
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            fallback = runtime_dir / LAUNCH_LOG_FILENAME
+        except Exception:
+            fallback_dir = Path.cwd() / LOGS_DIR_NAME
+            fallback_dir.mkdir(parents=True, exist_ok=True)
+            fallback = fallback_dir / LAUNCH_LOG_FILENAME
+        _runtime_log_event(
+            "bootstrap.launch_log_path_fallback",
+            severity="warning",
+            summary="Failed to resolve launch log path from data root; using fallback path.",
+            exc=exc,
+            context={"fallback_path": str(fallback)},
+        )
+        return fallback
+
+
+def _log_launch_error(code: str, summary: str, details: str = "") -> None:
+    try:
+        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines = [f"[{now}] [{code}] {summary}"]
+        if details:
+            lines.append(details)
+        lines.append("-" * 72)
+        with _error_log_path().open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.launch_log_write_failed",
+            severity="error",
+            summary="Failed to append launch error log entry.",
+            exc=exc,
+            context={"code": code, "summary": summary},
+        )
+
+
+def _log_launch_error_once(event_key: str, code: str, summary: str, details: str = "") -> None:
+    key = str(event_key or "").strip().lower()
+    if not key:
+        key = f"{code}:{summary}".strip().lower()
+    if key in _LAUNCH_LOGGED_ONCE_EVENTS:
+        return
+    _LAUNCH_LOGGED_ONCE_EVENTS.add(key)
+    _log_launch_error(code, summary, details)
+
+
+def _show_windows_toast(title: str, message: str) -> bool:
+    # Intentionally disabled to avoid spawning shell-based toast commands.
+    return False
+
+
+def _show_error_dialog(title: str, message: str) -> None:
+    if os.name == "nt":
+        try:
+            ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x10 | 0x1000)
+            return
+        except Exception as exc:
+            _runtime_log_event(
+                "bootstrap.error_dialog_native_failed",
+                severity="warning",
+                summary="Native error dialog failed; falling back to console print.",
+                exc=exc,
+                context={"title": str(title)},
+            )
+    try:
+        print(f"{title}\n{message}")
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.error_dialog_console_print_failed",
+            severity="error",
+            summary="Fallback console error dialog print failed.",
+            exc=exc,
+            context={"title": str(title)},
+        )
+
+
+def _notify_launch_error(code: str, summary: str, details: str = "") -> None:
+    _log_launch_error(code, summary, details)
+    short_msg = f"[{code}] {summary}"[:240]
+    if _show_windows_toast("Flowgrid Launch Error", short_msg):
+        return
+    log_path = _error_log_path()
+    body = short_msg
+    if details:
+        body = f"{body}\n\nDetails:\n{details}"
+    body = f"{body}\n\nLog: {log_path}"
+    _show_error_dialog("Flowgrid Launch Error", body)
+
+
+def _fatal_launch_error(code: str, summary: str, details: str = "") -> None:
+    _notify_launch_error(code, summary, details)
+    raise SystemExit(f"[{code}] {summary}")
+
+
+def _notify_data_root_fallback_once() -> None:
+    global _DATA_ROOT_FALLBACK_NOTIFIED
+    if _DATA_ROOT_FALLBACK_NOTIFIED or not _DATA_ROOT_FALLBACK_DETAILS:
+        return
+    _DATA_ROOT_FALLBACK_NOTIFIED = True
+    _notify_launch_error(
+        "TH-1201",
+        "Shared data path unavailable. Using a local fallback path.",
+        _DATA_ROOT_FALLBACK_DETAILS,
+    )
+
+
+def _safe_print(message: str = "", end: str = "\n") -> None:
+    try:
+        print(message, end=end)
+    except Exception as exc:
+        _runtime_log_event(
+            "runtime.safe_print_failed",
+            severity="warning",
+            summary="Console print failed in safe print helper.",
+            exc=exc,
+            context={"message_preview": str(message)[:240]},
+        )
+
+
+def detect_current_user_id() -> str:
+    candidates = [
+        os.environ.get("USERNAME", ""),
+        os.environ.get("USER", ""),
+        os.environ.get("LOGNAME", ""),
+    ]
+    try:
+        candidates.append(getpass.getuser() or "")
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.detect_user_getpass_failed",
+            severity="warning",
+            summary="getpass.getuser() failed while detecting current user ID.",
+            exc=exc,
+        )
+    for raw in candidates:
+        value = str(raw or "").strip()
+        if value:
+            return value.upper()
+    return "UNKNOWN"
+
+
+def _sanitize_log_filename_component(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return "UNKNOWN"
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", text)
+    cleaned = cleaned.strip("._-")
+    return cleaned or "UNKNOWN"
+
+
+def _runtime_log_dir() -> Path:
+    """Get runtime log directory. Logs stay LOCAL for reliability."""
+    try:
+        # Logs go to local folder for reliability and privacy
+        target = _get_local_config_folder() / LOGS_DIR_NAME
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except Exception as exc:
+        _log_launch_error_once(
+            "runtime.log_dir_primary_failed",
+            "TH-9802",
+            "Primary runtime log directory unavailable.",
+            f"Reason: {type(exc).__name__}: {exc}",
+        )
+        try:
+            fallback = _local_data_root() / LOGS_DIR_NAME
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        except Exception as fallback_exc:
+            _log_launch_error_once(
+                "runtime.log_dir_fallback_failed",
+                "TH-9803",
+                "Fallback runtime log directory unavailable.",
+                f"Fallback path: {_local_data_root() / LOGS_DIR_NAME}\nReason: {type(fallback_exc).__name__}: {fallback_exc}",
+            )
+            fallback = Path.cwd() / LOGS_DIR_NAME
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+
+
+def _runtime_log_path(user_id: str | None = None) -> Path:
+    normalized_user = _sanitize_log_filename_component(user_id or detect_current_user_id())
+    filename = f"{RUNTIME_LOG_FILENAME_PREFIX}_{normalized_user}{RUNTIME_LOG_FILENAME_SUFFIX}"
+    return _runtime_log_dir() / filename
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+def _brief_runtime_context(context: dict[str, Any] | None) -> str:
+    if not context:
+        return ""
+    parts: list[str] = []
+    for key, value in list(context.items())[:6]:
+        rendered = str(_json_safe(value))
+        if len(rendered) > 120:
+            rendered = rendered[:117] + "..."
+        parts.append(f"{key}={rendered}")
+    return "; ".join(parts)
+
+
+def _rotate_runtime_log(path: Path) -> None:
+    if not path.exists():
+        return
+    try:
+        if path.stat().st_size < RUNTIME_LOG_MAX_BYTES:
+            return
+    except Exception as exc:
+        _log_launch_error_once(
+            "runtime.log_rotate_stat_failed",
+            "TH-9804",
+            "Runtime log rotation stat check failed.",
+            f"Path: {path}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return
+
+    oldest = path.with_name(f"{path.name}.{RUNTIME_LOG_MAX_BACKUPS}")
+    if oldest.exists():
+        try:
+            oldest.unlink()
+        except Exception as exc:
+            _log_launch_error_once(
+                "runtime.log_rotate_delete_oldest_failed",
+                "TH-9805",
+                "Runtime log rotation failed deleting oldest backup.",
+                f"Path: {oldest}\nReason: {type(exc).__name__}: {exc}",
+            )
+
+    for idx in range(RUNTIME_LOG_MAX_BACKUPS - 1, 0, -1):
+        src = path.with_name(f"{path.name}.{idx}")
+        if not src.exists():
+            continue
+        dst = path.with_name(f"{path.name}.{idx + 1}")
+        try:
+            src.replace(dst)
+        except Exception as exc:
+            _log_launch_error_once(
+                "runtime.log_rotate_shift_failed",
+                "TH-9806",
+                "Runtime log rotation failed while shifting backups.",
+                f"Source: {src}\nTarget: {dst}\nReason: {type(exc).__name__}: {exc}",
+            )
+
+    first = path.with_name(f"{path.name}.1")
+    try:
+        path.replace(first)
+    except Exception as exc:
+        _log_launch_error_once(
+            "runtime.log_rotate_final_move_failed",
+            "TH-9807",
+            "Runtime log rotation failed moving active log to first backup.",
+            f"Source: {path}\nTarget: {first}\nReason: {type(exc).__name__}: {exc}",
+        )
+
+
+def _write_runtime_log_entry(path: Path, entry: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_runtime_log(path)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _runtime_log_event(
+    event_key: str,
+    severity: str = "warning",
+    *,
+    summary: str = "",
+    exc: BaseException | None = None,
+    context: dict[str, Any] | None = None,
+) -> Path | None:
+    global _RUNTIME_LOG_WRITE_IN_PROGRESS
+    if _RUNTIME_LOG_WRITE_IN_PROGRESS:
+        return None
+
+    _RUNTIME_LOG_WRITE_IN_PROGRESS = True
+    try:
+        user_id = detect_current_user_id()
+        payload: dict[str, Any] = {
+            "timestamp_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "event_key": str(event_key),
+            "severity": str(severity or "warning"),
+            "user_id": str(user_id),
+            "pid": int(os.getpid()),
+            "host": str(socket.gethostname() or ""),
+            "exception_type": "",
+            "exception_message": "",
+            "traceback": "",
+        }
+        if summary:
+            payload["summary"] = str(summary)
+        if exc is not None:
+            payload["exception_type"] = type(exc).__name__
+            payload["exception_message"] = str(exc)
+            payload["traceback"] = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        if context:
+            payload["context"] = _json_safe(context)
+        log_path = _runtime_log_path(user_id)
+        _write_runtime_log_entry(log_path, payload)
+        return log_path
+    except Exception as log_exc:
+        try:
+            _log_launch_error(
+                "TH-9801",
+                "Runtime log write failed.",
+                f"Event key: {event_key}\nReason: {type(log_exc).__name__}: {log_exc}",
+            )
+        except Exception:
+            try:
+                _safe_print(f"[Flowgrid] Runtime log write failed and launch log fallback also failed: {log_exc}")
+            except Exception as print_exc:
+                try:
+                    sys.stderr.write(
+                        "[Flowgrid] Runtime logging failure fallback also failed: "
+                        f"{type(print_exc).__name__}: {print_exc}\n"
+                    )
+                except Exception:
+                    return None
+        return None
+    finally:
+        _RUNTIME_LOG_WRITE_IN_PROGRESS = False
+
+
+def _escalate_runtime_issue_once(
+    event_key: str,
+    summary: str,
+    *,
+    details: str = "",
+    context: dict[str, Any] | None = None,
+) -> None:
+    if event_key in _RUNTIME_ESCALATED_EVENTS:
+        return
+    _RUNTIME_ESCALATED_EVENTS.add(event_key)
+
+    clipped_details = str(details or "").strip()
+    if len(clipped_details) > 1200:
+        clipped_details = clipped_details[:1197] + "..."
+    context_line = _brief_runtime_context(context)
+    message_lines: list[str] = [str(summary)]
+    if clipped_details:
+        message_lines.extend(["", f"Details: {clipped_details}"])
+    if context_line:
+        message_lines.extend(["", f"Context: {context_line}"])
+    message_lines.extend(["", f"Runtime log: {_runtime_log_path()}"])
+    _show_error_dialog(RUNTIME_PROMPT_TITLE, "\n".join(message_lines))
+
+
+def _unhandled_exception_hook(exc_type, exc_value, exc_tb) -> None:
+    details = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _runtime_log_event(
+        "bootstrap.unhandled_exception",
+        severity="error",
+        summary=f"Unhandled exception: {getattr(exc_type, '__name__', 'Exception')}",
+        exc=exc_value,
+        context={},
+    )
+    _notify_launch_error(
+        "TH-9001",
+        f"Unhandled exception: {getattr(exc_type, '__name__', 'Exception')}",
+        details,
+    )
+    try:
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.sys_excepthook_forward_failed",
+            severity="warning",
+            summary="Forwarding unhandled exception to sys.__excepthook__ failed.",
+            exc=exc,
+            context={"original_exception_type": str(getattr(exc_type, "__name__", "Exception"))},
+        )
+
+
+def _validate_runtime_storage_contract() -> None:
+    """Fail fast when the local install manifest does not define a usable shared-data contract."""
+    config_path = _find_local_paths_config()
+    if config_path is None:
+        raise RuntimeError("Flowgrid_paths.json is missing from the installed runtime folder.")
+
+    shared_root = _get_shared_root_from_config()
+    runtime_dir = _local_data_root()
+
+    if _paths_equal(config_path.parent, shared_root):
+        raise RuntimeError(
+            "Flowgrid_paths.json must remain in the local installed runtime folder, not in the shared data root."
+        )
+
+    if _paths_equal(runtime_dir, shared_root):
+        _runtime_log_event(
+            "bootstrap.runtime_on_shared_root",
+            severity="warning",
+            summary="Flowgrid appears to be running directly from the shared root; local install is recommended.",
+            context={"runtime_dir": str(runtime_dir), "shared_root": str(shared_root)},
+        )
+
+
+def _log_runtime_storage_contract() -> None:
+    """Emit one runtime diagnostic entry showing resolved local/shared storage roles."""
+    config_path = _find_local_paths_config()
+    shared_root = _resolve_data_root()
+    runtime_dir = _local_data_root()
+    local_config_path = _get_local_config_path()
+    reserved_local_db = _resolve_path_from_config(
+        "local_paths.database_folder",
+        "{DOCUMENTS}\\Flowgrid\\Data",
+        shared_root,
+    ) / DEPOT_DB_FILENAME
+    reserved_local_queue = _resolve_path_from_config(
+        "local_paths.queue_folder",
+        "{DOCUMENTS}\\Flowgrid\\Queue",
+        shared_root,
+    )
+    _runtime_log_event(
+        "bootstrap.storage_contract",
+        severity="info",
+        summary="Resolved Flowgrid storage contract.",
+        context={
+            "paths_config": str(config_path) if config_path is not None else "",
+            "runtime_dir": str(runtime_dir),
+            "shared_root": str(shared_root),
+            "shared_workflow_db": str(_shared_workflow_db_path()),
+            "local_user_config": str(local_config_path),
+            "reserved_local_db_path": str(reserved_local_db),
+            "reserved_local_queue_folder": str(reserved_local_queue),
+            "workflow_db_source_of_truth": "shared_root/Flowgrid_depot.db",
+        },
+    )
+
+
+def _check_python_version() -> None:
+    """Check if Python version meets minimum requirements."""
+    current_version = sys.version_info[:3]
+
+    if current_version < MIN_PYTHON_VERSION:
+        version_str = ".".join(map(str, current_version))
+        min_version_str = ".".join(map(str, MIN_PYTHON_VERSION))
+        _fatal_launch_error(
+            "TH-1001",
+            f"Python {min_version_str}+ is required.",
+            f"Python {min_version_str} or higher is required.\n"
+            f"Current version: {version_str}\n"
+            "Please upgrade Python from https://python.org",
+        )
+
+
+DEPENDENCY_SPECS: tuple[tuple[str, str, str, bool], ...] = (
+    ("PySide6", "PySide6", "Qt GUI framework", True),
+    ("openpyxl", "openpyxl", "Excel workbook import support", False),
+)
+
+
+def _dependency_specs_from_env() -> list[tuple[str, str, str, bool]]:
+    specs: list[tuple[str, str, str, bool]] = []
+
+    def parse_list(raw: str, required: bool) -> None:
+        for token in str(raw or "").replace(";", ",").split(","):
+            name = token.strip()
+            if not name:
+                continue
+            module_name = name.replace("-", "_")
+            desc = f"Extra {'required' if required else 'optional'} dependency"
+            specs.append((name, module_name, desc, required))
+
+    parse_list(os.environ.get("QI_EXTRA_PACKAGES", ""), False)
+    parse_list(os.environ.get("QI_EXTRA_REQUIRED_PACKAGES", ""), True)
+    return specs
+
+
+def _module_import_status(module_name: str) -> tuple[bool, str]:
+    try:
+        importlib.import_module(module_name)
+        return True, ""
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _format_pip_failure(stderr_text: str, stdout_text: str) -> str:
+    stderr_clean = (stderr_text or "").strip()
+    stdout_clean = (stdout_text or "").strip()
+    if stderr_clean:
+        return stderr_clean[-2000:]
+    if stdout_clean:
+        return stdout_clean[-2000:]
+    return "No pip output captured."
+
+
+def _install_package(package_name: str, description: str = "") -> tuple[bool, str]:
+    """Attempt to install a Python package using pip."""
+    try:
+        _safe_print(f"Installing {package_name}...{f' ({description})' if description else ''}")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "--disable-pip-version-check", "install", package_name],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minute timeout
+        )
+        if result.returncode == 0:
+            _safe_print(f"[OK] Successfully installed {package_name}")
+            return True, ""
+        else:
+            _safe_print(f"[FAIL] Failed to install {package_name}")
+            detail = _format_pip_failure(result.stderr, result.stdout)
+            _safe_print(f"Error: {detail}")
+            return False, detail
+    except subprocess.TimeoutExpired:
+        _safe_print(f"[TIMEOUT] Installation of {package_name} timed out")
+        return False, "pip install timed out after 300 seconds."
+    except Exception as e:
+        _safe_print(f"[ERROR] Error installing {package_name}: {e}")
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _ensure_dependencies() -> None:
+    """Check dependencies and auto-install missing ones when possible."""
+    missing_specs: list[dict[str, Any]] = []
+    all_specs = list(DEPENDENCY_SPECS) + _dependency_specs_from_env()
+    for package_name, module_name, description, required in all_specs:
+        ok, reason = _module_import_status(module_name)
+        if ok:
+            continue
+        missing_specs.append(
+            {
+                "package_name": package_name,
+                "module_name": module_name,
+                "description": description,
+                "required": required,
+                "reason": reason,
+            }
+        )
+
+    if not missing_specs:
+        return
+
+    _safe_print("Missing required packages detected:")
+    for item in missing_specs:
+        _safe_print(f"  - {item['package_name']}: {item['description']} ({item['reason']})")
+
+    auto_install_disabled = os.environ.get("QI_AUTO_INSTALL") == "0"
+    if auto_install_disabled:
+        required_missing = [item for item in missing_specs if bool(item["required"])]
+        if required_missing:
+            details = [
+                f"Interpreter: {sys.executable}",
+                "Required dependencies missing and QI_AUTO_INSTALL=0.",
+            ]
+            for item in required_missing:
+                details.append(f"- {item['package_name']} ({item['module_name']}): {item['reason']}")
+            _fatal_launch_error(
+                "TH-1102",
+                "Required dependencies missing and automatic installation is disabled.",
+                "\n".join(details),
+            )
+        return
+
+    _safe_print("\nAttempting automatic installation...")
+    for item in missing_specs:
+        package_name = str(item["package_name"])
+        module_name = str(item["module_name"])
+        description = str(item["description"])
+        required = bool(item["required"])
+
+        installed, install_detail = _install_package(package_name, description)
+        if not installed:
+            if required:
+                details = (
+                    f"Interpreter: {sys.executable}\n"
+                    f"Package: {package_name}\n"
+                    f"Module: {module_name}\n"
+                    f"Failure: {install_detail}\n"
+                    "See the launch/runtime log files for diagnostics."
+                )
+                _fatal_launch_error(
+                    "TH-1101",
+                    f"Required dependency installation failed: {package_name}.",
+                    details,
+                )
+            _safe_print(f"Warning: {package_name} installation failed. Some features may be disabled.")
+            continue
+
+        import_ok, import_reason = _module_import_status(module_name)
+        if import_ok:
+            continue
+        if required:
+            details = (
+                f"Interpreter: {sys.executable}\n"
+                f"Package installed but module import still fails.\n"
+                f"Package: {package_name}\n"
+                f"Module: {module_name}\n"
+                f"Import error: {import_reason}"
+            )
+            _fatal_launch_error(
+                "TH-1107",
+                f"Required dependency import failed after install: {module_name}.",
+                details,
+            )
+        _safe_print(f"Warning: {module_name} still cannot be imported after install: {import_reason}")
+
+
+try:
+    import openpyxl
+except Exception as exc:
+    openpyxl = None  # Workbook import will be disabled if not installed
+    _runtime_log_event(
+        "bootstrap.openpyxl_import_failed",
+        severity="warning",
+        summary="openpyxl import failed; workbook import will remain disabled.",
+        exc=exc,
+    )
+
+
+def _hide_console_window() -> None:
+    if os.name != "nt" or os.environ.get("QI_KEEP_CONSOLE") == "1":
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32_local = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32_local.ShowWindow(hwnd, 0)  # SW_HIDE
+            kernel32.FreeConsole()
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.hide_console_failed",
+            severity="warning",
+            summary="Unable to hide or detach console window.",
+            exc=exc,
+        )
+
+
+def _ensure_pyside6() -> None:
+    try:
+        importlib.import_module("PySide6")
+        return
+    except Exception as exc:
+        _fatal_launch_error(
+            "TH-1106",
+            "PySide6 import failed.",
+            f"Interpreter: {sys.executable}\n"
+            f"Import error: {type(exc).__name__}: {exc}\n"
+            "See the launch/runtime log files for diagnostics.",
+        )
+
+
+def _run_startup_initialization() -> None:
+    global _STARTUP_INITIALIZED
+    if _STARTUP_INITIALIZED:
+        return
+    try:
+        sys.excepthook = _unhandled_exception_hook
+        _resolve_data_root()
+        _validate_runtime_storage_contract()
+        _log_runtime_storage_contract()
+        _check_python_version()
+        if not _INSTALLER_FLAGS_ACTIVE:
+            _hide_console_window()
+        _ensure_dependencies()
+        _ensure_pyside6()
+        _notify_data_root_fallback_once()
+        _STARTUP_INITIALIZED = True
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _fatal_launch_error("TH-1900", "Unexpected startup initialization failure.", repr(exc))
+
+from PySide6.QtCore import (
+    QByteArray,
+    QBuffer,
+    QDate,
+    QEvent,
+    QEasingCurve,
+    QIODevice,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QProcess,
+    QTimer,
+    QUrl,
+    Signal,
+    QVariantAnimation,
+)
+from PySide6.QtGui import (
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QImageReader,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygon,
+    QPixmap,
+    QPalette,
+    QRegion,
+    QTextCursor,
+)
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QFileDialog,
+    QFontComboBox,
+    QFormLayout,
+    QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
+    QGridLayout,
+    QHeaderView,
+    QHBoxLayout,
+    QInputDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QTabWidget,
+    QMessageBox,
+    QListWidgetItem,
+    QMainWindow,
+    QPushButton,
+    QScrollArea,
+    QScrollBar,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QStackedWidget,
+    QStyle,
+    QStyleOptionTab,
+    QStyleOptionViewItem,
+    QStylePainter,
+    QStyledItemDelegate,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabBar,
+    QTextEdit,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+QA_FLAG_OPTIONS: tuple[str, ...] = (
+    "None",
+    "Follow Up",
+    "Need Parts",
+    "Escalation",
+    "Client Callback",
+    "Return Visit",
+    "Safety",
+    "Other",
+)
+QA_FLAG_SEVERITY_OPTIONS: tuple[str, ...] = ("Low", "Medium", "High", "Critical")
+LAUNCH_WIDTH = 430
+LAUNCH_HEIGHT = 485
+TITLEBAR_HEIGHT = 34
+SIDEBAR_WIDTH = 52
+SHIFT_CONTEXT_SCRIPT_LAUNCHERS: dict[str, str] = {
+}
+
+WORKBOOK_IMPORT_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("submissions", "Table1", "Submissions"),
+    ("parts", "tblParts", "Parts"),
+    ("rtvs", "RTVs", "RTVs"),
+    ("client_jo", "Client_JO", "Client JO"),
+    ("client_parts", "client_parts", "Client Parts"),
+    ("agents", "agents", "Agents"),
+    ("qa_flags", "qa_flags", "QA Flags"),
+    ("admin_users", "admin", "Users"),
+)
+
+TRACKER_DASHBOARD_TABLES: tuple[tuple[str, str], ...] = (
+    ("submissions", "Submissions"),
+    ("parts", "Parts"),
+    ("rtvs", "RTVs"),
+    ("client_jo", "Client JO"),
+    ("client_parts", "Client Parts"),
+)
+
+
+DEFAULT_THEME_PRESETS: dict[str, dict[str, str]] = {
+    "Default": {"primary": "#C35A00", "accent": "#FF9A1F", "surface": "#090A0F"},
+    "Classic": {"primary": "#0A246A", "accent": "#C0C0C0", "surface": "#D4D0C8"},
+    "Slate": {"primary": "#3A4A6A", "accent": "#D97706", "surface": "#E8ECF3"},
+    "Forest": {"primary": "#205E55", "accent": "#D66A1A", "surface": "#E9F1ED"},
+    "Ocean": {"primary": "#15D3E3", "accent": "#D1A91F", "surface": "#70D7E9"},
+    "Midnight": {"primary": "#1E2B3A", "accent": "#4DA3FF", "surface": "#0F141C"},
+    "Desert": {"primary": "#7A4A2A", "accent": "#D9A25E", "surface": "#F1E5D6"},
+    "Sage": {"primary": "#2F5D50", "accent": "#9DC66B", "surface": "#E8F0E6"},
+    "Crimson": {"primary": "#6A1E1E", "accent": "#D85A5A", "surface": "#F1E6E6"},
+    "Steel": {"primary": "#3C4B5C", "accent": "#8FA7BF", "surface": "#E3EAF2"},
+    "Amber": {"primary": "#70420C", "accent": "#F3B33E", "surface": "#F6EDD9"},
+}
+
+DEFAULT_THEME_PRIMARY = "#C35A00"
+DEFAULT_THEME_ACCENT = "#FF9A1F"
+DEFAULT_THEME_SURFACE = "#090A0F"
+LEGACY_DEFAULT_THEME_PRIMARY = "#2F6FED"
+LEGACY_DEFAULT_THEME_ACCENT = "#16A085"
+LEGACY_DEFAULT_THEME_SURFACE = "#E9EEF5"
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "grid_columns": 3,
+    "always_on_top": False,
+    "agent_window_always_on_top": True,
+    "qa_window_always_on_top": True,
+    "admin_window_always_on_top": False,
+    "dashboard_window_always_on_top": False,
+    "sidebar_on_right": False,
+    "auto_minimize_after_insert": False,
+    "compact_mode": True,
+    "background_tint_enabled": True,
+    "window_opacity": 1.0,
+    "hover_reveal_delay_s": 5,
+    "hover_fade_in_s": 5,
+    "hover_fade_out_s": 5,
+    "popup_control_style": "Fade Left to Right",
+    "popup_control_opacity": 82,
+    "popup_control_tail_opacity": 0,
+    "popup_control_fade_enabled": True,
+    "popup_control_fade_strength": 65,
+    "popup_header_color": "",
+    "popup_row_hover_color": "",
+    "popup_row_selected_color": "",
+    "popup_auto_reinherit_enabled": True,
+    "quick_button_opacity": 1.0,
+    "window_position": None,
+    "popup_positions": {"image_layers": None, "quick_layout": None, "depot_dashboard": None},
+    "theme": {"primary": DEFAULT_THEME_PRIMARY, "accent": DEFAULT_THEME_ACCENT, "surface": DEFAULT_THEME_SURFACE},
+    "theme_presets": DEFAULT_THEME_PRESETS,
+    "selected_theme_preset": "Default",
+    "theme_image_layers": [],
+    "quick_button_width": 140,
+    "quick_button_height": 40,
+    "quick_button_font_size": 11,
+    "quick_button_font_family": "Segoe UI",
+    "quick_button_shape": "Soft",
+    "active_quick_tab": 0,
+    "current_user": "",
+    "agent_theme": {
+        "background": "#FFFFFF",
+        "text": "#000000",
+        "field_bg": "#FFFFFF",
+        "transparent": False,
+        "inherit_main_theme": True,
+        "image_layers": [],
+        "control_style": "Fade Left to Right",
+        "control_opacity": 82,
+        "control_tail_opacity": 0,
+        "control_fade_strength": 65,
+        "header_color": "",
+        "row_hover_color": "",
+        "row_selected_color": "",
+    },
+    "qa_theme": {
+        "background": "#FFFFFF",
+        "text": "#000000",
+        "field_bg": "#FFFFFF",
+        "transparent": False,
+        "inherit_main_theme": True,
+        "image_layers": [],
+        "control_style": "Fade Left to Right",
+        "control_opacity": 82,
+        "control_tail_opacity": 0,
+        "control_fade_strength": 65,
+        "header_color": "",
+        "row_hover_color": "",
+        "row_selected_color": "",
+    },
+    "admin_theme": {
+        "background": "#FFFFFF",
+        "text": "#000000",
+        "field_bg": "#FFFFFF",
+        "transparent": False,
+        "inherit_main_theme": True,
+        "image_layers": [],
+        "control_style": "Fade Left to Right",
+        "control_opacity": 82,
+        "control_tail_opacity": 0,
+        "control_fade_strength": 65,
+        "header_color": "",
+        "row_hover_color": "",
+        "row_selected_color": "",
+    },
+    "dashboard_theme": {
+        "background": "#FFFFFF",
+        "text": "#000000",
+        "field_bg": "#FFFFFF",
+        "transparent": False,
+        "inherit_main_theme": True,
+        "image_layers": [],
+        "control_style": "Fade Left to Right",
+        "control_opacity": 82,
+        "control_tail_opacity": 0,
+        "control_fade_strength": 65,
+        "header_color": "",
+        "row_hover_color": "",
+        "row_selected_color": "",
+    },
+    "app_icon_path": "",
+    "quick_texts": [
+        {
+            "title": "Greeting",
+            "tooltip": "Quick opening line",
+            "text": "Hi there,",
+            "action": "paste_text",
+            "open_target": "",
+            "app_targets": "",
+            "urls": "",
+            "browser_path": "",
+        },
+        {
+            "title": "Follow-up",
+            "tooltip": "Ask for updates",
+            "text": "Checking in on this when you have a moment.",
+            "action": "paste_text",
+            "open_target": "",
+            "app_targets": "",
+            "urls": "",
+            "browser_path": "",
+        },
+    ],
+}
+
+DEFAULT_WINDOW_ICON_FILENAME = "wrench.png"
+MANAGED_SHORTCUT_ICON_FILENAME = "Flowgrid_shortcut.ico"
+DESKTOP_SHORTCUT_FILENAME = f"{APP_TITLE}.lnk"
+WINDOWS_SHORTCUT_DESCRIPTION = "Launch Flowgrid"
+
+
+def _flowgrid_script_path() -> Path:
+    try:
+        return Path(__file__).resolve()
+    except Exception as exc:
+        fallback = Path.cwd() / "Flowgrid.pyw"
+        _runtime_log_event(
+            "installer.script_path_resolve_failed",
+            severity="warning",
+            summary="Failed resolving Flowgrid script path; using current working directory fallback.",
+            exc=exc,
+            context={"fallback_path": str(fallback)},
+        )
+        return fallback
+
+
+def _load_installer_config_snapshot() -> dict[str, Any]:
+    config_path = _data_file_path(CONFIG_FILENAME)
+    if not config_path.exists():
+        return {}
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        _runtime_log_event(
+            "installer.config_snapshot_parse_failed",
+            severity="warning",
+            summary="Failed parsing config while preparing installer icon state; default icon will be used.",
+            exc=exc,
+            context={"config_path": str(config_path)},
+        )
+        return {}
+    if isinstance(data, dict):
+        return data
+    _runtime_log_event(
+        "installer.config_snapshot_invalid",
+        severity="warning",
+        summary="Config snapshot was not a JSON object; default icon will be used for shortcut sync.",
+        context={"config_path": str(config_path), "value_type": type(data).__name__},
+    )
+    return {}
+
+
+def _resolve_existing_file_path(raw_path: str) -> Path | None:
+    expanded = os.path.expandvars(os.path.expanduser(str(raw_path or "").strip()))
+    if not expanded:
+        return None
+
+    base_candidate = Path(expanded)
+    candidates: list[Path] = [base_candidate]
+    if not base_candidate.is_absolute():
+        candidates.extend((_resolve_data_root() / base_candidate, _local_data_root() / base_candidate))
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if any(_paths_equal(candidate, existing) for existing in unique):
+            continue
+        unique.append(candidate)
+
+    for candidate in unique:
+        try:
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        except Exception as exc:
+            _runtime_log_event(
+                "installer.icon_candidate_stat_failed",
+                severity="warning",
+                summary="Failed checking an icon path candidate while resolving installer icon state.",
+                exc=exc,
+                context={"candidate": str(candidate)},
+            )
+    return None
+
+
+def _flowgrid_icon_pack_dir() -> Path:
+    return _resolve_data_root() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME
+
+
+def _ensure_flowgrid_icon_pack_dir() -> Path:
+    icon_dir = _flowgrid_icon_pack_dir()
+    try:
+        icon_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        _runtime_log_event(
+            "installer.icon_pack_dir_create_failed",
+            severity="warning",
+            summary="Failed creating Flowgrid icon pack directory.",
+            exc=exc,
+            context={"icon_dir": str(icon_dir)},
+        )
+    return icon_dir
+
+
+def _default_wrench_icon_source_path() -> Path | None:
+    target = _ensure_flowgrid_icon_pack_dir() / DEFAULT_WINDOW_ICON_FILENAME
+    if target.exists() and target.is_file():
+        return target
+
+    candidate_dirs = [
+        _local_data_root() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME,
+        _resolve_data_root() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME,
+        _local_data_root() / "ui_icons",
+        _resolve_data_root() / "ui_icons",
+    ]
+
+    seen: list[Path] = []
+    for directory in candidate_dirs:
+        if any(_paths_equal(directory, existing) for existing in seen):
+            continue
+        seen.append(directory)
+        candidate = directory / DEFAULT_WINDOW_ICON_FILENAME
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        if _paths_equal(candidate, target):
+            return candidate
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(candidate, target)
+            return target
+        except Exception as exc:
+            _runtime_log_event(
+                "installer.default_icon_copy_failed",
+                severity="warning",
+                summary="Failed copying the default wrench icon into the managed icon pack directory.",
+                exc=exc,
+                context={"source_path": str(candidate), "target_path": str(target)},
+            )
+            return candidate
+    return None
+
+
+def _resolve_active_app_icon_path(config: dict[str, Any] | None = None) -> Path | None:
+    config_data = config if isinstance(config, dict) else _load_installer_config_snapshot()
+    stored = str(config_data.get("app_icon_path", "") or "").strip() if isinstance(config_data, dict) else ""
+    custom_icon = _resolve_existing_file_path(stored)
+    if custom_icon is not None:
+        return custom_icon
+    return _default_wrench_icon_source_path()
+
+
+def _load_icon_image_file(icon_path: str | Path) -> QImage:
+    resolved = _resolve_existing_file_path(str(icon_path))
+    if resolved is None:
+        return QImage()
+
+    reader = QImageReader(str(resolved))
+    reader.setAutoTransform(True)
+    image = reader.read()
+    if image.isNull():
+        return QImage()
+
+    max_dim = max(image.width(), image.height())
+    if max_dim > 512:
+        image = image.scaled(
+            512,
+            512,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    return image.convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def _is_image_mostly_opaque(image: QImage) -> bool:
+    width = image.width()
+    height = image.height()
+    if width <= 0 or height <= 0:
+        return False
+
+    step = max(1, min(width, height) // 64)
+    total = 0
+    opaque = 0
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            total += 1
+            if image.pixelColor(x, y).alpha() >= 250:
+                opaque += 1
+
+    if total == 0:
+        return False
+    return (opaque / total) >= 0.96
+
+
+def _estimate_icon_corner_matte(image: QImage) -> QColor:
+    width = image.width()
+    height = image.height()
+    points = [
+        (0, 0),
+        (min(width - 1, 1), 0),
+        (0, min(height - 1, 1)),
+        (width - 1, 0),
+        (width - 1, min(height - 1, 1)),
+        (max(0, width - 2), 0),
+        (0, height - 1),
+        (min(width - 1, 1), height - 1),
+        (0, max(0, height - 2)),
+        (width - 1, height - 1),
+        (max(0, width - 2), height - 1),
+        (width - 1, max(0, height - 2)),
+    ]
+    rs = 0
+    gs = 0
+    bs = 0
+    count = 0
+    for x, y in points:
+        color = image.pixelColor(x, y)
+        rs += color.red()
+        gs += color.green()
+        bs += color.blue()
+        count += 1
+    if count == 0:
+        return QColor(0, 0, 0)
+    return QColor(rs // count, gs // count, bs // count)
+
+
+def _cleanup_icon_transparency_image(image: QImage) -> QImage:
+    if image.isNull() or not _is_image_mostly_opaque(image):
+        return image
+
+    matte = _estimate_icon_corner_matte(image)
+    hard = 24
+    soft = 72
+    cleaned = QImage(image)
+
+    for y in range(cleaned.height()):
+        for x in range(cleaned.width()):
+            color = cleaned.pixelColor(x, y)
+            dist = (
+                abs(color.red() - matte.red())
+                + abs(color.green() - matte.green())
+                + abs(color.blue() - matte.blue())
+            )
+            alpha = color.alpha()
+            if dist <= hard:
+                cleaned.setPixelColor(x, y, QColor(color.red(), color.green(), color.blue(), 0))
+            elif dist < soft:
+                ratio = (dist - hard) / float(soft - hard)
+                cleaned.setPixelColor(
+                    x,
+                    y,
+                    QColor(color.red(), color.green(), color.blue(), int(alpha * ratio)),
+                )
+    return cleaned
+
+
+def _build_smoothed_qicon(icon_path: str | Path) -> QIcon:
+    image = _load_icon_image_file(icon_path)
+    if image.isNull():
+        return QIcon()
+
+    cleaned = _cleanup_icon_transparency_image(image)
+    icon = QIcon()
+    for size in (16, 20, 24, 32, 40, 48, 64, 96, 128, 256):
+        scaled = cleaned.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        canvas = QPixmap(size, size)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        x = (size - scaled.width()) // 2
+        y = (size - scaled.height()) // 2
+        painter.drawImage(x, y, scaled)
+        painter.end()
+        icon.addPixmap(canvas)
+    return icon
+
+
+def _normalized_icon_export_image(image: QImage, size: int = 256) -> QImage:
+    canvas = QImage(size, size, QImage.Format.Format_ARGB32)
+    canvas.fill(Qt.GlobalColor.transparent)
+    if image.isNull():
+        return canvas
+    scaled = image.scaled(
+        size,
+        size,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+    x = (size - scaled.width()) // 2
+    y = (size - scaled.height()) // 2
+    painter.drawImage(x, y, scaled)
+    painter.end()
+    return canvas
+
+
+def _qimage_to_png_bytes(image: QImage) -> bytes:
+    buffer_bytes = QByteArray()
+    buffer = QBuffer(buffer_bytes)
+    if not buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+        return b""
+    try:
+        if not image.save(buffer, "PNG"):
+            return b""
+    finally:
+        buffer.close()
+    return bytes(buffer_bytes)
+
+
+def _png_dimensions(png_bytes: bytes) -> tuple[int, int]:
+    if len(png_bytes) < 24 or png_bytes[:8] != b"\x89PNG\r\n\x1a\n" or png_bytes[12:16] != b"IHDR":
+        raise ValueError("PNG byte stream missing a valid IHDR header.")
+    width, height = struct.unpack(">II", png_bytes[16:24])
+    return int(width), int(height)
+
+
+def _write_png_bytes_as_ico(png_bytes: bytes, target_path: Path) -> None:
+    width, height = _png_dimensions(png_bytes)
+    directory_entry = struct.pack(
+        "<BBBBHHII",
+        0 if width >= 256 else width,
+        0 if height >= 256 else height,
+        0,
+        0,
+        1,
+        32,
+        len(png_bytes),
+        6 + 16,
+    )
+    payload = struct.pack("<HHH", 0, 1, 1) + directory_entry + png_bytes
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f"{target_path.name}.tmp")
+    temp_path.write_bytes(payload)
+    os.replace(temp_path, target_path)
+
+
+def _write_managed_shortcut_icon(source_path: str | Path, target_path: Path) -> Path:
+    image = _load_icon_image_file(source_path)
+    if image.isNull():
+        raise ValueError(f"Unable to decode icon source: {source_path}")
+
+    cleaned = _cleanup_icon_transparency_image(image)
+    export_image = _normalized_icon_export_image(cleaned, 256)
+    png_bytes = _qimage_to_png_bytes(export_image)
+    if not png_bytes:
+        raise ValueError(f"Unable to encode icon source as PNG: {source_path}")
+
+    _write_png_bytes_as_ico(png_bytes, target_path)
+    return target_path
+
+
+def _preferred_gui_python_executable() -> Path:
+    candidates: list[Path] = []
+    for raw in (getattr(sys, "_base_executable", ""), sys.executable):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        candidates.append(path)
+        candidates.append(path.parent / "pythonw.exe")
+        if path.name.lower() == "python.exe":
+            candidates.append(path.with_name("pythonw.exe"))
+
+    unique: list[Path] = []
+    for candidate in candidates:
+        if any(_paths_equal(candidate, existing) for existing in unique):
+            continue
+        unique.append(candidate)
+
+    for candidate in unique:
+        if candidate.name.lower() == "pythonw.exe" and candidate.exists() and candidate.is_file():
+            return candidate
+    for candidate in unique:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return Path(sys.executable)
+
+
+def _resolve_windows_desktop_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+
+    try:
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer)
+        if result == 0 and str(buffer.value).strip():
+            path = Path(str(buffer.value).strip())
+            if path.exists() and path.is_dir():
+                return path
+    except Exception as exc:
+        _runtime_log_event(
+            "installer.desktop_path_native_resolve_failed",
+            severity="warning",
+            summary="Native desktop path lookup failed; falling back to environment-based detection.",
+            exc=exc,
+        )
+
+    fallback_candidates = []
+    onedrive = str(os.environ.get("OneDrive", "") or "").strip()
+    if onedrive:
+        fallback_candidates.append(Path(onedrive) / "Desktop")
+    fallback_candidates.append(Path.home() / "Desktop")
+
+    for candidate in fallback_candidates:
+        try:
+            if candidate.exists() and candidate.is_dir():
+                return candidate
+        except Exception as exc:
+            _runtime_log_event(
+                "installer.desktop_path_fallback_stat_failed",
+                severity="warning",
+                summary="Desktop fallback path check failed during installer preparation.",
+                exc=exc,
+                context={"candidate": str(candidate)},
+            )
+    return None
+
+
+def _powershell_single_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _create_or_update_windows_shortcut(
+    shortcut_path: Path,
+    target_path: Path,
+    arguments: str,
+    working_directory: Path,
+    icon_path: Path,
+    description: str,
+) -> tuple[bool, str]:
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            "$shell = New-Object -ComObject WScript.Shell",
+            f"$shortcut = $shell.CreateShortcut({_powershell_single_quote(str(shortcut_path))})",
+            f"$shortcut.TargetPath = {_powershell_single_quote(str(target_path))}",
+            f"$shortcut.Arguments = {_powershell_single_quote(arguments)}",
+            f"$shortcut.WorkingDirectory = {_powershell_single_quote(str(working_directory))}",
+            f"$shortcut.IconLocation = {_powershell_single_quote(str(icon_path) + ',0')}",
+            f"$shortcut.Description = {_powershell_single_quote(description)}",
+            "$shortcut.WindowStyle = 1",
+            "$shortcut.Save()",
+        ]
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    if result.returncode == 0:
+        return True, ""
+
+    detail = _format_pip_failure(result.stderr, result.stdout)
+    return False, detail
+
+
+def _sync_desktop_shortcut(
+    config: dict[str, Any] | None = None,
+    *,
+    create_if_missing: bool,
+) -> tuple[str, str]:
+    if os.name != "nt":
+        return "skipped", "Desktop shortcut creation is only supported on Windows."
+
+    desktop_dir = _resolve_windows_desktop_directory()
+    if desktop_dir is None:
+        detail = "Unable to locate the current user's Desktop folder."
+        _runtime_log_event(
+            "installer.desktop_path_unavailable",
+            severity="error",
+            summary="Desktop shortcut sync failed because the Desktop folder could not be located.",
+            context={"app_title": APP_TITLE},
+        )
+        return "failed", detail
+
+    shortcut_path = desktop_dir / DESKTOP_SHORTCUT_FILENAME
+    already_exists = shortcut_path.exists()
+    if not create_if_missing and not already_exists:
+        return "missing", ""
+
+    icon_source = _resolve_active_app_icon_path(config)
+    if icon_source is None:
+        detail = "Unable to find the default wrench icon or the configured custom icon."
+        _runtime_log_event(
+            "installer.icon_source_unavailable",
+            severity="error",
+            summary="Desktop shortcut sync failed because no usable icon source was available.",
+            context={"shortcut_path": str(shortcut_path)},
+        )
+        return "failed", detail
+
+    managed_icon_path = _ensure_flowgrid_icon_pack_dir() / MANAGED_SHORTCUT_ICON_FILENAME
+    try:
+        _write_managed_shortcut_icon(icon_source, managed_icon_path)
+    except Exception as exc:
+        detail = f"Failed preparing shortcut icon: {type(exc).__name__}: {exc}"
+        _runtime_log_event(
+            "installer.shortcut_icon_write_failed",
+            severity="error",
+            summary="Desktop shortcut sync failed while preparing the managed shortcut icon file.",
+            exc=exc,
+            context={
+                "icon_source": str(icon_source),
+                "managed_icon_path": str(managed_icon_path),
+                "shortcut_path": str(shortcut_path),
+            },
+        )
+        return "failed", detail
+
+    launcher_path = _preferred_gui_python_executable()
+    script_path = _flowgrid_script_path()
+    if not launcher_path.exists() or not launcher_path.is_file():
+        detail = f"Python launcher not found: {launcher_path}"
+        _runtime_log_event(
+            "installer.launcher_not_found",
+            severity="error",
+            summary="Desktop shortcut sync failed because the Python launcher executable could not be found.",
+            context={"launcher_path": str(launcher_path), "shortcut_path": str(shortcut_path)},
+        )
+        return "failed", detail
+    if not script_path.exists() or not script_path.is_file():
+        detail = f"Flowgrid script not found: {script_path}"
+        _runtime_log_event(
+            "installer.script_not_found",
+            severity="error",
+            summary="Desktop shortcut sync failed because the Flowgrid script file could not be found.",
+            context={"script_path": str(script_path), "shortcut_path": str(shortcut_path)},
+        )
+        return "failed", detail
+
+    arguments = f'"{script_path}"'
+    ok, detail = _create_or_update_windows_shortcut(
+        shortcut_path,
+        launcher_path,
+        arguments,
+        script_path.parent,
+        managed_icon_path,
+        WINDOWS_SHORTCUT_DESCRIPTION,
+    )
+    if not ok:
+        _runtime_log_event(
+            "installer.shortcut_save_failed",
+            severity="error",
+            summary="Desktop shortcut save failed.",
+            context={
+                "shortcut_path": str(shortcut_path),
+                "launcher_path": str(launcher_path),
+                "managed_icon_path": str(managed_icon_path),
+                "detail": detail,
+            },
+        )
+        return "failed", f"Failed saving desktop shortcut: {detail}"
+
+    status = "updated" if already_exists else "created"
+    return status, f"Desktop shortcut {status} at {shortcut_path}"
+
+
+def _launch_flowgrid_detached() -> tuple[bool, str]:
+    launcher_path = _preferred_gui_python_executable()
+    script_path = _flowgrid_script_path()
+    if not launcher_path.exists() or not launcher_path.is_file():
+        return False, f"Python launcher not found: {launcher_path}"
+    if not script_path.exists() or not script_path.is_file():
+        return False, f"Flowgrid script not found: {script_path}"
+
+    try:
+        subprocess.Popen([str(launcher_path), str(script_path)], cwd=str(script_path.parent))
+        return True, ""
+    except Exception as exc:
+        _runtime_log_event(
+            "installer.launch_subprocess_failed",
+            severity="error",
+            summary="Installer failed to launch Flowgrid after creating the desktop shortcut.",
+            exc=exc,
+            context={"launcher_path": str(launcher_path), "script_path": str(script_path)},
+        )
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _run_installer_mode(*, launch_after_install: bool) -> int:
+    _safe_print(f"{APP_TITLE} installer")
+    _safe_print(f"Interpreter: {sys.executable}")
+    _safe_print("Checking dependencies: complete")
+
+    status, detail = _sync_desktop_shortcut(create_if_missing=True)
+    if status == "failed":
+        _notify_launch_error("TH-1301", "Flowgrid installer could not create the desktop shortcut.", detail)
+        return 1
+
+    if detail:
+        _safe_print(detail)
+
+    if not launch_after_install:
+        return 0
+
+    launched, launch_detail = _launch_flowgrid_detached()
+    if not launched:
+        _notify_launch_error("TH-1302", "Flowgrid installer could not launch the app.", launch_detail)
+        return 1
+
+    _safe_print("Flowgrid launched.")
+    return 0
+
+
+def _submission_latest_ts_sql(alias: str = "") -> str:
+    prefix = f"{str(alias).strip()}." if str(alias).strip() else ""
+    return f"COALESCE(NULLIF(TRIM({prefix}updated_at), ''), {prefix}created_at)"
+
+
+def _submission_entry_date_sql(alias: str = "") -> str:
+    prefix = f"{str(alias).strip()}." if str(alias).strip() else ""
+    return f"COALESCE(NULLIF(TRIM({prefix}entry_date), ''), SUBSTR({_submission_latest_ts_sql(alias)}, 1, 10))"
+
+
+def _split_piped_values(text: str) -> list[str]:
+    raw = str(text or "")
+    if raw == "":
+        return []
+    return [str(piece or "").strip() for piece in raw.split(" | ")]
+
+
+def _merged_part_detail_rows(
+    lpn_text: str,
+    part_number_text: str,
+    part_description_text: str,
+    shipping_text: str,
+) -> list[tuple[str, str, str, str]]:
+    lpn_values = _split_piped_values(lpn_text)
+    part_values = _split_piped_values(part_number_text)
+    desc_values = _split_piped_values(part_description_text)
+    ship_values = _split_piped_values(shipping_text)
+    row_count = max(len(lpn_values), len(part_values), len(desc_values), len(ship_values), 0)
+
+    def value_for(values: list[str], idx: int) -> str:
+        if idx < len(values):
+            return str(values[idx] or "").strip()
+        if len(values) == 1 and row_count > 1:
+            return str(values[0] or "").strip()
+        return ""
+
+    rows: list[tuple[str, str, str, str]] = []
+    for idx in range(row_count):
+        rows.append(
+            (
+                value_for(lpn_values, idx),
+                value_for(part_values, idx),
+                value_for(desc_values, idx),
+                value_for(ship_values, idx),
+            )
+        )
+    return rows
+
+
+def _serialize_part_detail_rows(rows: list[tuple[str, str, str, str]]) -> tuple[str, str, str, str]:
+    cleaned = [
+        (
+            str(row[0] or "").strip(),
+            str(row[1] or "").strip(),
+            str(row[2] or "").strip(),
+            str(row[3] or "").strip(),
+        )
+        for row in rows
+        if any(str(piece or "").strip() for piece in row)
+    ]
+    return (
+        " | ".join(row[0] for row in cleaned),
+        " | ".join(row[1] for row in cleaned),
+        " | ".join(row[2] for row in cleaned),
+        " | ".join(row[3] for row in cleaned),
+    )
+
+
+def _installed_key_set_from_text(installed_keys_raw: str) -> set[str]:
+    key_set: set[str] = set()
+    serialized = str(installed_keys_raw or "").strip()
+    if not serialized:
+        return key_set
+    try:
+        parsed = json.loads(serialized)
+        if isinstance(parsed, list):
+            for value in parsed:
+                value_text = str(value or "").strip()
+                if value_text:
+                    key_set.add(value_text)
+            return key_set
+    except Exception:
+        pass
+    for value in serialized.split(" | "):
+        value_text = str(value or "").strip()
+        if value_text:
+            key_set.add(value_text)
+    return key_set
+
+
+def _part_detail_row_key(lpn: str, part_number: str, part_description: str, shipping_info: str) -> str:
+    normalized_lpn = DepotRules.normalize_work_order(lpn)
+    part_no_text = str(part_number or "").strip()
+    part_desc_text = str(part_description or "").strip()
+    shipping_text = str(shipping_info or "").strip()
+    if normalized_lpn:
+        payload = ["lpn", normalized_lpn.casefold()]
+    else:
+        payload = [
+            "line",
+            part_no_text.casefold(),
+            part_desc_text.casefold(),
+            shipping_text.casefold(),
+        ]
+    if payload == ["line", "", "", ""]:
+        return ""
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def _dedupe_part_detail_rows(rows: list[tuple[str, str, str, str]]) -> list[tuple[str, str, str, str]]:
+    ordered_keys: list[str] = []
+    by_key: dict[str, tuple[str, str, str, str]] = {}
+    for row in rows:
+        normalized_row = tuple(str(piece or "").strip() for piece in row)
+        row_key = _part_detail_row_key(*normalized_row)
+        if not row_key:
+            continue
+        if row_key not in by_key:
+            ordered_keys.append(row_key)
+        by_key[row_key] = normalized_row
+    return [by_key[key] for key in ordered_keys]
+
+
+ALERT_QUIET_DEFAULT_HOUR = 9
+
+
+def _next_alert_quiet_until(hour: int = ALERT_QUIET_DEFAULT_HOUR, now: datetime | None = None) -> str:
+    reference = now if isinstance(now, datetime) else datetime.now()
+    quiet_day = reference.date() + timedelta(days=1)
+    quiet_dt = datetime.combine(quiet_day, datetime.min.time()).replace(hour=int(clamp(int(hour), 0, 23)))
+    return quiet_dt.isoformat(timespec="seconds")
+
+
+def _parse_iso_datetime_local(raw_value: str) -> datetime | None:
+    stamp = str(raw_value or "").strip()
+    if not stamp:
+        return None
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone().replace(tzinfo=None)
+        return parsed
+    except Exception:
+        pass
+    candidate = stamp.replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(candidate[: len(datetime.now().strftime(fmt))], fmt)
+        except Exception:
+            continue
+    return None
+
+
+def _alert_quiet_active(raw_value: str, now: datetime | None = None) -> bool:
+    quiet_until = _parse_iso_datetime_local(raw_value)
+    if quiet_until is None:
+        return False
+    reference = now if isinstance(now, datetime) else datetime.now()
+    return bool(reference < quiet_until)
+
+
+def _serialized_installed_keys(keys: list[str] | set[str] | tuple[str, ...]) -> str:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in keys:
+        key_text = str(value or "").strip()
+        if not key_text or key_text in seen:
+            continue
+        seen.add(key_text)
+        ordered.append(key_text)
+    return json.dumps(ordered, ensure_ascii=True, separators=(",", ":")) if ordered else ""
+
+
+def _drag_target_widget(root: QWidget, local_pos: QPoint) -> QWidget:
+    child = root.childAt(local_pos)
+    return child if isinstance(child, QWidget) else root
+
+
+def _is_drag_blocked_widget(widget: QWidget | None) -> bool:
+    blocked_types = (
+        QLineEdit,
+        QTextEdit,
+        QAbstractButton,
+        QComboBox,
+        QSpinBox,
+        QDateEdit,
+        QSlider,
+        QListWidget,
+        QAbstractItemView,
+        QScrollArea,
+        QScrollBar,
+        QTabBar,
+    )
+    current = widget
+    while current is not None:
+        if isinstance(current, blocked_types):
+            return True
+        current = current.parentWidget()
+    return False
+
+
+def configure_standard_table(
+    table: QTableWidget,
+    headers: list[str] | tuple[str, ...],
+    *,
+    resize_modes: dict[int, QHeaderView.ResizeMode] | None = None,
+    stretch_last: bool = True,
+) -> None:
+    table.setColumnCount(len(headers))
+    table.setHorizontalHeaderLabels([str(h) for h in headers])
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.verticalHeader().setVisible(False)
+    table.verticalHeader().setDefaultSectionSize(30)
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(True)
+    table.setGridStyle(Qt.PenStyle.SolidLine)
+    table.setWordWrap(False)
+    table.setTextElideMode(Qt.TextElideMode.ElideRight)
+    table.setIconSize(QSize(26, 26))
+    table.setItemDelegate(FlowgridIconCenteredDelegate(table))
+    table.horizontalHeader().setStretchLastSection(bool(stretch_last))
+    table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+    if resize_modes:
+        for col_idx, mode in resize_modes.items():
+            if 0 <= int(col_idx) < table.columnCount():
+                table.horizontalHeader().setSectionResizeMode(int(col_idx), mode)
+
+
+# --- Shared UI layout (frameless depot tools vs standard framed dialogs) ---
+UI_MARGIN_FRAMELESS_TOOL = 6
+UI_SPACING_FRAMELESS_TOOL = 6
+UI_MARGIN_STANDARD_DIALOG = 10
+UI_SPACING_STANDARD_DIALOG = 8
+HEADER_CLOSE_BUTTON_WIDTH = 26
+HEADER_CLOSE_BUTTON_HEIGHT = 22
+
+
+def show_flowgrid_themed_message(
+    parent: QWidget,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    icon: QMessageBox.Icon,
+    title: str,
+    text: str,
+) -> None:
+    """Themed validation/confirmation popup that follows the active popup theme."""
+    dialog = FlowgridThemedMessageDialog(parent, app_window, theme_kind, icon, title, text)
+    dialog.exec()
+
+
+def _resolve_flowgrid_popup_app_window(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+) -> "QuickInputsWindow" | None:
+    if app_window is not None:
+        return app_window
+    probe = parent
+    while probe is not None:
+        candidate = getattr(probe, "app_window", None)
+        if candidate is not None:
+            return candidate
+        probe = probe.parentWidget()
+    return None
+
+
+def _apply_flowgrid_popup_stylesheet(
+    widget: QWidget,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    *,
+    force_opaque_root: bool = True,
+    event_key: str = "ui.themed_popup_stylesheet_failed",
+    title: str = "",
+) -> None:
+    if app_window is None:
+        return
+    try:
+        widget.setStyleSheet(app_window._popup_theme_stylesheet(theme_kind, force_opaque_root=force_opaque_root))
+    except Exception as exc:
+        _runtime_log_event(
+            event_key,
+            severity="warning",
+            summary="Failed applying themed popup stylesheet.",
+            exc=exc,
+            context={"theme_kind": str(theme_kind), "title": str(title or widget.windowTitle())},
+        )
+
+
+def _paint_flowgrid_popup_background(
+    widget: QWidget,
+    painter: QPainter,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+) -> None:
+    if app_window is None:
+        return
+
+    target_rect = widget.rect()
+    if target_rect.width() <= 0 or target_rect.height() <= 0:
+        return
+
+    target_size = target_rect.size()
+    parent_widget = widget.parentWidget()
+    reference_size = target_size
+    if parent_widget is not None:
+        parent_size = parent_widget.size()
+        if parent_size.width() > 0 and parent_size.height() > 0:
+            reference_size = parent_size
+
+    resolved_kind = str(theme_kind or "").strip() or "main"
+    if resolved_kind == "main":
+        base_bg = normalize_hex(
+            app_window.palette_data.get("control_bg", app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE)),
+            DEFAULT_THEME_SURFACE,
+        )
+        requested_transparent = bool(app_window.config.get("theme_page_transparent_primary_bg", False))
+        transparent = app_window._effective_popup_transparency("main")
+        bg = app_window.render_background_pixmap(reference_size, kind="main")
+    else:
+        resolved = app_window._resolved_popup_theme(resolved_kind)
+        base_bg = normalize_hex(
+            resolved.get("background", app_window.palette_data.get("control_bg", DEFAULT_THEME_SURFACE)),
+            app_window.palette_data.get("control_bg", DEFAULT_THEME_SURFACE),
+        )
+        requested_transparent = bool(resolved.get("transparent", False))
+        transparent = app_window._effective_popup_transparency(resolved_kind)
+        bg = app_window.render_background_pixmap(reference_size, kind=resolved_kind)
+
+    bg_color = QColor(base_bg)
+    if transparent:
+        bg_color.setAlpha(220)
+    elif requested_transparent:
+        bg_color.setAlpha(max(13, int(round(255 * 0.05))))
+    else:
+        bg_color.setAlpha(244)
+    painter.fillRect(target_rect, bg_color)
+
+    if not bg.isNull():
+        src = QRect(0, 0, bg.width(), bg.height())
+        if bg.width() >= target_size.width() and bg.height() >= target_size.height():
+            src = QRect(
+                max(0, (bg.width() - target_size.width()) // 2),
+                max(0, (bg.height() - target_size.height()) // 2),
+                int(target_size.width()),
+                int(target_size.height()),
+            )
+        painter.setOpacity(0.84 if transparent else (0.22 if requested_transparent else 0.94))
+        painter.drawPixmap(target_rect, bg, src)
+        painter.setOpacity(1.0)
+
+    overlay = QColor(app_window.palette_data.get("shell_overlay", base_bg))
+    overlay.setAlpha(56 if transparent else (12 if requested_transparent else 28))
+    painter.fillRect(target_rect, overlay)
+
+
+class FlowgridThemedDialog(QDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        app_window: "QuickInputsWindow" | None,
+        theme_kind: str,
+    ) -> None:
+        super().__init__(parent)
+        self._app_window = _resolve_flowgrid_popup_app_window(parent, app_window)
+        self._theme_kind = str(theme_kind or "").strip() or "main"
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def apply_theme_styles(self, *, force_opaque_root: bool = True) -> None:
+        _apply_flowgrid_popup_stylesheet(
+            self,
+            self._app_window,
+            self._theme_kind,
+            force_opaque_root=force_opaque_root,
+            event_key="ui.themed_dialog_stylesheet_failed",
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        _paint_flowgrid_popup_background(self, painter, self._app_window, self._theme_kind)
+        super().paintEvent(event)
+
+
+class FlowgridThemedFileDialog(QFileDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        app_window: "QuickInputsWindow" | None,
+        theme_kind: str,
+    ) -> None:
+        super().__init__(parent)
+        self._app_window = _resolve_flowgrid_popup_app_window(parent, app_window)
+        self._theme_kind = str(theme_kind or "").strip() or "main"
+        self.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        _apply_flowgrid_popup_stylesheet(
+            self,
+            self._app_window,
+            self._theme_kind,
+            force_opaque_root=True,
+            event_key="ui.themed_file_dialog_stylesheet_failed",
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        _paint_flowgrid_popup_background(self, painter, self._app_window, self._theme_kind)
+        super().paintEvent(event)
+
+
+class FlowgridThemedColorDialog(QColorDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        app_window: "QuickInputsWindow" | None,
+        theme_kind: str,
+    ) -> None:
+        super().__init__(parent)
+        self._app_window = _resolve_flowgrid_popup_app_window(parent, app_window)
+        self._theme_kind = str(theme_kind or "").strip() or "main"
+        self.setOption(QColorDialog.ColorDialogOption.DontUseNativeDialog, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        _apply_flowgrid_popup_stylesheet(
+            self,
+            self._app_window,
+            self._theme_kind,
+            force_opaque_root=True,
+            event_key="ui.themed_color_dialog_stylesheet_failed",
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        _paint_flowgrid_popup_background(self, painter, self._app_window, self._theme_kind)
+        super().paintEvent(event)
+
+
+class FlowgridThemedMessageDialog(FlowgridThemedDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        app_window: "QuickInputsWindow" | None,
+        theme_kind: str,
+        icon: QMessageBox.Icon,
+        title: str,
+        text: str,
+    ) -> None:
+        super().__init__(parent, app_window, theme_kind)
+        self.setWindowTitle(str(title or "").strip() or "Message")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        self.setMaximumWidth(620)
+        self.apply_theme_styles(force_opaque_root=True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(UI_MARGIN_STANDARD_DIALOG, UI_MARGIN_STANDARD_DIALOG, UI_MARGIN_STANDARD_DIALOG, UI_MARGIN_STANDARD_DIALOG)
+        layout.setSpacing(UI_SPACING_STANDARD_DIALOG)
+
+        content_row = QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(UI_SPACING_STANDARD_DIALOG)
+
+        icon_label = QLabel()
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        icon_label.setPixmap(self._message_icon_pixmap(icon))
+        icon_label.setMinimumWidth(40)
+        content_row.addWidget(icon_label, 0)
+
+        text_label = QLabel(str(text or ""))
+        text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        content_row.addWidget(text_label, 1)
+        layout.addLayout(content_row)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(UI_SPACING_STANDARD_DIALOG)
+        button_row.addStretch(1)
+        ok_button = QPushButton("OK")
+        ok_button.setProperty("actionRole", "pick")
+        ok_button.clicked.connect(self.accept)
+        ok_button.setDefault(True)
+        ok_button.setAutoDefault(True)
+        button_row.addWidget(ok_button, 0)
+        layout.addLayout(button_row)
+
+    def _message_icon_pixmap(self, icon: QMessageBox.Icon) -> QPixmap:
+        style = self.style() if self.style() is not None else QApplication.style()
+        if style is None:
+            return QPixmap()
+        mapping = {
+            QMessageBox.Icon.Information: QStyle.StandardPixmap.SP_MessageBoxInformation,
+            QMessageBox.Icon.Warning: QStyle.StandardPixmap.SP_MessageBoxWarning,
+            QMessageBox.Icon.Critical: QStyle.StandardPixmap.SP_MessageBoxCritical,
+            QMessageBox.Icon.Question: QStyle.StandardPixmap.SP_MessageBoxQuestion,
+        }
+        standard = mapping.get(icon, QStyle.StandardPixmap.SP_MessageBoxInformation)
+        return style.standardIcon(standard).pixmap(32, 32)
+
+
+class FlowgridThemedInputDialog(QInputDialog):
+    def __init__(
+        self,
+        parent: QWidget | None,
+        app_window: "QuickInputsWindow" | None,
+        theme_kind: str,
+    ) -> None:
+        super().__init__(parent)
+        self._app_window = _resolve_flowgrid_popup_app_window(parent, app_window)
+        self._theme_kind = str(theme_kind or "").strip() or "main"
+        self.setObjectName("FlowgridThemedInputDialog")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        _paint_flowgrid_popup_background(self, painter, self._app_window, self._theme_kind)
+        super().paintEvent(event)
+
+
+def _configure_flowgrid_file_dialog(
+    dialog: FlowgridThemedFileDialog,
+    title: str,
+    directory: str,
+    file_filter: str,
+) -> None:
+    dialog.setWindowTitle(str(title or "").strip() or "Select File")
+    initial_path = str(directory or "").strip()
+    if initial_path:
+        candidate = Path(initial_path)
+        if candidate.exists() and candidate.is_dir():
+            dialog.setDirectory(str(candidate))
+        else:
+            parent_dir = candidate.parent if str(candidate.parent) else Path.home()
+            if parent_dir.exists():
+                dialog.setDirectory(str(parent_dir))
+            if candidate.name:
+                dialog.selectFile(candidate.name)
+    filters = [item for item in str(file_filter or "").split(";;") if str(item or "").strip()]
+    if filters:
+        dialog.setNameFilters(filters)
+        dialog.selectNameFilter(filters[0])
+
+
+def show_flowgrid_themed_open_file_name(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    directory: str,
+    file_filter: str,
+) -> tuple[str, str]:
+    dialog = FlowgridThemedFileDialog(parent, app_window, theme_kind)
+    _configure_flowgrid_file_dialog(dialog, title, directory, file_filter)
+    dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return "", dialog.selectedNameFilter()
+    files = dialog.selectedFiles()
+    return (str(files[0]), dialog.selectedNameFilter()) if files else ("", dialog.selectedNameFilter())
+
+
+def show_flowgrid_themed_open_file_names(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    directory: str,
+    file_filter: str,
+) -> tuple[list[str], str]:
+    dialog = FlowgridThemedFileDialog(parent, app_window, theme_kind)
+    _configure_flowgrid_file_dialog(dialog, title, directory, file_filter)
+    dialog.setFileMode(QFileDialog.FileMode.ExistingFiles)
+    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return [], dialog.selectedNameFilter()
+    return [str(path) for path in dialog.selectedFiles()], dialog.selectedNameFilter()
+
+
+def show_flowgrid_themed_save_file_name(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    directory: str,
+    file_filter: str,
+) -> tuple[str, str]:
+    dialog = FlowgridThemedFileDialog(parent, app_window, theme_kind)
+    _configure_flowgrid_file_dialog(dialog, title, directory, file_filter)
+    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+    dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return "", dialog.selectedNameFilter()
+    files = dialog.selectedFiles()
+    return (str(files[0]), dialog.selectedNameFilter()) if files else ("", dialog.selectedNameFilter())
+
+
+def show_flowgrid_themed_existing_directory(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    directory: str,
+) -> str:
+    dialog = FlowgridThemedFileDialog(parent, app_window, theme_kind)
+    _configure_flowgrid_file_dialog(dialog, title, directory, "")
+    dialog.setFileMode(QFileDialog.FileMode.Directory)
+    dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+    dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return ""
+    files = dialog.selectedFiles()
+    return str(files[0]) if files else ""
+
+
+def show_flowgrid_themed_color(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    current: QColor,
+) -> QColor:
+    dialog = FlowgridThemedColorDialog(parent, app_window, theme_kind)
+    dialog.setWindowTitle(str(title or "").strip() or "Pick Color")
+    dialog.setCurrentColor(current)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return QColor()
+    return dialog.currentColor()
+
+
+def _build_flowgrid_themed_input_dialog(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+) -> QInputDialog:
+    if app_window is None and parent is not None:
+        app_window = getattr(parent, "app_window", None)
+    dialog = FlowgridThemedInputDialog(parent, app_window, theme_kind)
+    dialog.setWindowTitle(str(title or "").strip() or "Input")
+    dialog.setModal(True)
+    dialog.setOption(QInputDialog.InputDialogOption.UseListViewForComboBoxItems, False)
+    dialog.setMinimumWidth(340)
+    dialog.setMaximumWidth(520)
+    resolved_theme = str(theme_kind or "").strip() or "main"
+    if app_window is not None:
+        try:
+            dialog.setStyleSheet(app_window._popup_theme_stylesheet(resolved_theme, force_opaque_root=True))
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.themed_input_dialog_stylesheet_failed",
+                severity="warning",
+                summary="Failed applying themed stylesheet to input dialog.",
+                exc=exc,
+                context={"theme_kind": str(resolved_theme), "title": str(title)},
+            )
+    return dialog
+
+
+def show_flowgrid_themed_input_text(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    label: str,
+    default_text: str = "",
+) -> tuple[str, bool]:
+    dialog = _build_flowgrid_themed_input_dialog(parent, app_window, theme_kind, title)
+    dialog.setInputMode(QInputDialog.InputMode.TextInput)
+    dialog.setLabelText(str(label or ""))
+    dialog.setTextValue(str(default_text or ""))
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    return str(dialog.textValue() or ""), bool(accepted)
+
+
+def show_flowgrid_themed_input_int(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    label: str,
+    value: int,
+    min_value: int,
+    max_value: int,
+    step: int = 1,
+) -> tuple[int, bool]:
+    dialog = _build_flowgrid_themed_input_dialog(parent, app_window, theme_kind, title)
+    dialog.setInputMode(QInputDialog.InputMode.IntInput)
+    dialog.setLabelText(str(label or ""))
+    dialog.setIntRange(int(min_value), int(max_value))
+    dialog.setIntStep(max(1, int(step)))
+    dialog.setIntValue(int(value))
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    return int(dialog.intValue()), bool(accepted)
+
+
+def show_flowgrid_themed_input_item(
+    parent: QWidget | None,
+    app_window: "QuickInputsWindow" | None,
+    theme_kind: str,
+    title: str,
+    label: str,
+    items: list[str] | tuple[str, ...],
+    current_index: int = 0,
+    editable: bool = False,
+) -> tuple[str, bool]:
+    dialog = _build_flowgrid_themed_input_dialog(parent, app_window, theme_kind, title)
+    values = [str(item or "").strip() for item in items if str(item or "").strip()]
+    if not values:
+        return "", False
+    index = int(clamp(int(current_index), 0, len(values) - 1))
+    dialog.setInputMode(QInputDialog.InputMode.TextInput)
+    dialog.setLabelText(str(label or ""))
+    dialog.setComboBoxItems(values)
+    dialog.setComboBoxEditable(bool(editable))
+    dialog.setTextValue(values[index])
+    dialog.setMinimumHeight(148)
+    dialog.setMaximumHeight(230)
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    return str(dialog.textValue() or "").strip(), bool(accepted)
+
+
+def _center_table_item(item: QTableWidgetItem) -> QTableWidgetItem:
+    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+    return item
+
+
+def _resolve_user_icon_from_agent_meta(
+    user_id: str,
+    agent_meta: dict[str, tuple[str, str]] | None,
+) -> QIcon | None:
+    if not user_id or not agent_meta:
+        return None
+    _, icon_path = agent_meta.get(user_id, ("", ""))
+    if not icon_path:
+        return None
+    if not Path(icon_path).exists():
+        return None
+    icon = QIcon(icon_path)
+    return icon if not icon.isNull() else None
+
+
+def _center_table_icon_item(icon: QIcon | None, text: str = "") -> QTableWidgetItem:
+    item = QTableWidgetItem(icon or QIcon(), str(text or ""))
+    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+    return item
+
+
+class FlowgridIconCenteredDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        icon_data = index.data(Qt.ItemDataRole.DecorationRole)
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "")
+        if icon_data and not text.strip():
+            opt = QStyleOptionViewItem(option)
+            self.initStyleOption(opt, index)
+            style = QApplication.style() if opt.widget is None else opt.widget.style()
+            painter.save()
+            style.drawControl(QStyle.CE_ItemViewItem, opt, painter)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            icon = QIcon(icon_data) if isinstance(icon_data, QIcon) else QIcon(QPixmap(icon_data))
+            available = min(opt.rect.width(), opt.rect.height()) - 6
+            icon_size = max(16, min(available, 32))
+            target_rect = QRect(0, 0, icon_size, icon_size)
+            target_rect.moveCenter(opt.rect.center())
+            painter.drawPixmap(target_rect, icon.pixmap(QSize(icon_size, icon_size)))
+            painter.restore()
+            return
+        super().paint(painter, option, index)
+
+
+def _table_column_index_by_header(table: QTableWidget, header_text: str) -> int:
+    for col in range(int(table.columnCount())):
+        hdr = table.horizontalHeaderItem(col)
+        if hdr is not None and str(hdr.text() or "").strip() == header_text:
+            return col
+    return -1
+
+
+def _selected_part_id_from_table(table: QTableWidget) -> int | None:
+    row = table.currentRow()
+    if row < 0:
+        return None
+    for col in range(int(table.columnCount())):
+        cell_item = table.item(row, col)
+        if cell_item is None:
+            continue
+        raw_id = cell_item.data(Qt.ItemDataRole.UserRole)
+        try:
+            return int(raw_id)
+        except Exception:
+            continue
+    return None
+
+
+def _copy_work_order_from_table_item(
+    item: QTableWidgetItem | None,
+    *,
+    header_text: str = "Work Order",
+) -> tuple[QTableWidget | None, str]:
+    if item is None:
+        return None, ""
+    table = item.tableWidget()
+    if table is None:
+        return None, ""
+    work_col = _table_column_index_by_header(table, header_text)
+    if work_col < 0:
+        return table, ""
+    work_item = table.item(item.row(), work_col)
+    if work_item is None:
+        return table, ""
+    work_order = str(work_item.text() or "").strip()
+    if work_order:
+        QApplication.clipboard().setText(work_order)
+    return table, work_order
+
+
+def _select_table_row_by_context_pos(
+    table: QTableWidget | None,
+    pos: QPoint,
+    *,
+    header_text: str = "Work Order",
+) -> bool:
+    if table is None:
+        return False
+    row = int(table.rowAt(int(pos.y())))
+    if row < 0:
+        return False
+    work_col = _table_column_index_by_header(table, header_text)
+    if work_col < 0:
+        work_col = 0
+    table.setCurrentCell(row, work_col)
+    table.selectRow(row)
+    return True
+
+
+class DepotFramelessToolWindow(QDialog):
+    """Frameless depot panels: shared chrome, drag-to-move, themed background, themed message boxes."""
+
+    def __init__(
+        self,
+        app_window: "QuickInputsWindow" | None,
+        *,
+        window_title: str,
+        theme_kind: str,
+        size: tuple[int, int] = (780, 560),
+        minimum_size: tuple[int, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.app_window = app_window
+        self._theme_kind = theme_kind
+        self._drag_offset: QPoint | None = None
+
+        self.setWindowTitle(window_title)
+        self.setModal(False)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.resize(int(size[0]), int(size[1]))
+        if minimum_size is not None:
+            self.setMinimumSize(int(minimum_size[0]), int(minimum_size[1]))
+        self._copy_notice_label: QLabel | None = None
+        self._copy_notice_host: QWidget | None = None
+
+        self.root_layout = QVBoxLayout(self)
+        self.root_layout.setContentsMargins(
+            UI_MARGIN_FRAMELESS_TOOL,
+            UI_MARGIN_FRAMELESS_TOOL,
+            UI_MARGIN_FRAMELESS_TOOL,
+            UI_MARGIN_FRAMELESS_TOOL,
+        )
+        self.root_layout.setSpacing(UI_SPACING_FRAMELESS_TOOL)
+
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(UI_SPACING_FRAMELESS_TOOL)
+        self.header_title = QLabel(window_title)
+        self.header_title.setProperty("section", True)
+        self.header_close_btn = QPushButton("x")
+        self.header_close_btn.setFixedSize(HEADER_CLOSE_BUTTON_WIDTH, HEADER_CLOSE_BUTTON_HEIGHT)
+        self.header_close_btn.setObjectName("DepotFramelessCloseButton")
+        self.header_close_btn.setAutoDefault(False)
+        self.header_close_btn.setDefault(False)
+        self.header_close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.header_close_btn.clicked.connect(self.close)
+        header_row.addWidget(self.header_title)
+        header_row.addStretch(1)
+        header_row.addWidget(self.header_close_btn)
+        self.root_layout.addLayout(header_row)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    def apply_theme_styles(self) -> None:
+        if self.app_window is None:
+            return
+        self.setStyleSheet(self.app_window._popup_theme_stylesheet(self._theme_kind))
+
+    def _refresh_coordinator(self) -> DepotRefreshCoordinator | None:
+        if self.app_window is None:
+            return None
+        return getattr(self.app_window, "depot_refresh_coordinator", None)
+
+    def _should_refresh_depot_view(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        force: bool = False,
+        ttl_ms: int = DEPOT_VIEW_TTL_MS,
+        reason: str = "",
+    ) -> bool:
+        coordinator = self._refresh_coordinator()
+        if coordinator is None:
+            return True
+        return coordinator.should_refresh_view(
+            view_key,
+            state_key,
+            force=force,
+            ttl_ms=ttl_ms,
+            reason=reason,
+        )
+
+    def _mark_depot_view_refreshed(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        payload: Any = None,
+        reason: str = "",
+        duration_ms: float | None = None,
+        row_count: int | None = None,
+    ) -> None:
+        coordinator = self._refresh_coordinator()
+        if coordinator is None:
+            return
+        coordinator.mark_view_refreshed(
+            view_key,
+            state_key,
+            payload=payload,
+            reason=reason,
+            duration_ms=duration_ms,
+            row_count=row_count,
+        )
+
+    def set_window_always_on_top(self, enabled: bool) -> None:
+        keep_on_top = bool(enabled)
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, keep_on_top)
+        if was_visible:
+            self.show()
+            if keep_on_top:
+                self.raise_()
+
+    def _load_window_always_on_top_preference(self, config_key: str, default: bool = True) -> bool:
+        if self.app_window is None:
+            return bool(default)
+        resolved_key = str(config_key or "").strip()
+        popup_key = self.app_window._popup_window_on_top_config_key(self._theme_kind)
+        if popup_key:
+            resolved_key = popup_key
+        if resolved_key:
+            self._always_on_top_config_key = resolved_key
+        return bool(self.app_window.config.get(resolved_key, default))
+
+    def _apply_window_always_on_top_preference(self, config_key: str, enabled: bool) -> bool:
+        keep_on_top = bool(enabled)
+        if self.app_window is not None:
+            popup_key = self.app_window._popup_window_on_top_config_key(self._theme_kind)
+            resolved_key = popup_key or str(config_key or "").strip()
+            if popup_key:
+                keep_on_top = self.app_window._apply_popup_window_on_top_preference(self._theme_kind, keep_on_top)
+            else:
+                self.set_window_always_on_top(keep_on_top)
+                if resolved_key:
+                    self.app_window.config[resolved_key] = keep_on_top
+            if resolved_key:
+                self._always_on_top_config_key = resolved_key
+            self.app_window.queue_save_config()
+        else:
+            self.set_window_always_on_top(keep_on_top)
+        return keep_on_top
+
+    def _show_themed_message(self, icon: QMessageBox.Icon, title: str, text: str) -> None:
+        show_flowgrid_themed_message(self, self.app_window, self._theme_kind, icon, title, text)
+
+    def _clear_copy_notice(self) -> None:
+        label = self._copy_notice_label
+        self._copy_notice_label = None
+        self._copy_notice_host = None
+        if label is None:
+            return
+        try:
+            label.hide()
+            label.deleteLater()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.copy_notice_clear_failed",
+                severity="warning",
+                summary="Failed clearing copy-notice overlay.",
+                exc=exc,
+                context={"window_title": str(self.windowTitle())},
+            )
+
+    def _show_copy_notice(self, anchor: QWidget | None, text: str, *, duration_ms: int = 4200) -> None:
+        self._clear_copy_notice()
+        host = anchor
+        if host is not None and hasattr(host, "viewport"):
+            try:
+                vp = host.viewport()  # type: ignore[attr-defined]
+                if isinstance(vp, QWidget):
+                    host = vp
+            except Exception:
+                host = anchor
+        if not isinstance(host, QWidget):
+            host = self
+        message = str(text or "").strip()
+        if not message:
+            return
+        notice = QLabel(message, host)
+        notice.setObjectName("FlowgridCopyNotice")
+        notice.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        notice.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        notice.setWordWrap(False)
+        notice.setStyleSheet(
+            "QLabel#FlowgridCopyNotice {"
+            "background-color: rgba(8, 16, 28, 228);"
+            "color: #FFFFFF;"
+            "border: 1px solid rgba(74, 196, 186, 230);"
+            "border-radius: 8px;"
+            "padding: 4px 10px;"
+            "font-weight: 800;"
+            "}"
+        )
+        hint = notice.sizeHint()
+        max_w = max(170, int(host.width()) - 16)
+        width = int(clamp(int(hint.width()) + 20, 180, max_w))
+        height = int(max(28, int(hint.height()) + 10))
+        x = int(max(8, int(host.width()) - width - 8))
+        y = int(max(8, int(host.height()) - height - 8))
+        notice.setGeometry(x, y, width, height)
+        notice.show()
+        notice.raise_()
+        self._copy_notice_label = notice
+        self._copy_notice_host = host
+        QTimer.singleShot(max(1200, int(duration_ms)), self._clear_copy_notice)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if (
+            self.isVisible()
+            and isinstance(watched, QWidget)
+            and (watched is self or self.isAncestorOf(watched))
+            and isinstance(event, QMouseEvent)
+        ):
+            if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                if not _is_drag_blocked_widget(watched):
+                    self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseMove and self._drag_offset is not None:
+                if event.buttons() & Qt.MouseButton.LeftButton:
+                    self.move(event.globalPosition().toPoint() - self._drag_offset)
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and self._drag_offset is not None:
+                self._drag_offset = None
+                event.accept()
+                return True
+        return super().eventFilter(watched, event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        target = _drag_target_widget(self, event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(target):
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self.app_window is not None:
+            _paint_flowgrid_popup_background(self, painter, self.app_window, self._theme_kind)
+        super().paintEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self._drag_offset = None
+        self._clear_copy_notice()
+        super().closeEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        key = event.key()
+        if key in (int(Qt.Key.Key_Return), int(Qt.Key.Key_Enter)):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+if os.name == "nt":
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    # Standard keys
+    VK_CONTROL = 0x11
+    VK_V = 0x56
+    KEYEVENTF_KEYUP = 0x0002
+    SW_RESTORE = 9
+    # Extended keycodes for macro sequences
+    VK_TAB = 0x09
+    VK_ENTER = 0x0D
+    VK_ESCAPE = 0x1B
+    VK_SPACE = 0x20
+    VK_SHIFT = 0x10
+    VK_ALT = 0x12
+    VK_BACKSPACE = 0x08
+    VK_DELETE = 0x2E
+    VK_HOME = 0x24
+    VK_END = 0x23
+    VK_PAGE_UP = 0x21
+    VK_PAGE_DOWN = 0x22
+    VK_LEFT = 0x25
+    VK_RIGHT = 0x27
+    VK_UP = 0x26
+    VK_DOWN = 0x28
+    VK_RETURN = 0x0D
+    VK_ENTER = 0x0D
+    
+    # Key code mapping for macro parsing
+    KEY_CODES: dict[str, int] = {
+        "tab": VK_TAB,
+        "enter": VK_RETURN,
+        "return": VK_RETURN,
+        "escape": VK_ESCAPE,
+        "esc": VK_ESCAPE,
+        "space": VK_SPACE,
+        "shift": VK_SHIFT,
+        "alt": VK_ALT,
+        "backspace": VK_BACKSPACE,
+        "delete": VK_DELETE,
+        "del": VK_DELETE,
+        "home": VK_HOME,
+        "end": VK_END,
+        "pageup": VK_PAGE_UP,
+        "pagedown": VK_PAGE_DOWN,
+        "left": VK_LEFT,
+        "right": VK_RIGHT,
+        "up": VK_UP,
+        "down": VK_DOWN,
+    }
+
+
+@dataclass
+class LayerRenderInfo:
+    layer: dict[str, Any]
+    rect: QRectF
+    pixmap: QPixmap
+
+
+def deep_clone(value: Any) -> Any:
+    return json.loads(json.dumps(value))
+
+
+def deep_merge(defaults: Any, incoming: Any) -> Any:
+    if isinstance(defaults, dict):
+        out: dict[str, Any] = {}
+        incoming_dict = incoming if isinstance(incoming, dict) else {}
+        for key, default_value in defaults.items():
+            out[key] = deep_merge(default_value, incoming_dict.get(key))
+        for key, value in incoming_dict.items():
+            if key not in out:
+                out[key] = value
+        return out
+    if isinstance(defaults, list):
+        if isinstance(incoming, list):
+            return incoming
+        return deep_clone(defaults)
+    return defaults if incoming is None else incoming
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def safe_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(fallback)
+
+
+def normalize_hex(color: str, fallback: str = "#FFFFFF") -> str:
+    if not isinstance(color, str):
+        return fallback
+    value = color.strip().upper()
+    if len(value) == 7 and value.startswith("#"):
+        try:
+            int(value[1:], 16)
+            return value
+        except ValueError:
+            return fallback
+    return fallback
+
+
+def hex_to_rgb(color: str) -> tuple[int, int, int]:
+    color = normalize_hex(color)
+    return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
+
+
+def rgb_to_hex(r: int, g: int, b: int) -> str:
+    return f"#{int(clamp(r, 0, 255)):02X}{int(clamp(g, 0, 255)):02X}{int(clamp(b, 0, 255)):02X}"
+
+
+def blend(color_a: str, color_b: str, ratio: float) -> str:
+    ratio = clamp(ratio, 0.0, 1.0)
+    ar, ag, ab = hex_to_rgb(color_a)
+    br, bg, bb = hex_to_rgb(color_b)
+    return rgb_to_hex(ar + (br - ar) * ratio, ag + (bg - ag) * ratio, ab + (bb - ab) * ratio)
+
+
+def luminance(color: str) -> float:
+    r, g, b = hex_to_rgb(color)
+
+    def channel(v: int) -> float:
+        x = v / 255.0
+        return x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4
+
+    return 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b)
+
+
+def contrast_ratio(color_a: str, color_b: str) -> float:
+    l1, l2 = luminance(color_a), luminance(color_b)
+    hi, lo = (l1, l2) if l1 > l2 else (l2, l1)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def readable_text(background: str) -> str:
+    white_ratio = contrast_ratio("#FFFFFF", background)
+    black_ratio = contrast_ratio("#101418", background)
+    return "#FFFFFF" if white_ratio >= black_ratio else "#101418"
+
+
+def shift(color: str, amount: float) -> str:
+    target = "#FFFFFF" if amount >= 0 else "#000000"
+    return blend(color, target, abs(amount))
+
+
+def rgba_css(color: str, alpha: float) -> str:
+    r, g, b = hex_to_rgb(color)
+    a = int(clamp(alpha, 0.0, 1.0) * 255)
+    return f"rgba({r}, {g}, {b}, {a})"
+
+
+def compute_palette(theme: dict[str, str]) -> dict[str, str]:
+    primary = normalize_hex(theme.get("primary", DEFAULT_THEME_PRIMARY), DEFAULT_THEME_PRIMARY)
+    accent = normalize_hex(theme.get("accent", DEFAULT_THEME_ACCENT), DEFAULT_THEME_ACCENT)
+    surface = normalize_hex(theme.get("surface", DEFAULT_THEME_SURFACE), DEFAULT_THEME_SURFACE)
+
+    shell_overlay = shift(primary, -0.60)
+    sidebar_overlay = shift(primary, -0.70)
+    nav_active = blend(accent, primary, 0.35)
+    text_color = readable_text(shift(surface, -0.55))
+    control_bg = blend(surface, "#1E2A34", 0.22)
+    input_bg = blend(surface, "#FFFFFF", 0.08)
+    button_bg = blend(primary, accent, 0.30)
+
+    return {
+        "primary": primary,
+        "accent": accent,
+        "surface": surface,
+        "shell_overlay": shell_overlay,
+        "sidebar_overlay": sidebar_overlay,
+        "label_text": text_color,
+        "muted_text": blend(text_color, "#AAB7C2", 0.35),
+        "control_bg": control_bg,
+        "input_bg": input_bg,
+        "button_bg": button_bg,
+        "button_text": readable_text(button_bg),
+        "nav_active": nav_active,
+    }
+
+
+def safe_layer_defaults(layer: dict[str, Any]) -> dict[str, Any]:
+    visible_raw = layer.get("visible", True)
+    if isinstance(visible_raw, str):
+        visible_text = visible_raw.strip().lower()
+        if visible_text in {"0", "false", "no", "off"}:
+            visible_value = False
+        elif visible_text in {"1", "true", "yes", "on"}:
+            visible_value = True
+        else:
+            visible_value = True
+    else:
+        visible_value = bool(visible_raw)
+    return {
+        "image_path": layer.get("image_path", ""),
+        "image_x": int(layer.get("image_x", 0)),
+        "image_y": int(layer.get("image_y", 0)),
+        "image_scale_mode": layer.get("image_scale_mode", "Fill"),
+        "image_anchor": layer.get("image_anchor", "Center"),
+        "image_scale_percent": int(layer.get("image_scale_percent", 100)),
+        "image_opacity": float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)),
+        "visible": visible_value,
+        "name": layer.get("name") or Path(layer.get("image_path", "")).name or "Layer",
+    }
+
+
+def build_quick_shape_polygon(shape: str, w: int, h: int) -> QPolygon | None:
+    if w <= 8 or h <= 8:
+        return None
+
+    if shape == "Diamond":
+        return QPolygon(
+            [
+                QPoint(w // 2, 0),
+                QPoint(w - 1, h // 2),
+                QPoint(w // 2, h - 1),
+                QPoint(0, h // 2),
+            ]
+        )
+
+    if shape == "Hex":
+        dx = max(8, int(w * 0.14))
+        return QPolygon(
+            [
+                QPoint(dx, 0),
+                QPoint(w - dx - 1, 0),
+                QPoint(w - 1, h // 2),
+                QPoint(w - dx - 1, h - 1),
+                QPoint(dx, h - 1),
+                QPoint(0, h // 2),
+            ]
+        )
+
+    if shape == "Slant":
+        dx = max(8, int(w * 0.12))
+        return QPolygon(
+            [
+                QPoint(dx, 0),
+                QPoint(w - 1, 0),
+                QPoint(w - dx - 1, h - 1),
+                QPoint(0, h - 1),
+            ]
+        )
+
+    if shape == "CutCorner":
+        cut = max(6, int(min(w, h) * 0.22))
+        return QPolygon(
+            [
+                QPoint(cut, 0),
+                QPoint(w - cut - 1, 0),
+                QPoint(w - 1, cut),
+                QPoint(w - 1, h - cut - 1),
+                QPoint(w - cut - 1, h - 1),
+                QPoint(cut, h - 1),
+                QPoint(0, h - cut - 1),
+                QPoint(0, cut),
+            ]
+        )
+
+    if shape == "Trapezoid":
+        top_inset = max(8, int(w * 0.18))
+        return QPolygon(
+            [
+                QPoint(top_inset, 0),
+                QPoint(w - top_inset - 1, 0),
+                QPoint(w - 1, h - 1),
+                QPoint(0, h - 1),
+            ]
+        )
+
+    return None
+
+
+class BackgroundCanvas(QWidget):
+    def __init__(self, app_window: "QuickInputsWindow") -> None:
+        super().__init__()
+        self.app_window = app_window
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.app_window.paint_background(painter, self.rect())
+        super().paintEvent(event)
+
+
+class TitleBar(QWidget):
+    def __init__(self, app_window: "QuickInputsWindow") -> None:
+        super().__init__(app_window)
+        self.app_window = app_window
+        self._drag_offset: QPoint | None = None
+        self.setFixedHeight(TITLEBAR_HEIGHT)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 4, 4)
+        layout.setSpacing(6)
+
+        self.icon_label = QLabel()
+        self.icon_label.setFixedSize(16, 16)
+
+        self.title_label = QLabel(APP_TITLE)
+        self.title_label.setObjectName("TitleText")
+
+        self.min_button = QToolButton()
+        self.min_button.setObjectName("TitleMinButton")
+        self.min_button.setText("-")
+        self.min_button.setFixedSize(26, 22)
+        self.min_button.clicked.connect(self.app_window.showMinimized)
+
+        self.close_button = QToolButton()
+        self.close_button.setObjectName("TitleCloseButton")
+        self.close_button.setText("x")
+        self.close_button.setFixedSize(26, 22)
+        self.close_button.clicked.connect(self.app_window.close)
+
+        layout.addWidget(self.icon_label)
+        layout.addWidget(self.title_label)
+        layout.addStretch(1)
+        layout.addWidget(self.min_button)
+        layout.addWidget(self.close_button)
+
+    def update_icon(self, icon: QIcon | None) -> None:
+        if icon and not icon.isNull():
+            source = icon.pixmap(64, 64)
+            if source.isNull():
+                source = icon.pixmap(16, 16)
+        else:
+            source = QIcon.fromTheme("applications-utilities").pixmap(64, 64)
+
+        if source.isNull():
+            self.icon_label.clear()
+            return
+
+        scaled = source.scaled(16, 16, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        canvas = QPixmap(16, 16)
+        canvas.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(canvas)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        x = (16 - scaled.width()) // 2
+        y = (16 - scaled.height()) // 2
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        self.icon_label.setPixmap(canvas)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.app_window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag_offset and event.buttons() & Qt.MouseButton.LeftButton:
+            self.app_window.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
+class QuickButtonCard(QWidget):
+    edit_requested = Signal(int)
+    insert_requested = Signal(int)
+    move_requested = Signal(int, int, int, bool)
+    _icon_cache: dict[tuple[str, int], QIcon] = {}
+
+    def __init__(self, index: int, title: str, tooltip: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.index = index
+        self._shape_for_mask = "Soft"
+        self._layout_mode = False
+        self._drag_anchor: QPoint | None = None
+        self._drag_origin = QPoint(0, 0)
+        self._drag_active = False
+        self._suppress_click_once = False
+        self.main_button = QPushButton(title)
+        self.main_button.setToolTip(tooltip or "")
+        self.main_button.clicked.connect(self._on_main_button_clicked)
+        self.main_button.installEventFilter(self)
+        self.main_button.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.edit_button = QToolButton(self.main_button)
+        self.edit_button.setText("")
+        self.edit_button.setToolTip("Edit")
+        self.edit_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.edit_button.clicked.connect(lambda: self.edit_requested.emit(self.index))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self.main_button)
+
+    def _on_main_button_clicked(self) -> None:
+        if self._layout_mode:
+            self._suppress_click_once = False
+            return
+        if self._suppress_click_once:
+            self._suppress_click_once = False
+            return
+        self.insert_requested.emit(self.index)
+
+    def set_layout_mode(self, enabled: bool) -> None:
+        self._layout_mode = bool(enabled)
+        if self._layout_mode:
+            self.main_button.setCursor(Qt.CursorShape.OpenHandCursor)
+        else:
+            self.main_button.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._drag_anchor = None
+            self._drag_active = False
+            self._suppress_click_once = False
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self.main_button and self._layout_mode:
+            et = event.type()
+            if et == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_anchor = event.globalPosition().toPoint()
+                self._drag_origin = self.pos()
+                self._drag_active = False
+                self._suppress_click_once = False
+                self.main_button.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return True
+
+            if et == QEvent.Type.MouseMove and event.buttons() & Qt.MouseButton.LeftButton and self._drag_anchor is not None:
+                delta = event.globalPosition().toPoint() - self._drag_anchor
+                if not self._drag_active and delta.manhattanLength() < 3:
+                    return True
+                self._drag_active = True
+                self._suppress_click_once = True
+                new_pos = self._drag_origin + delta
+                self.move_requested.emit(self.index, int(new_pos.x()), int(new_pos.y()), False)
+                return True
+
+            if et == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton and self._drag_anchor is not None:
+                if self._drag_active:
+                    delta = event.globalPosition().toPoint() - self._drag_anchor
+                    new_pos = self._drag_origin + delta
+                    self.move_requested.emit(self.index, int(new_pos.x()), int(new_pos.y()), True)
+                self._drag_anchor = None
+                self._drag_active = False
+                self.main_button.setCursor(Qt.CursorShape.OpenHandCursor)
+                return True
+
+        return super().eventFilter(watched, event)
+
+    def apply_visual_style(
+        self,
+        width: int,
+        height: int,
+        font_size: int,
+        font_family: str,
+        shape: str,
+        button_opacity: float,
+        palette: dict[str, str],
+        action_type: str = "paste_text",
+    ) -> None:
+        width = int(clamp(width, 90, 220))
+        height = int(clamp(height, 35, 100))
+        font_size = int(clamp(font_size, 8, 20))
+        button_opacity = float(clamp(button_opacity, 0.15, 1.0))
+
+        # Adjust base color based on action type for subtle distinction
+        base_bg = palette['button_bg']
+        if action_type == "open_url":
+            # Shift toward accent color for web links
+            base_bg = blend(palette['button_bg'], palette['accent'], 0.25)
+        elif action_type == "open_app":
+            # Shift toward primary color for apps
+            base_bg = blend(palette['button_bg'], palette['primary'], 0.25)
+        elif action_type in {"input_sequence", "macro_sequence"}:
+            # Shift toward surface color for input sequences.
+            base_bg = blend(palette['button_bg'], palette['surface'], 0.35)
+
+        self.main_button.setMinimumSize(width, height)
+        self.main_button.setMaximumSize(width, height)
+        self.main_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setFixedSize(width, height)
+        self._shape_for_mask = shape
+
+        temp_window = self.window()
+        style_provider = None
+        if temp_window is not None and hasattr(temp_window, "_quick_button_stylesheet"):
+            style_provider = temp_window
+        elif temp_window is not None and hasattr(temp_window, "app_window") and hasattr(temp_window.app_window, "_quick_button_stylesheet"):
+            style_provider = temp_window.app_window
+        style_css = None
+        if style_provider is not None:
+            style_css = style_provider._quick_button_stylesheet(
+                font_size,
+                button_opacity,
+                shape,
+                font_family=font_family,
+                padding="2px 20px 2px 8px",
+                action_type=action_type,
+            )
+        if style_css is None:
+            safe_family = str(font_family or "Segoe UI").replace("'", "\\'")
+            style_css = (
+                "QPushButton {"
+                f"background-color: {rgba_css(base_bg, button_opacity)};"
+                f"color: {palette['button_text']};"
+                f"border: 1px solid {shift(base_bg, -0.35)};"
+                "border-radius: 11px;"
+                f"font-size: {font_size}px;"
+                f"font-family: '{safe_family}';"
+                "font-weight: 700;"
+                "padding: 2px 20px 2px 8px;"
+                "text-align: center;"
+                "}"
+            )
+        self.main_button.setStyleSheet(style_css)
+        # User-created quick buttons stay text-only; no action icons on button faces.
+        self.main_button.setIcon(QIcon())
+
+        icon_color = shift(palette["button_text"], 0.03)
+        self.edit_button.setIcon(self._build_pencil_icon(icon_color, 14))
+        self.edit_button.setIconSize(QSize(12, 12))
+        self.edit_button.setStyleSheet(
+            "QToolButton {"
+            "background: rgba(0, 0, 0, 28);"
+            "border: none;"
+            "border-radius: 8px;"
+            "padding: 0px;"
+            "}"
+            "QToolButton:hover { background: rgba(255, 255, 255, 52); }"
+        )
+        self.edit_button.setFixedSize(16, 16)
+        self._apply_shape_edge_effect(shape, palette, width, height)
+        self._position_edit_button()
+        self._apply_shape_mask()
+
+    def _apply_shape_edge_effect(self, shape: str, palette: dict[str, str], width: int, height: int) -> None:
+        if self._build_shape_polygon(shape, width, height) is None:
+            self.main_button.setGraphicsEffect(None)
+            return
+        effect = self.main_button.graphicsEffect()
+        if not isinstance(effect, QGraphicsDropShadowEffect):
+            effect = QGraphicsDropShadowEffect(self.main_button)
+            self.main_button.setGraphicsEffect(effect)
+        edge = QColor(shift(palette["button_bg"], 0.28))
+        edge.setAlpha(110)
+        effect.setColor(edge)
+        effect.setOffset(0, 0)
+        effect.setBlurRadius(5.0)
+
+    @classmethod
+    def _build_pencil_icon(cls, color_hex: str, size: int) -> QIcon:
+        key = (color_hex, size)
+        cached = cls._icon_cache.get(key)
+        if cached is not None:
+            return cached
+
+        canvas_size = 64
+        pixmap = QPixmap(canvas_size, canvas_size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        body_color = QColor(color_hex)
+        body_pen = QPen(body_color)
+        body_pen.setWidth(8)
+        body_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        body_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(body_pen)
+        painter.drawLine(16, 48, 44, 20)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(body_color)
+        painter.drawPolygon(
+            QPolygon(
+                [
+                    QPoint(44, 20),
+                    QPoint(54, 10),
+                    QPoint(52, 24),
+                ]
+            )
+        )
+
+        eraser_color = QColor("#F2F5F8")
+        eraser_color.setAlpha(230)
+        painter.setBrush(eraser_color)
+        painter.drawPolygon(
+            QPolygon(
+                [
+                    QPoint(12, 52),
+                    QPoint(18, 58),
+                    QPoint(24, 52),
+                    QPoint(18, 46),
+                ]
+            )
+        )
+        painter.end()
+
+        icon = QIcon(pixmap)
+        cls._icon_cache[key] = icon
+        return icon
+
+    def _position_edit_button(self) -> None:
+        pad = 4
+        x = max(0, self.main_button.width() - self.edit_button.width() - pad)
+        self.edit_button.move(x, pad)
+        self.edit_button.raise_()
+
+    def _build_shape_polygon(self, shape: str, w: int, h: int) -> QPolygon | None:
+        return build_quick_shape_polygon(shape, w, h)
+
+    def _apply_shape_mask(self) -> None:
+        w = self.main_button.width()
+        h = self.main_button.height()
+        polygon = self._build_shape_polygon(self._shape_for_mask, w, h)
+        if polygon is None:
+            self.main_button.clearMask()
+            return
+        self.main_button.setMask(QRegion(polygon))
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._position_edit_button()
+        self._apply_shape_mask()
+        super().resizeEvent(event)
+
+
+class QuickButtonCanvas(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._snap_x = 1
+        self._snap_y = 1
+        self._snap_enabled = False
+        self._show_grid = False
+        self._viewport_width = 300
+        self._guide_v_lines: list[int] = []
+        self._guide_h_lines: list[int] = []
+        self._background_drawer: Callable[[QPainter, QRect], None] | None = None
+        self._cards: dict[int, QuickButtonCard] = {}
+        self._placeholder = QLabel("", self)
+        self._placeholder.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self._placeholder.hide()
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet("background: transparent;")
+
+    def set_background_drawer(self, drawer: Callable[[QPainter, QRect], None] | None) -> None:
+        self._background_drawer = drawer
+        self.update()
+
+    def configure_grid(self, snap_x: int = 1, snap_y: int = 1, show_grid: bool = False, snap_enabled: bool = False) -> None:
+        self._snap_x = max(1, int(snap_x))
+        self._snap_y = max(1, int(snap_y))
+        self._show_grid = bool(show_grid)
+        self._snap_enabled = bool(snap_enabled)
+        self.update()
+
+    def set_alignment_guides(self, vertical_lines: list[int], horizontal_lines: list[int]) -> None:
+        self._guide_v_lines = [int(v) for v in vertical_lines]
+        self._guide_h_lines = [int(h) for h in horizontal_lines]
+        self.update()
+
+    def clear_alignment_guides(self) -> None:
+        self._guide_v_lines = []
+        self._guide_h_lines = []
+        self.update()
+
+    def set_viewport_width(self, width: int) -> None:
+        self._viewport_width = max(120, int(width))
+        self._refresh_canvas_size()
+
+    def clear_cards(self) -> None:
+        for card in list(self._cards.values()):
+            card.setParent(None)
+            card.deleteLater()
+        self._cards.clear()
+        self._placeholder.hide()
+        self._refresh_canvas_size()
+
+    def set_placeholder(self, text: str, color: str) -> None:
+        self._placeholder.setText(text)
+        self._placeholder.setStyleSheet(
+            "QLabel {"
+            f"color: {color};"
+            "background: transparent;"
+            "font-weight: 700;"
+            "}"
+        )
+        self._placeholder.move(8, 8)
+        self._placeholder.adjustSize()
+        self._placeholder.show()
+        self._refresh_canvas_size()
+
+    def place_card(self, card: QuickButtonCard, x: int, y: int, snap: bool = False) -> tuple[int, int]:
+        card.setParent(self)
+        card.show()
+        self._cards[card.index] = card
+        snapped_x, snapped_y = self.snap_position(x, y, card.width(), card.height(), snap=snap)
+        card.move(snapped_x, snapped_y)
+        self._refresh_canvas_size()
+        return snapped_x, snapped_y
+
+    def snap_position(self, x: int, y: int, width: int, height: int, snap: bool = False) -> tuple[int, int]:
+        snapped_x = int(x)
+        snapped_y = int(y)
+        do_snap = bool(snap or self._snap_enabled)
+        if do_snap:
+            sx = max(1, self._snap_x)
+            sy = max(1, self._snap_y)
+            snapped_x = int(round(float(snapped_x) / float(sx)) * sx)
+            snapped_y = int(round(float(snapped_y) / float(sy)) * sy)
+        max_x = max(0, self._viewport_width - max(1, int(width)))
+        snapped_x = int(clamp(snapped_x, 0, max_x))
+        snapped_y = max(0, snapped_y)
+        return snapped_x, snapped_y
+
+    def move_card(self, index: int, x: int, y: int, snap: bool = False) -> tuple[int, int]:
+        card = self._cards.get(index)
+        if card is None:
+            return 0, 0
+        snapped_x, snapped_y = self.snap_position(x, y, card.width(), card.height(), snap=snap)
+        card.move(snapped_x, snapped_y)
+        self._refresh_canvas_size()
+        return snapped_x, snapped_y
+
+    def card_geometry(self, index: int) -> QRect | None:
+        card = self._cards.get(index)
+        if card is None:
+            return None
+        return QRect(card.x(), card.y(), card.width(), card.height())
+
+    def iter_card_geometries(self, exclude_index: int | None = None) -> list[QRect]:
+        rects: list[QRect] = []
+        for idx, card in self._cards.items():
+            if exclude_index is not None and idx == exclude_index:
+                continue
+            rects.append(QRect(card.x(), card.y(), card.width(), card.height()))
+        return rects
+
+    def _refresh_canvas_size(self) -> None:
+        width = max(120, self._viewport_width)
+        max_bottom = 0
+        for card in self._cards.values():
+            max_bottom = max(max_bottom, card.y() + card.height())
+        if self._placeholder.isVisible():
+            max_bottom = max(max_bottom, self._placeholder.y() + self._placeholder.height())
+        height = max(220, max_bottom + 12)
+        self.resize(width, height)
+        self.setMinimumSize(width, height)
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        if self._background_drawer is not None:
+            self._background_drawer(painter, self.rect())
+        if self._show_grid:
+            grid_pen = QPen(QColor(255, 255, 255, 28))
+            grid_pen.setWidth(1)
+            painter.setPen(grid_pen)
+            for x in range(0, self.width(), max(1, self._snap_x)):
+                painter.drawLine(x, 0, x, self.height())
+            for y in range(0, self.height(), max(1, self._snap_y)):
+                painter.drawLine(0, y, self.width(), y)
+        if self._guide_v_lines or self._guide_h_lines:
+            guide_pen = QPen(QColor(255, 216, 76, 220))
+            guide_pen.setWidth(1)
+            painter.setPen(guide_pen)
+            for x in self._guide_v_lines:
+                painter.drawLine(int(x), 0, int(x), self.height())
+            for y in self._guide_h_lines:
+                painter.drawLine(0, int(y), self.width(), int(y))
+
+
+class QuickRadialMenu(QDialog):
+    action_requested = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(False)
+        self.setFixedSize(290, 290)
+
+        self._center = QPoint(self.width() // 2, self.height() // 2)
+        self._radius = 90
+        self._button_size = QSize(92, 36)
+        self._buttons: dict[str, QPushButton] = {}
+        self._action_meta: list[tuple[str, str, str, int]] = [
+            ("add", "Add", "add", 142),
+            ("layout", "Layout", "pick", 94),
+            ("new_tab", "New Tab", "new", 46),
+            ("rename", "Rename", "pick", -2),
+            ("remove", "Remove", "reset", -50),
+        ]
+
+        self.center_chip = QLabel("+", self)
+        self.center_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.center_chip.setGeometry(self._center.x() - 22, self._center.y() - 22, 44, 44)
+
+        for action_key, label, action_role, _angle in self._action_meta:
+            button = QPushButton(label, self)
+            button.setProperty("actionRole", action_role)
+            button.setProperty("radialAction", action_key)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setFixedSize(self._button_size)
+            button.clicked.connect(lambda _checked=False, key=action_key: self._emit_action(key))
+            self._buttons[action_key] = button
+
+        self._layout_buttons()
+        self.apply_theme_styles(compute_palette(DEFAULT_CONFIG.get("theme", {})))
+
+    def _layout_buttons(self) -> None:
+        for action_key, _label, _role, angle_deg in self._action_meta:
+            button = self._buttons[action_key]
+            radians = math.radians(float(angle_deg))
+            cx = self._center.x() + int(math.cos(radians) * self._radius)
+            cy = self._center.y() - int(math.sin(radians) * self._radius)
+            button.move(cx - (button.width() // 2), cy - (button.height() // 2))
+
+    def _emit_action(self, action_key: str) -> None:
+        self.hide()
+        self.action_requested.emit(action_key)
+
+    def set_action_enabled(self, action_key: str, enabled: bool) -> None:
+        button = self._buttons.get(action_key)
+        if button is not None:
+            button.setEnabled(bool(enabled))
+
+    def open_anchored_to(self, anchor_widget: QWidget) -> None:
+        anchor_center = anchor_widget.mapToGlobal(anchor_widget.rect().center())
+        top_left = QPoint(anchor_center.x() - (self.width() // 2), anchor_center.y() - (self.height() // 2))
+        screen = QGuiApplication.screenAt(anchor_center)
+        if screen is not None:
+            avail = screen.availableGeometry()
+            top_left.setX(int(clamp(top_left.x(), avail.left(), avail.right() - self.width())))
+            top_left.setY(int(clamp(top_left.y(), avail.top(), avail.bottom() - self.height())))
+        self.move(top_left)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def apply_theme_styles(self, palette_data: dict[str, str]) -> None:
+        accent = palette_data["accent"]
+        control_bg = palette_data["control_bg"]
+        label_text = palette_data["label_text"]
+        base_btn = palette_data["button_bg"]
+        reset_base = shift(palette_data["surface"], -0.45)
+        self.setStyleSheet(
+            "QPushButton {"
+            f"background-color: {rgba_css(base_btn, 0.92)};"
+            f"color: {readable_text(base_btn)};"
+            f"border: 2px solid {shift(base_btn, -0.62)};"
+            "border-radius: 18px;"
+            "font-size: 11px;"
+            "font-weight: 800;"
+            "padding: 2px 8px;"
+            "}"
+            "QPushButton:hover {"
+            f"background-color: {rgba_css(shift(base_btn, 0.08), 0.96)};"
+            f"border: 2px solid {shift(base_btn, -0.72)};"
+            "}"
+            "QPushButton:pressed {"
+            f"background-color: {rgba_css(shift(base_btn, -0.06), 0.98)};"
+            "}"
+            "QPushButton[actionRole='add'] {"
+            f"background-color: {rgba_css(palette_data['primary'], 0.94)};"
+            f"color: {readable_text(palette_data['primary'])};"
+            f"border: 2px solid {shift(palette_data['primary'], -0.56)};"
+            "}"
+            "QPushButton[actionRole='pick'] {"
+            f"background-color: {rgba_css(blend(palette_data['primary'], palette_data['surface'], 0.45), 0.94)};"
+            f"color: {readable_text(blend(palette_data['primary'], palette_data['surface'], 0.45))};"
+            f"border: 2px solid {shift(blend(palette_data['primary'], palette_data['surface'], 0.45), -0.56)};"
+            "}"
+            "QPushButton[actionRole='new'] {"
+            f"background-color: {rgba_css(blend(palette_data['surface'], palette_data['primary'], 0.35), 0.94)};"
+            f"color: {readable_text(blend(palette_data['surface'], palette_data['primary'], 0.35))};"
+            f"border: 2px solid {shift(blend(palette_data['surface'], palette_data['primary'], 0.35), -0.56)};"
+            "}"
+            "QPushButton[actionRole='reset'] {"
+            f"background-color: {rgba_css(reset_base, 0.94)};"
+            f"color: {readable_text(reset_base)};"
+            f"border: 2px solid {shift(reset_base, -0.56)};"
+            "}"
+            "QPushButton:disabled {"
+            "background-color: rgba(80,80,80,160);"
+            "color: rgba(230,230,230,140);"
+            "border: 2px solid rgba(60,60,60,180);"
+            "}"
+            "QLabel {"
+            f"background: {rgba_css(control_bg, 0.92)};"
+            f"color: {readable_text(control_bg)};"
+            f"border: 2px solid {shift(control_bg, -0.58)};"
+            "border-radius: 22px;"
+            "font-size: 20px;"
+            "font-weight: 900;"
+            "}"
+        )
+        self.center_chip.setText("+")
+        self.center_chip.setToolTip("Quick actions")
+        self.center_chip.setStyleSheet(
+            "QLabel {"
+            f"background: {rgba_css(accent, 0.95)};"
+            f"color: {readable_text(accent)};"
+            f"border: 2px solid {shift(accent, -0.52)};"
+            "border-radius: 22px;"
+            "font-size: 20px;"
+            "font-weight: 900;"
+            "}"
+        )
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 95))
+        painter.drawEllipse(self._center, 106, 106)
+
+        guide_pen = QPen(QColor(255, 255, 255, 55))
+        guide_pen.setWidth(2)
+        painter.setPen(guide_pen)
+        for action_key, _label, _role, _angle in self._action_meta:
+            button = self._buttons[action_key]
+            button_center = button.geometry().center()
+            painter.drawLine(self._center, button_center)
+        super().paintEvent(event)
+
+
+class QuickLayoutDialog(QDialog):
+    def __init__(self, app_window: "QuickInputsWindow") -> None:
+        super().__init__(app_window)
+        self.app_window = app_window
+        self.setWindowTitle("Arrange Quick Buttons")
+        self.setMinimumSize(LAUNCH_WIDTH, LAUNCH_HEIGHT)
+        self.setMaximumWidth(LAUNCH_WIDTH)
+        self.resize(LAUNCH_WIDTH, LAUNCH_HEIGHT)
+        self.setModal(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        self.hint_label = QLabel("Drag freely. Hold Shift while dragging to snap to center/alignment guides.")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+
+        style_form = QFormLayout()
+        style_form.setContentsMargins(0, 0, 0, 0)
+        style_form.setSpacing(6)
+
+        self.style_width_slider = QSlider(Qt.Orientation.Horizontal)
+        self.style_width_slider.setRange(90, 220)
+        self.style_width_value = QLabel("140")
+        width_row = QHBoxLayout()
+        width_row.addWidget(self.style_width_slider, 1)
+        width_row.addWidget(self.style_width_value)
+        width_wrap = QWidget()
+        width_wrap.setLayout(width_row)
+
+        self.style_height_slider = QSlider(Qt.Orientation.Horizontal)
+        self.style_height_slider.setRange(35, 100)
+        self.style_height_value = QLabel("40")
+        height_row = QHBoxLayout()
+        height_row.addWidget(self.style_height_slider, 1)
+        height_row.addWidget(self.style_height_value)
+        height_wrap = QWidget()
+        height_wrap.setLayout(height_row)
+
+        self.style_font_slider = QSlider(Qt.Orientation.Horizontal)
+        self.style_font_slider.setRange(8, 20)
+        self.style_font_value = QLabel("11")
+        font_row = QHBoxLayout()
+        font_row.addWidget(self.style_font_slider, 1)
+        font_row.addWidget(self.style_font_value)
+        font_wrap = QWidget()
+        font_wrap.setLayout(font_row)
+
+        self.style_font_family_combo = QFontComboBox()
+        self.style_font_family_combo.setEditable(True)
+        self.style_font_family_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.style_font_family_combo.setMaxVisibleItems(16)
+        if self.style_font_family_combo.lineEdit() is not None:
+            self.style_font_family_combo.lineEdit().setPlaceholderText("Search fonts...")
+
+        self.style_shape_combo = QComboBox()
+        self.style_shape_combo.addItems(
+            [
+                "Soft",
+                "Bordered",
+                "Block",
+                "Pill",
+                "Outline",
+                "Glass",
+                "Diamond",
+                "Hex",
+                "Slant",
+                "Raised3D",
+                "Bevel3D",
+                "Ridge3D",
+                "Neumorph",
+                "Retro3D",
+                "Neon3D",
+            ]
+        )
+
+        self.style_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.style_opacity_slider.setRange(20, 100)
+        self.style_opacity_value = QLabel("1.00")
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(self.style_opacity_slider, 1)
+        opacity_row.addWidget(self.style_opacity_value)
+        opacity_wrap = QWidget()
+        opacity_wrap.setLayout(opacity_row)
+
+        style_form.addRow("Width", width_wrap)
+        style_form.addRow("Height", height_wrap)
+        style_form.addRow("Font", font_wrap)
+        style_form.addRow("Font Family", self.style_font_family_combo)
+        style_form.addRow("Shape", self.style_shape_combo)
+        style_form.addRow("Opacity", opacity_wrap)
+        layout.addLayout(style_form)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.canvas = QuickButtonCanvas()
+        self.canvas.setObjectName("QuickLayoutCanvas")
+        self.canvas.configure_grid(show_grid=False, snap_enabled=False)
+        self.canvas.set_background_drawer(self._paint_canvas_background)
+        self.scroll.setWidget(self.canvas)
+        layout.addWidget(self.scroll, 1)
+
+        actions = QHBoxLayout()
+        self.reset_button = QPushButton("Auto Layout")
+        self.done_button = QPushButton("Done")
+        self.reset_button.setProperty("actionRole", "pick")
+        self.done_button.setProperty("actionRole", "save")
+        actions.addWidget(self.reset_button)
+        actions.addStretch(1)
+        actions.addWidget(self.done_button)
+        layout.addLayout(actions)
+
+        self.scroll.viewport().installEventFilter(self)
+        self.style_width_slider.valueChanged.connect(self._on_style_controls_changed)
+        self.style_height_slider.valueChanged.connect(self._on_style_controls_changed)
+        self.style_font_slider.valueChanged.connect(self._on_style_controls_changed)
+        self.style_font_family_combo.currentFontChanged.connect(lambda _font: self._on_style_controls_changed())
+        self.style_shape_combo.currentTextChanged.connect(self._on_style_controls_changed)
+        self.style_opacity_slider.valueChanged.connect(self._on_style_controls_changed)
+        self.reset_button.clicked.connect(self.reset_auto_layout)
+        self.done_button.clicked.connect(self.close)
+        self._sync_style_controls_from_config()
+        self.apply_theme_styles()
+        self.refresh_cards()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.app_window.config.setdefault("popup_positions", {})["quick_layout"] = {
+            "x": self.x(),
+            "y": self.y(),
+        }
+        self.app_window.queue_save_config()
+        self.app_window.refresh_quick_grid()
+        super().closeEvent(event)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if watched is self.scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._sync_canvas_viewport_width()
+            return False
+        return super().eventFilter(watched, event)
+
+    def _reference_main_canvas_width(self) -> int:
+        try:
+            return max(120, int(self.app_window.quick_scroll.viewport().width()))
+        except Exception:
+            return max(120, int(self.scroll.viewport().width()))
+
+    def _sync_canvas_viewport_width(self) -> None:
+        popup_viewport_w = max(120, int(self.scroll.viewport().width()))
+        main_w = self._reference_main_canvas_width()
+        target_w = min(popup_viewport_w, main_w)
+        self.canvas.set_viewport_width(target_w)
+
+    def apply_theme_styles(self) -> None:
+        p = self.app_window.palette_data
+        bg = rgba_css(p["shell_overlay"], 0.92)
+        border = shift(p["control_bg"], -0.30)
+        self.setStyleSheet(
+            "QDialog {"
+            f"background: {bg};"
+            f"color: {p['label_text']};"
+            "font-family: 'Segoe UI';"
+            "font-size: 13px;"
+            "}"
+            "QLabel { background: transparent; color: inherit; font-weight: 700; }"
+            "QScrollArea { background: transparent; border: none; }"
+            "QComboBox, QLineEdit, QSpinBox {"
+            f"background: {rgba_css(p['input_bg'], 0.86)};"
+            f"border: 1px solid {shift(p['input_bg'], -0.38)};"
+            "border-radius: 3px;"
+            "padding: 2px 6px;"
+            "}"
+            "QSlider::groove:horizontal {"
+            "background: rgba(0,0,0,90);"
+            "height: 6px;"
+            "border-radius: 3px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            f"background: {p['accent']};"
+            "width: 12px;"
+            "margin: -4px 0px;"
+            "border-radius: 3px;"
+            "}"
+            "QPushButton {"
+            f"background-color: {rgba_css(p['button_bg'], 0.78)};"
+            f"color: {p['button_text']};"
+            f"border: 1px solid {shift(p['button_bg'], -0.40)};"
+            "border-radius: 4px;"
+            "padding: 4px 10px;"
+            "min-height: 30px;"
+            "font-size: 11px;"
+            "font-weight: 700;"
+            "}"
+            "QPushButton[actionRole='save'] {"
+            f"background-color: {rgba_css(p['accent'], 0.78)};"
+            f"color: {readable_text(p['accent'])};"
+            f"border: 1px solid {shift(p['accent'], -0.42)};"
+            "}"
+        )
+        self.canvas.setStyleSheet(
+            "QWidget#QuickLayoutCanvas {"
+            "background: transparent;"
+            f"border: 1px solid {border};"
+            "border-radius: 4px;"
+            "}"
+        )
+        self.canvas.update()
+
+    def _sync_style_controls_from_config(self) -> None:
+        self.style_width_slider.blockSignals(True)
+        self.style_height_slider.blockSignals(True)
+        self.style_font_slider.blockSignals(True)
+        self.style_font_family_combo.blockSignals(True)
+        self.style_shape_combo.blockSignals(True)
+        self.style_opacity_slider.blockSignals(True)
+
+        width = int(clamp(int(self.app_window.config.get("quick_button_width", 140)), 90, 220))
+        height = int(clamp(int(self.app_window.config.get("quick_button_height", 40)), 35, 100))
+        font_size = int(clamp(int(self.app_window.config.get("quick_button_font_size", 11)), 8, 20))
+        font_family = str(self.app_window.config.get("quick_button_font_family", "Segoe UI"))
+        shape = self.app_window.config.get("quick_button_shape", "Soft")
+        if self.style_shape_combo.findText(shape) == -1:
+            shape = "Soft"
+        opacity = float(clamp(float(self.app_window.config.get("quick_button_opacity", 1.0)), 0.2, 1.0))
+
+        self.style_width_slider.setValue(width)
+        self.style_height_slider.setValue(height)
+        self.style_font_slider.setValue(font_size)
+        self.style_font_family_combo.setCurrentFont(QFont(font_family))
+        self.style_shape_combo.setCurrentText(shape)
+        self.style_opacity_slider.setValue(int(opacity * 100))
+
+        self.style_width_slider.blockSignals(False)
+        self.style_height_slider.blockSignals(False)
+        self.style_font_slider.blockSignals(False)
+        self.style_font_family_combo.blockSignals(False)
+        self.style_shape_combo.blockSignals(False)
+        self.style_opacity_slider.blockSignals(False)
+
+        self.style_width_value.setText(str(width))
+        self.style_height_value.setText(str(height))
+        self.style_font_value.setText(str(font_size))
+        self.style_opacity_value.setText(f"{opacity:.2f}")
+
+    def _on_style_controls_changed(self) -> None:
+        width = int(self.style_width_slider.value())
+        height = int(self.style_height_slider.value())
+        font_size = int(self.style_font_slider.value())
+        font_family = str(self.style_font_family_combo.currentFont().family() or "Segoe UI")
+        shape = self.style_shape_combo.currentText()
+        opacity = float(clamp(self.style_opacity_slider.value() / 100.0, 0.2, 1.0))
+
+        self.app_window.config["quick_button_width"] = width
+        self.app_window.config["quick_button_height"] = height
+        self.app_window.config["quick_button_font_size"] = font_size
+        self.app_window.config["quick_button_font_family"] = font_family
+        self.app_window.config["quick_button_shape"] = shape
+        self.app_window.config["quick_button_opacity"] = opacity
+
+        self.style_width_value.setText(str(width))
+        self.style_height_value.setText(str(height))
+        self.style_font_value.setText(str(font_size))
+        self.style_opacity_value.setText(f"{opacity:.2f}")
+
+        self.app_window._refresh_theme_preview_buttons()
+        self.app_window.refresh_quick_grid()
+        self.refresh_cards()
+        self.app_window.queue_save_config()
+
+    def _default_position(self, index: int, width: int, height: int) -> tuple[int, int]:
+        return self.app_window._default_quick_position(index, width, height)
+
+    def _paint_canvas_background(self, painter: QPainter, rect: QRect) -> None:
+        base = QColor(self.app_window.palette_data["surface"])
+        base.setAlpha(110)
+        painter.fillRect(rect, base)
+
+        surface_size = self.app_window.surface.size()
+        if surface_size.width() <= 0 or surface_size.height() <= 0:
+            return
+        bg = self.app_window.render_background_pixmap(surface_size)
+        if bg.isNull():
+            return
+
+        source_offset = self.app_window.quick_scroll.viewport().mapTo(self.app_window.surface, QPoint(0, 0))
+        painter.save()
+        painter.setClipRect(rect)
+        painter.drawPixmap(-source_offset.x(), -source_offset.y(), bg)
+        overlay = QColor(self.app_window.palette_data["shell_overlay"])
+        overlay.setAlpha(24)
+        painter.fillRect(rect, overlay)
+        painter.restore()
+
+    def refresh_cards(self) -> None:
+        self._sync_style_controls_from_config()
+        self.canvas.clear_cards()
+        self.canvas.clear_alignment_guides()
+        self.canvas.configure_grid(show_grid=False, snap_enabled=False)
+        self._sync_canvas_viewport_width()
+        can_persist_positions = bool(
+            self.isVisible() and self.scroll.viewport().width() > 120 and self._reference_main_canvas_width() > 120
+        )
+
+        quick_texts = self.app_window._active_quick_texts()
+        if not quick_texts:
+            self.canvas.set_placeholder("No quick text buttons yet.", self.app_window.palette_data["muted_text"])
+            return
+
+        width = int(self.app_window.config.get("quick_button_width", 140))
+        height = int(self.app_window.config.get("quick_button_height", 40))
+        font_size = int(self.app_window.config.get("quick_button_font_size", 11))
+        font_family = str(self.app_window.config.get("quick_button_font_family", "Segoe UI"))
+        shape = self.app_window.config.get("quick_button_shape", "Soft")
+        button_opacity = float(clamp(float(self.app_window.config.get("quick_button_opacity", 1.0)), 0.15, 1.0))
+        updated_positions = False
+
+        for idx, item in enumerate(quick_texts):
+            card = QuickButtonCard(
+                idx,
+                str(item.get("title", "Untitled"))[:28],
+                str(item.get("tooltip", "")),
+                self.canvas,
+            )
+            action_type = self.app_window._quick_action_kind(item)
+            card.apply_visual_style(width, height, font_size, font_family, shape, button_opacity, self.app_window.palette_data, action_type)
+            card.set_layout_mode(True)
+            card.edit_button.hide()
+            card.move_requested.connect(self.on_card_move)
+            raw_x = item.get("x")
+            raw_y = item.get("y")
+            if isinstance(raw_x, (int, float)) and isinstance(raw_y, (int, float)):
+                pos_x, pos_y = int(raw_x), int(raw_y)
+            else:
+                pos_x, pos_y = self._default_position(idx, width, height)
+                if can_persist_positions:
+                    item["x"] = int(pos_x)
+                    item["y"] = int(pos_y)
+                    updated_positions = True
+
+            px, py = self.canvas.place_card(card, pos_x, pos_y, snap=False)
+            if (
+                can_persist_positions
+                and (
+                    safe_int(item.get("x", -99999), -99999) != px
+                    or safe_int(item.get("y", -99999), -99999) != py
+                )
+            ):
+                item["x"] = int(px)
+                item["y"] = int(py)
+                updated_positions = True
+
+        if updated_positions:
+            self.app_window.queue_save_config()
+
+    def _alignment_guides_for(self, moving_index: int, x: int, y: int, w: int, h: int) -> tuple[list[int], list[int]]:
+        tolerance = 8
+        moving_left = x
+        moving_right = x + w - 1
+        moving_cx = x + (w // 2)
+        moving_top = y
+        moving_bottom = y + h - 1
+        moving_cy = y + (h // 2)
+
+        v_lines: set[int] = set()
+        h_lines: set[int] = set()
+
+        center_x = self.canvas.width() // 2
+        center_y = self.canvas.height() // 2
+        if abs(moving_cx - center_x) <= tolerance:
+            v_lines.add(center_x)
+        if abs(moving_cy - center_y) <= tolerance:
+            h_lines.add(center_y)
+
+        for rect in self.canvas.iter_card_geometries(exclude_index=moving_index):
+            other_left = rect.left()
+            other_right = rect.right()
+            other_cx = rect.left() + (rect.width() // 2)
+            other_top = rect.top()
+            other_bottom = rect.bottom()
+            other_cy = rect.top() + (rect.height() // 2)
+
+            for moving_anchor in (moving_left, moving_cx, moving_right):
+                for other_anchor in (other_left, other_cx, other_right):
+                    if abs(moving_anchor - other_anchor) <= tolerance:
+                        v_lines.add(int(other_anchor))
+            for moving_anchor in (moving_top, moving_cy, moving_bottom):
+                for other_anchor in (other_top, other_cy, other_bottom):
+                    if abs(moving_anchor - other_anchor) <= tolerance:
+                        h_lines.add(int(other_anchor))
+
+        return sorted(v_lines), sorted(h_lines)
+
+    @staticmethod
+    def _snap_axis_to_lines(start: int, size: int, guide_lines: list[int], tolerance: int = 12) -> int:
+        if not guide_lines:
+            return start
+        anchors = [start, start + (size // 2), start + size - 1]
+        best_delta: int | None = None
+        for anchor in anchors:
+            for line in guide_lines:
+                delta = int(line - anchor)
+                if abs(delta) > tolerance:
+                    continue
+                if best_delta is None or abs(delta) < abs(best_delta):
+                    best_delta = delta
+        if best_delta is None:
+            return start
+        return start + best_delta
+
+    def on_card_move(self, index: int, x: int, y: int, finished: bool) -> None:
+        gx, gy = self.canvas.move_card(index, x, y, snap=False)
+        card_rect = self.canvas.card_geometry(index)
+        if card_rect is not None:
+            v_lines, h_lines = self._alignment_guides_for(index, gx, gy, card_rect.width(), card_rect.height())
+            if bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier):
+                snapped_x = self._snap_axis_to_lines(gx, card_rect.width(), v_lines)
+                snapped_y = self._snap_axis_to_lines(gy, card_rect.height(), h_lines)
+                if snapped_x != gx or snapped_y != gy:
+                    gx, gy = self.canvas.move_card(index, snapped_x, snapped_y, snap=False)
+                    card_rect = self.canvas.card_geometry(index)
+                    if card_rect is not None:
+                        v_lines, h_lines = self._alignment_guides_for(index, gx, gy, card_rect.width(), card_rect.height())
+            self.canvas.set_alignment_guides(v_lines, h_lines)
+        if finished:
+            self.canvas.clear_alignment_guides()
+
+        quick_texts = self.app_window._active_quick_texts()
+        if 0 <= index < len(quick_texts):
+            entry = quick_texts[index]
+            entry["x"] = int(gx)
+            entry["y"] = int(gy)
+            if finished:
+                self.app_window.queue_save_config()
+                self.app_window.refresh_quick_grid()
+
+    def reset_auto_layout(self) -> None:
+        quick_texts = self.app_window._active_quick_texts()
+        width = int(self.app_window.config.get("quick_button_width", 140))
+        height = int(self.app_window.config.get("quick_button_height", 40))
+        for idx, entry in enumerate(quick_texts):
+            x, y = self._default_position(idx, width, height)
+            entry["x"] = int(x)
+            entry["y"] = int(y)
+        self.app_window.queue_save_config()
+        self.refresh_cards()
+        self.app_window.refresh_quick_grid()
+
+
+class ImageLayerPreview(QWidget):
+    layer_changed = Signal(dict)
+
+    def __init__(self, app_window: "QuickInputsWindow", get_layer: Callable[[], dict[str, Any] | None], kind: str = "main") -> None:
+        super().__init__()
+        self.app_window = app_window
+        self.get_layer = get_layer
+        self.kind = kind
+        self._dragging = False
+        self._drag_start = QPointF(0.0, 0.0)
+        self._layer_start = QPointF(0.0, 0.0)
+        self._drag_scale = 1.0
+        self.setMinimumSize(260, 190)
+
+    def _virtual_size(self) -> QSize:
+        if self.kind == "main":
+            size = self.app_window.surface.size()
+            if size.width() <= 0 or size.height() <= 0:
+                return QSize(LAUNCH_WIDTH, LAUNCH_HEIGHT)
+            return size
+
+        if self.kind == "agent":
+            active_agent = getattr(self.app_window, "active_agent_window", None)
+            if active_agent is not None and active_agent.isVisible():
+                size = active_agent.size()
+                if size.width() > 0 and size.height() > 0:
+                    return size
+            return QSize(460, 380)
+
+        if self.kind == "qa":
+            active_qa = getattr(self.app_window, "active_qa_window", None)
+            if active_qa is not None and active_qa.isVisible():
+                size = active_qa.size()
+                if size.width() > 0 and size.height() > 0:
+                    return size
+            return QSize(500, 420)
+        
+        if self.kind == "dashboard":
+            active_dashboard = getattr(self.app_window, "depot_dashboard_dialog", None)
+            if active_dashboard is not None and active_dashboard.isVisible():
+                size = active_dashboard.size()
+                if size.width() > 0 and size.height() > 0:
+                    return size
+            return QSize(780, 420)
+
+        if self.kind == "admin":
+            active_admin = getattr(self.app_window, "admin_dialog", None)
+            if active_admin is not None and active_admin.isVisible():
+                size = active_admin.size()
+                if size.width() > 0 and size.height() > 0:
+                    return size
+            return QSize(620, 500)
+
+        return QSize(LAUNCH_WIDTH, LAUNCH_HEIGHT)
+
+    def _mapping(self) -> tuple[QSize, QRectF, float]:
+        virtual_size = self._virtual_size()
+        outer = QRectF(self.rect())
+        if virtual_size.width() <= 0 or virtual_size.height() <= 0 or outer.width() <= 0 or outer.height() <= 0:
+            return virtual_size, outer, 1.0
+
+        scale = min(outer.width() / virtual_size.width(), outer.height() / virtual_size.height())
+        draw_w = virtual_size.width() * scale
+        draw_h = virtual_size.height() * scale
+        draw_rect = QRectF(
+            outer.left() + (outer.width() - draw_w) / 2.0,
+            outer.top() + (outer.height() - draw_h) / 2.0,
+            draw_w,
+            draw_h,
+        )
+        return virtual_size, draw_rect, scale
+
+    @staticmethod
+    def _virtual_rect_to_preview(rect: QRectF, preview_rect: QRectF, scale: float) -> QRectF:
+        if scale <= 0:
+            return QRectF()
+        return QRectF(
+            preview_rect.left() + rect.left() * scale,
+            preview_rect.top() + rect.top() * scale,
+            rect.width() * scale,
+            rect.height() * scale,
+        )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        virtual_size, draw_rect, scale = self._mapping()
+        frame_tint = QColor(self.app_window.palette_data["shell_overlay"])
+        frame_tint.setAlpha(72)
+        painter.fillRect(self.rect(), frame_tint)
+        bg = self.app_window.render_background_pixmap(virtual_size, kind=self.kind)
+        if not bg.isNull():
+            painter.drawPixmap(draw_rect.toRect(), bg)
+
+        layer = self.get_layer()
+        if not layer:
+            return
+
+        render_info = self.app_window.compute_layer_render(layer, virtual_size)
+        if not render_info:
+            return
+        layer_rect = self._virtual_rect_to_preview(render_info.rect, draw_rect, scale)
+
+        pen = QPen(QColor("#FFFFFF"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(layer_rect)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        layer = self.get_layer()
+        if not layer:
+            return
+
+        virtual_size, draw_rect, scale = self._mapping()
+        info = self.app_window.compute_layer_render(layer, virtual_size)
+        if not info:
+            return
+        layer_rect = self._virtual_rect_to_preview(info.rect, draw_rect, scale)
+
+        if event.button() == Qt.MouseButton.LeftButton and layer_rect.contains(event.position()):
+            self._dragging = True
+            self._drag_start = event.position()
+            self._layer_start = QPointF(float(layer.get("image_x", 0)), float(layer.get("image_y", 0)))
+            self._drag_scale = scale if scale > 0 else 1.0
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._dragging:
+            return
+
+        layer = self.get_layer()
+        if not layer:
+            return
+
+        delta = event.position() - self._drag_start
+        dx = delta.x() / self._drag_scale
+        dy = delta.y() / self._drag_scale
+        layer["image_x"] = int(round(self._layer_start.x() + dx))
+        layer["image_y"] = int(round(self._layer_start.y() + dy))
+        self.layer_changed.emit(layer)
+        self.update()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+
+
+class ImageLayersDialog(QDialog):
+    def __init__(self, app_window: "QuickInputsWindow", kind: str = "main") -> None:
+        super().__init__(app_window)
+        self.app_window = app_window
+        self.kind = kind
+        title = "Image Layers - Flowgrid" if kind == "main" else f"Image Layers - {kind.title()}"
+        self.setWindowTitle(title)
+        self.setMinimumSize(500, 380)
+        self.setModal(False)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        left = QVBoxLayout()
+        self.layer_list = QListWidget()
+        left.addWidget(self.layer_list, 1)
+
+        row_buttons = QHBoxLayout()
+        self.add_button = QPushButton("Add")
+        self.remove_button = QPushButton("Remove")
+        self.up_button = QPushButton("Up")
+        self.down_button = QPushButton("Down")
+        self.add_button.setProperty("actionRole", "add")
+        self.remove_button.setProperty("actionRole", "reset")
+        self.up_button.setProperty("actionRole", "pick")
+        self.down_button.setProperty("actionRole", "pick")
+        row_buttons.addWidget(self.add_button)
+        row_buttons.addWidget(self.remove_button)
+        row_buttons.addWidget(self.up_button)
+        row_buttons.addWidget(self.down_button)
+        left.addLayout(row_buttons)
+
+        self.visible_check = QCheckBox("Visible")
+        left.addWidget(self.visible_check)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(6)
+
+        self.x_spin = QSpinBox()
+        self.x_spin.setRange(-3000, 3000)
+        self.y_spin = QSpinBox()
+        self.y_spin.setRange(-3000, 3000)
+
+        self.scale_mode = QComboBox()
+        self.scale_mode.addItems(["Fill", "Fit", "Stretch", "Place"])
+
+        self.anchor_combo = QComboBox()
+        self.anchor_combo.addItems(["TopLeft", "Top", "TopRight", "Left", "Center", "Right", "BottomLeft", "Bottom", "BottomRight"])
+
+        self.scale_spin = QSpinBox()
+        self.scale_spin.setRange(10, 400)
+
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+
+        form.addRow("X", self.x_spin)
+        form.addRow("Y", self.y_spin)
+        form.addRow("Scale", self.scale_mode)
+        form.addRow("Anchor", self.anchor_combo)
+        form.addRow("Scale %", self.scale_spin)
+        form.addRow("Opacity", self.opacity_slider)
+
+        left.addLayout(form)
+        layout.addLayout(left, 0)
+
+        right = QVBoxLayout()
+        self.preview = ImageLayerPreview(app_window, self.current_layer, kind=self.kind)
+        right.addWidget(self.preview, 1)
+
+        hint = QLabel("Tip: drag the highlighted image in preview to reposition it.")
+        hint.setWordWrap(True)
+        right.addWidget(hint)
+
+        layout.addLayout(right, 1)
+
+        self.layer_list.currentRowChanged.connect(self._on_layer_selected)
+        self.add_button.clicked.connect(self._add_image)
+        self.remove_button.clicked.connect(self._remove_selected)
+        self.up_button.clicked.connect(lambda: self._move_selected(-1))
+        self.down_button.clicked.connect(lambda: self._move_selected(1))
+
+        self.visible_check.toggled.connect(lambda value: self._update_layer_field("visible", value))
+        self.x_spin.valueChanged.connect(lambda value: self._update_layer_field("image_x", value))
+        self.y_spin.valueChanged.connect(lambda value: self._update_layer_field("image_y", value))
+        self.scale_mode.currentTextChanged.connect(lambda value: self._update_layer_field("image_scale_mode", value))
+        self.anchor_combo.currentTextChanged.connect(lambda value: self._update_layer_field("image_anchor", value))
+        self.scale_spin.valueChanged.connect(lambda value: self._update_layer_field("image_scale_percent", value))
+        self.opacity_slider.valueChanged.connect(lambda value: self._update_layer_field("image_opacity", value / 100.0))
+
+        self.preview.layer_changed.connect(self._on_layer_dragged)
+        self.apply_theme_styles()
+        self.refresh_list()
+
+    def apply_theme_styles(self) -> None:
+        p = self.app_window.palette_data
+        dialog_bg = rgba_css(p["shell_overlay"], 0.92)
+        list_bg = rgba_css(p["input_bg"], 0.42)
+        input_bg = rgba_css(p["input_bg"], 0.86)
+        border = shift(p["control_bg"], -0.30)
+        field_border = shift(p["input_bg"], -0.38)
+        button_bg = rgba_css(p["button_bg"], 0.78)
+        button_hover = rgba_css(shift(p["button_bg"], 0.08), 0.86)
+        self.setStyleSheet(
+            "QDialog {"
+            f"background: {dialog_bg};"
+            f"color: {p['label_text']};"
+            "font-family: 'Segoe UI';"
+            "font-size: 13px;"
+            "}"
+            "QLabel { background: transparent; color: inherit; font-weight: 700; }"
+            "QListWidget {"
+            f"background: {list_bg};"
+            f"border: 1px solid {field_border};"
+            "border-radius: 4px;"
+            "padding: 4px;"
+            "}"
+            "QLineEdit, QTextEdit, QSpinBox, QComboBox {"
+            f"background: {input_bg};"
+            f"border: 1px solid {field_border};"
+            "border-radius: 3px;"
+            "padding: 2px 6px;"
+            "}"
+            "QCheckBox { background: transparent; spacing: 8px; font-weight: 700; }"
+            "QPushButton {"
+            f"background: {button_bg};"
+            f"color: {p['button_text']};"
+            f"border: 1px solid {shift(p['button_bg'], -0.40)};"
+            "border-radius: 4px;"
+            "padding: 4px 10px;"
+            "min-height: 28px;"
+            "font-size: 11px;"
+            "font-weight: 700;"
+            "}"
+            f"QPushButton:hover {{ background: {button_hover}; }}"
+            "QPushButton[actionRole='add'] {"
+            f"background-color: {rgba_css(p['primary'], 0.78)};"
+            f"color: {readable_text(p['primary'])};"
+            f"border: 1px solid {shift(p['primary'], -0.42)};"
+            "}"
+            "QPushButton[actionRole='reset'] {"
+            f"background-color: {rgba_css(p['accent'], 0.78)};"
+            f"color: {readable_text(p['accent'])};"
+            f"border: 1px solid {shift(p['accent'], -0.42)};"
+            "}"
+        )
+        self.preview.setStyleSheet(
+            "QWidget {"
+            "background: transparent;"
+            f"border: 1px solid {border};"
+            "border-radius: 4px;"
+            "}"
+        )
+        self.preview.update()
+
+    def _layers_key(self) -> str:
+        if self.kind == "main":
+            return "theme_image_layers"
+        else:
+            return f"{self.kind}_theme"
+
+    def _popup_uses_inherited_layers(self, theme: dict[str, Any]) -> bool:
+        if self.kind == "main":
+            return False
+        if not isinstance(theme, dict):
+            return True
+        if bool(theme.get("inherit_main_theme", False)):
+            return True
+        if self.app_window._looks_like_unconfigured_popup_theme(theme):
+            return True
+        return False
+
+    def _materialize_popup_layers_for_edit(self) -> None:
+        if self.kind == "main":
+            return
+        key = self._layers_key()
+        theme = self.app_window.config.setdefault(key, {})
+        if not isinstance(theme, dict):
+            theme = {}
+            self.app_window.config[key] = theme
+        if not self._popup_uses_inherited_layers(theme):
+            return
+        effective_layers = self._get_layers()
+        theme["image_layers"] = [
+            safe_layer_defaults(layer) for layer in effective_layers if isinstance(layer, dict)
+        ]
+        theme["inherit_main_theme"] = False
+
+    def _get_layers(self) -> list[dict[str, Any]]:
+        key = self._layers_key()
+        if self.kind == "main":
+            return self.app_window.config.get(key, [])
+        else:
+            theme = self.app_window.config.get(key, {})
+            if self._popup_uses_inherited_layers(theme if isinstance(theme, dict) else {}):
+                resolved = self.app_window._resolved_popup_theme(self.kind)
+                inherited_layers = resolved.get("image_layers", [])
+                if isinstance(inherited_layers, list):
+                    return [
+                        safe_layer_defaults(layer)
+                        for layer in inherited_layers
+                        if isinstance(layer, dict)
+                    ]
+                return []
+            if isinstance(theme, dict):
+                raw_layers = theme.get("image_layers", [])
+                if isinstance(raw_layers, list):
+                    return raw_layers
+            return []
+
+    def _set_layers(self, layers: list[dict[str, Any]]) -> None:
+        key = self._layers_key()
+        if self.kind == "main":
+            self.app_window.config[key] = layers
+        else:
+            theme = self.app_window.config.setdefault(key, {})
+            if not isinstance(theme, dict):
+                theme = {}
+                self.app_window.config[key] = theme
+            theme["image_layers"] = layers
+            theme["inherit_main_theme"] = False
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        popup_positions = self.app_window.config.setdefault("popup_positions", {})
+        if self.kind == "main":
+            popup_positions["image_layers"] = {"x": self.x(), "y": self.y()}
+        else:
+            popup_positions[f"image_layers_{self.kind}"] = {"x": self.x(), "y": self.y()}
+        self.app_window.queue_save_config()
+        super().closeEvent(event)
+
+    def refresh_list(self) -> None:
+        current = self.layer_list.currentRow()
+        self.layer_list.blockSignals(True)
+        self.layer_list.clear()
+        for layer in self._get_layers():
+            item = QListWidgetItem(layer.get("name") or "Layer")
+            self.layer_list.addItem(item)
+        self.layer_list.blockSignals(False)
+
+        if self.layer_list.count() == 0:
+            self._load_layer_to_controls(None)
+            return
+
+        if current < 0:
+            current = 0
+        current = int(clamp(current, 0, self.layer_list.count() - 1))
+        self.layer_list.setCurrentRow(current)
+
+    def current_layer(self) -> dict[str, Any] | None:
+        row = self.layer_list.currentRow()
+        layers = self._get_layers()
+        if row < 0 or row >= len(layers):
+            return None
+        return layers[row]
+
+    def _on_layer_selected(self, _row: int) -> None:
+        self._load_layer_to_controls(self.current_layer())
+
+    def _load_layer_to_controls(self, layer: dict[str, Any] | None) -> None:
+        controls: list[QWidget] = [
+            self.visible_check,
+            self.x_spin,
+            self.y_spin,
+            self.scale_mode,
+            self.anchor_combo,
+            self.scale_spin,
+            self.opacity_slider,
+            self.remove_button,
+            self.up_button,
+            self.down_button,
+        ]
+        enabled = layer is not None
+        for control in controls:
+            control.setEnabled(enabled)
+
+        if not layer:
+            self.preview.update()
+            return
+
+        self.visible_check.blockSignals(True)
+        self.x_spin.blockSignals(True)
+        self.y_spin.blockSignals(True)
+        self.scale_mode.blockSignals(True)
+        self.anchor_combo.blockSignals(True)
+        self.scale_spin.blockSignals(True)
+        self.opacity_slider.blockSignals(True)
+
+        self.visible_check.setChecked(bool(layer.get("visible", True)))
+        self.x_spin.setValue(int(layer.get("image_x", 0)))
+        self.y_spin.setValue(int(layer.get("image_y", 0)))
+        self.scale_mode.setCurrentText(layer.get("image_scale_mode", "Fill"))
+        self.anchor_combo.setCurrentText(layer.get("image_anchor", "Center"))
+        self.scale_spin.setValue(int(layer.get("image_scale_percent", 100)))
+        self.opacity_slider.setValue(int(float(layer.get("image_opacity", 1.0)) * 100))
+
+        self.visible_check.blockSignals(False)
+        self.x_spin.blockSignals(False)
+        self.y_spin.blockSignals(False)
+        self.scale_mode.blockSignals(False)
+        self.anchor_combo.blockSignals(False)
+        self.scale_spin.blockSignals(False)
+        self.opacity_slider.blockSignals(False)
+
+        self.preview.update()
+
+    def _add_image(self) -> None:
+        files, _ = show_flowgrid_themed_open_file_names(
+            self,
+            self.app_window,
+            self.kind,
+            "Add Image Layers",
+            str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*.*)",
+        )
+        if not files:
+            return
+
+        for file_path in files:
+            layer = safe_layer_defaults(
+                {
+                    "image_path": file_path,
+                    "name": Path(file_path).name,
+                }
+            )
+            layers = self._get_layers()
+            layers.append(layer)
+            self._set_layers(layers)
+
+        self.app_window.mark_background_dirty()
+        self.app_window.queue_save_config()
+        self.refresh_list()
+        self.layer_list.setCurrentRow(self.layer_list.count() - 1)
+        self.app_window.refresh_all_views()
+
+    def _remove_selected(self) -> None:
+        row = self.layer_list.currentRow()
+        if row < 0:
+            return
+
+        layers = self._get_layers()
+        if 0 <= row < len(layers):
+            layers.pop(row)
+            self._set_layers(layers)
+            self.app_window.mark_background_dirty()
+            self.app_window.queue_save_config()
+            self.refresh_list()
+            self.app_window.refresh_all_views()
+
+    def _move_selected(self, direction: int) -> None:
+        row = self.layer_list.currentRow()
+        layers = self._get_layers()
+        new_index = row + direction
+        if row < 0 or new_index < 0 or new_index >= len(layers):
+            return
+
+        layers[row], layers[new_index] = layers[new_index], layers[row]
+        self._set_layers(layers)
+        self.refresh_list()
+        self.layer_list.setCurrentRow(new_index)
+        self.app_window.mark_background_dirty()
+        self.app_window.queue_save_config()
+        self.app_window.refresh_all_views()
+
+    def _update_layer_field(self, field: str, value: Any) -> None:
+        self._materialize_popup_layers_for_edit()
+        layer = self.current_layer()
+        if not layer:
+            return
+
+        layer[field] = value
+        self.app_window.mark_background_dirty()
+        self.app_window.queue_save_config()
+        self.preview.update()
+        self.app_window.refresh_all_views()
+
+    def _on_layer_dragged(self, layer: dict[str, Any]) -> None:
+        self._materialize_popup_layers_for_edit()
+        editable_layer = self.current_layer()
+        if editable_layer is not None:
+            editable_layer["image_x"] = int(layer.get("image_x", 0))
+            editable_layer["image_y"] = int(layer.get("image_y", 0))
+            layer = editable_layer
+        self.x_spin.blockSignals(True)
+        self.y_spin.blockSignals(True)
+        self.x_spin.setValue(int(layer.get("image_x", 0)))
+        self.y_spin.setValue(int(layer.get("image_y", 0)))
+        self.x_spin.blockSignals(False)
+        self.y_spin.blockSignals(False)
+
+        self.app_window.mark_background_dirty()
+        self.app_window.queue_save_config()
+        self.app_window.refresh_all_views()
+
+# -------------------------- Depot Tracker Data Layer --------------------------
+
+
+@dataclass
+class DepotRefreshViewState:
+    state_key: str = ""
+    last_refresh_ms: float = 0.0
+    last_reason: str = ""
+
+
+class DepotRefreshCoordinator:
+    """Centralized refresh policy for shared-drive workflow views."""
+
+    _SKIP_LOG_INTERVAL_MS = 2000
+
+    def __init__(self) -> None:
+        self._view_states: dict[str, DepotRefreshViewState] = {}
+        self._invalidated_views: set[str] = set()
+        self._cached_payloads: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._last_skip_log_ms: dict[str, float] = {}
+
+    @staticmethod
+    def _now_ms() -> float:
+        return time.monotonic() * 1000.0
+
+    @staticmethod
+    def _normalize_key(value: Any) -> str:
+        text = str(value or "").strip()
+        return text
+
+    @staticmethod
+    def _normalize_state_key(value: Any) -> str:
+        if isinstance(value, (dict, list, tuple, set)):
+            try:
+                return json.dumps(_json_safe(value), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+            except Exception:
+                return repr(value)
+        return str(value or "")
+
+    def invalidate_views(self, *view_keys: str, reason: str = "") -> None:
+        normalized_keys = [self._normalize_key(view_key) for view_key in view_keys if self._normalize_key(view_key)]
+        if not normalized_keys:
+            return
+        for view_key in normalized_keys:
+            self._invalidated_views.add(view_key)
+            self._cached_payloads = {
+                cache_key: cache_value
+                for cache_key, cache_value in self._cached_payloads.items()
+                if cache_key[0] != view_key
+            }
+        _runtime_log_event(
+            "sync.depot_views_invalidated",
+            severity="info",
+            summary="Shared workflow view invalidation was triggered.",
+            context={
+                "views": normalized_keys,
+                "reason": str(reason or ""),
+            },
+        )
+
+    def should_refresh_view(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        force: bool = False,
+        ttl_ms: int = DEPOT_VIEW_TTL_MS,
+        reason: str = "",
+    ) -> bool:
+        normalized_view = self._normalize_key(view_key)
+        normalized_state = self._normalize_state_key(state_key)
+        if not normalized_view:
+            return True
+        if force:
+            _runtime_log_event(
+                "sync.depot_view_refresh_forced",
+                severity="info",
+                summary="A shared workflow view refresh was forced.",
+                context={"view": normalized_view, "reason": str(reason or ""), "state_key": normalized_state[:160]},
+            )
+            return True
+        if normalized_view in self._invalidated_views:
+            return True
+
+        entry = self._view_states.get(normalized_view)
+        if entry is None:
+            return True
+        if entry.state_key != normalized_state:
+            return True
+
+        elapsed_ms = self._now_ms() - float(entry.last_refresh_ms or 0.0)
+        if elapsed_ms >= int(max(0, ttl_ms)):
+            return True
+
+        last_skip_log = float(self._last_skip_log_ms.get(normalized_view, 0.0))
+        now_ms = self._now_ms()
+        if (now_ms - last_skip_log) >= self._SKIP_LOG_INTERVAL_MS:
+            self._last_skip_log_ms[normalized_view] = now_ms
+            _runtime_log_event(
+                "sync.depot_view_refresh_skipped_fresh",
+                severity="info",
+                summary="A shared workflow view refresh was skipped because the cached state is still fresh.",
+                context={
+                    "view": normalized_view,
+                    "reason": str(reason or ""),
+                    "ttl_ms": int(ttl_ms),
+                    "age_ms": int(max(0.0, elapsed_ms)),
+                },
+            )
+        return False
+
+    def mark_view_refreshed(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        payload: Any = None,
+        reason: str = "",
+        duration_ms: float | None = None,
+        row_count: int | None = None,
+    ) -> None:
+        normalized_view = self._normalize_key(view_key)
+        normalized_state = self._normalize_state_key(state_key)
+        if not normalized_view:
+            return
+        self._view_states[normalized_view] = DepotRefreshViewState(
+            state_key=normalized_state,
+            last_refresh_ms=self._now_ms(),
+            last_reason=str(reason or ""),
+        )
+        self._invalidated_views.discard(normalized_view)
+        self._cached_payloads[(normalized_view, normalized_state)] = (self._now_ms(), payload)
+        context = {
+            "view": normalized_view,
+            "reason": str(reason or ""),
+        }
+        if duration_ms is not None:
+            context["duration_ms"] = int(max(0.0, float(duration_ms)))
+        if row_count is not None:
+            context["row_count"] = int(max(0, row_count))
+        _runtime_log_event(
+            "sync.depot_view_refreshed",
+            severity="info",
+            summary="A shared workflow view refresh completed.",
+            context=context,
+        )
+
+    def get_cached_payload(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        ttl_ms: int = DEPOT_VIEW_TTL_MS,
+    ) -> Any | None:
+        normalized_view = self._normalize_key(view_key)
+        normalized_state = self._normalize_state_key(state_key)
+        cache_entry = self._cached_payloads.get((normalized_view, normalized_state))
+        if cache_entry is None or normalized_view in self._invalidated_views:
+            return None
+        cached_at_ms, payload = cache_entry
+        if (self._now_ms() - float(cached_at_ms)) > int(max(0, ttl_ms)):
+            self._cached_payloads.pop((normalized_view, normalized_state), None)
+            return None
+        return payload
+
+class DepotDB:
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._transaction_depth = 0
+        self._connection_unhealthy = False
+        self._last_reopen_attempt_ms = 0.0
+        self.conn = self._open_connection()
+        self._create_tables()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            str(self.db_path),
+            timeout=30.0,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        self._apply_connection_pragmas(connection)
+        self._connection_unhealthy = False
+        return connection
+
+    @staticmethod
+    def _apply_connection_pragmas(connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 20000")
+        connection.execute("PRAGMA journal_mode = DELETE")
+
+    def _should_reopen_for_error(self, exc: BaseException, *, lock_retry_exhausted: bool = False) -> bool:
+        if self._transaction_depth > 0:
+            return False
+        if lock_retry_exhausted:
+            return True
+        message = str(exc or "").strip().lower()
+        recoverable_fragments = (
+            "cannot operate on a closed database",
+            "unable to open database file",
+            "disk i/o error",
+            "database disk image is malformed",
+            "readonly database",
+        )
+        return any(fragment in message for fragment in recoverable_fragments)
+
+    def reopen_connection(self, reason: str) -> bool:
+        if self._transaction_depth > 0:
+            return False
+        now_ms = time.monotonic() * 1000.0
+        if (now_ms - float(self._last_reopen_attempt_ms or 0.0)) < DEPOT_DB_REOPEN_COOLDOWN_MS:
+            return False
+        self._last_reopen_attempt_ms = now_ms
+        old_conn = getattr(self, "conn", None)
+        _runtime_log_event(
+            "depot.db.reopen_requested",
+            severity="warning",
+            summary="The shared workflow database connection is being reopened.",
+            context={"db_path": str(self.db_path), "reason": str(reason or "")},
+        )
+        try:
+            new_conn = self._open_connection()
+        except Exception as exc:
+            self._connection_unhealthy = True
+            _runtime_log_event(
+                "depot.db.reopen_failed",
+                severity="error",
+                summary="The shared workflow database connection reopen attempt failed.",
+                exc=exc,
+                context={"db_path": str(self.db_path), "reason": str(reason or "")},
+            )
+            return False
+        self.conn = new_conn
+        try:
+            if old_conn is not None:
+                old_conn.close()
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.db.reopen_previous_close_failed",
+                severity="warning",
+                summary="Closing the previous shared workflow database connection failed after a reopen.",
+                exc=exc,
+                context={"db_path": str(self.db_path)},
+            )
+        _runtime_log_event(
+            "depot.db.reopen_succeeded",
+            severity="info",
+            summary="The shared workflow database connection was reopened successfully.",
+            context={"db_path": str(self.db_path), "reason": str(reason or "")},
+        )
+        return True
+
+    def _run_sql_with_retry(
+        self,
+        operation_name: str,
+        query: str,
+        params: tuple,
+        runner: Callable[[sqlite3.Cursor], Any],
+        *,
+        allow_reopen: bool = False,
+    ) -> Any:
+        attempt = 0
+        reopened = False
+        while True:
+            try:
+                cursor = self.conn.cursor()
+                result = runner(cursor)
+                self._connection_unhealthy = False
+                return result
+            except sqlite3.OperationalError as exc:
+                attempt += 1
+                message = str(exc).lower()
+                is_locked = "locked" in message
+                if is_locked and attempt < 6:
+                    time.sleep(min(1.5, 0.15 * (2 ** (attempt - 1))))
+                    continue
+                self._connection_unhealthy = True
+                if allow_reopen and not reopened and self._should_reopen_for_error(exc, lock_retry_exhausted=is_locked):
+                    reopened = self.reopen_connection(f"{operation_name}:{'locked' if is_locked else 'operational_error'}")
+                    if reopened:
+                        attempt = 0
+                        continue
+                if is_locked:
+                    _runtime_log_event(
+                        "depot.db.lock_retry_exhausted",
+                        severity="warning",
+                        summary="Shared workflow database lock retries were exhausted.",
+                        exc=exc,
+                        context={
+                            "db_path": str(self.db_path),
+                            "operation": operation_name,
+                            "attempts": attempt,
+                            "query_preview": " ".join(str(query).split())[:240],
+                            "param_count": len(params),
+                            "reopened": bool(reopened),
+                        },
+                    )
+                raise
+            except (sqlite3.ProgrammingError, sqlite3.DatabaseError) as exc:
+                self._connection_unhealthy = True
+                if allow_reopen and not reopened and self._should_reopen_for_error(exc):
+                    reopened = self.reopen_connection(f"{operation_name}:connection_recovery")
+                    if reopened:
+                        continue
+                raise
+
+    def _execute_transaction_command(self, command: str) -> None:
+        self._run_sql_with_retry(
+            "transaction",
+            command,
+            (),
+            lambda cursor: cursor.execute(command),
+        )
+
+    @contextmanager
+    def write_transaction(self, purpose: str = "workflow.write") -> Iterator[None]:
+        is_outer = self._transaction_depth == 0
+        if is_outer:
+            self._execute_transaction_command("BEGIN IMMEDIATE")
+        self._transaction_depth += 1
+        try:
+            yield
+        except Exception:
+            if is_outer:
+                try:
+                    self._execute_transaction_command("ROLLBACK")
+                except Exception as rollback_exc:
+                    _runtime_log_event(
+                        "depot.db.transaction_rollback_failed",
+                        severity="critical",
+                        summary="A database transaction rollback failed after an exception.",
+                        exc=rollback_exc,
+                        context={"db_path": str(self.db_path), "purpose": str(purpose)},
+                    )
+            raise
+        else:
+            if is_outer:
+                try:
+                    self._execute_transaction_command("COMMIT")
+                except Exception:
+                    try:
+                        self._execute_transaction_command("ROLLBACK")
+                    except Exception as rollback_exc:
+                        _runtime_log_event(
+                            "depot.db.transaction_rollback_failed",
+                            severity="critical",
+                            summary="A database transaction rollback failed after a commit error.",
+                            exc=rollback_exc,
+                            context={"db_path": str(self.db_path), "purpose": str(purpose)},
+                        )
+                    raise
+        finally:
+            self._transaction_depth = max(0, self._transaction_depth - 1)
+
+    def _create_tables(self) -> None:
+        DepotSchema.ensure_schema(self)
+        DepotSchema.apply_migrations(self)
+        DepotSchema.run_backfills(self)
+
+    def _ensure_column(self, table_name: str, column_name: str, column_sql: str) -> None:
+        cursor = self.conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table_name})")
+        columns = {str(row[1]).lower() for row in cursor.fetchall()}
+        if column_name.lower() in columns:
+            return
+        cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+    def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        return self._run_sql_with_retry(
+            "execute",
+            query,
+            params,
+            lambda cursor: cursor.execute(query, params),
+        )
+
+    def fetchall(self, query: str, params: tuple = ()) -> list[sqlite3.Row]:
+        return self._run_sql_with_retry(
+            "fetchall",
+            query,
+            params,
+            lambda cursor: cursor.execute(query, params).fetchall(),
+            allow_reopen=True,
+        )
+
+    def fetchone(self, query: str, params: tuple = ()) -> sqlite3.Row | None:
+        return self._run_sql_with_retry(
+            "fetchone",
+            query,
+            params,
+            lambda cursor: cursor.execute(query, params).fetchone(),
+            allow_reopen=True,
+        )
+
+
+class DepotSchema:
+    @staticmethod
+    def ensure_schema(db: DepotDB) -> None:
+        with db.write_transaction("schema.ensure"):
+            cursor = db.conn.cursor()
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS submissions (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL,
+                    work_order TEXT NOT NULL,
+                    touch TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT '',
+                    client_unit INTEGER NOT NULL DEFAULT 0,
+                    entry_date TEXT NOT NULL,
+                    part_order_count INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submissions_user ON submissions(user_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submissions_work_order ON submissions(work_order)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submissions_touch ON submissions(touch)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_submissions_entry_date ON submissions(entry_date)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS parts (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    assigned_user_id TEXT NOT NULL,
+                    source_submission_id INTEGER NOT NULL DEFAULT 0,
+                    missing_part_order_followup INTEGER NOT NULL DEFAULT 0,
+                    missing_part_order_logged_at TEXT NOT NULL DEFAULT '',
+                    missing_part_order_logged_by TEXT NOT NULL DEFAULT '',
+                    missing_part_order_resolved_at TEXT NOT NULL DEFAULT '',
+                    missing_part_order_resolved_by TEXT NOT NULL DEFAULT '',
+                    work_order TEXT NOT NULL,
+                    client_unit INTEGER NOT NULL DEFAULT 0,
+                    category TEXT NOT NULL,
+                    comments TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    working_user_id TEXT NOT NULL DEFAULT '',
+                    working_updated_at TEXT NOT NULL DEFAULT '',
+                    alert_quiet_until TEXT NOT NULL DEFAULT '',
+                    parts_on_hand INTEGER NOT NULL DEFAULT 0,
+                    parts_installed INTEGER NOT NULL DEFAULT 0,
+                    parts_installed_by TEXT NOT NULL DEFAULT '',
+                    parts_installed_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS part_details (
+                    id INTEGER PRIMARY KEY,
+                    part_id INTEGER NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL,
+                    lpn TEXT NOT NULL,
+                    part_number TEXT NOT NULL DEFAULT '',
+                    part_description TEXT NOT NULL DEFAULT '',
+                    shipping_info TEXT NOT NULL DEFAULT '',
+                    installed_keys TEXT NOT NULL DEFAULT '',
+                    delivered INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY(part_id) REFERENCES parts(id) ON DELETE CASCADE
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_part_details_lpn ON part_details(lpn)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parts_user ON parts(user_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parts_work_order ON parts(work_order)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS rtvs (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    work_order TEXT NOT NULL,
+                    comments TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS client_jo (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    work_order TEXT NOT NULL,
+                    comments TEXT
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS client_parts (
+                    id INTEGER PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    assigned_user_id TEXT,
+                    work_order TEXT NOT NULL UNIQUE,
+                    comments TEXT,
+                    alert_quiet_until TEXT NOT NULL DEFAULT '',
+                    followup_last_action TEXT NOT NULL DEFAULT '',
+                    followup_last_action_at TEXT NOT NULL DEFAULT '',
+                    followup_last_actor TEXT NOT NULL DEFAULT '',
+                    followup_no_contact_count INTEGER NOT NULL DEFAULT 0,
+                    followup_stage_logged INTEGER NOT NULL DEFAULT -1
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS agents (
+                    id INTEGER PRIMARY KEY,
+                    agent_name TEXT NOT NULL,
+                    user_id TEXT NOT NULL UNIQUE,
+                    tier INTEGER NOT NULL DEFAULT 1,
+                    location TEXT NOT NULL DEFAULT '',
+                    icon_path TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS admin_users (
+                    id INTEGER PRIMARY KEY,
+                    user_id TEXT NOT NULL UNIQUE,
+                    admin_name TEXT NOT NULL DEFAULT '',
+                    position TEXT NOT NULL DEFAULT '',
+                    location TEXT NOT NULL DEFAULT '',
+                    icon_path TEXT NOT NULL DEFAULT '',
+                    access_level TEXT NOT NULL DEFAULT 'admin'
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS role_definitions (
+                    id INTEGER PRIMARY KEY,
+                    role_name TEXT NOT NULL UNIQUE,
+                    role_slot TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS qa_flags (
+                    id INTEGER PRIMARY KEY,
+                    flag_name TEXT NOT NULL UNIQUE,
+                    severity TEXT NOT NULL DEFAULT 'Medium',
+                    icon_path TEXT NOT NULL DEFAULT '',
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_qa_flags_sort ON qa_flags(sort_order, severity, flag_name)
+                """
+            )
+
+    @staticmethod
+    def apply_migrations(db: DepotDB) -> None:
+        with db.write_transaction("schema.migrate"):
+            cursor = db.conn.cursor()
+            db._ensure_column("agents", "tier", "INTEGER NOT NULL DEFAULT 1")
+            db._ensure_column("agents", "location", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("agents", "icon_path", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("submissions", "category", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("submissions", "updated_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("admin_users", "admin_name", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("admin_users", "position", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("admin_users", "location", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("admin_users", "icon_path", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("admin_users", "access_level", "TEXT NOT NULL DEFAULT 'admin'")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS role_definitions (
+                    id INTEGER PRIMARY KEY,
+                    role_name TEXT NOT NULL UNIQUE,
+                    role_slot TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            cursor.execute(
+                "UPDATE admin_users SET access_level='' "
+                "WHERE access_level IS NULL"
+            )
+            DepotSchema._seed_default_role_definitions(cursor)
+            db._ensure_column("parts", "qa_comment", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "agent_comment", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "qa_flag", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "qa_flag_image_path", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "working_user_id", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "working_updated_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "alert_quiet_until", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "parts_on_hand", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("parts", "parts_installed", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("parts", "parts_installed_by", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "parts_installed_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "source_submission_id", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("parts", "missing_part_order_followup", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("parts", "missing_part_order_logged_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "missing_part_order_logged_by", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "missing_part_order_resolved_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("parts", "missing_part_order_resolved_by", "TEXT NOT NULL DEFAULT ''")
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parts_source_submission ON parts(source_submission_id)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_parts_missing_part_order_followup
+                ON parts(is_active, missing_part_order_followup)
+                """
+            )
+            db._ensure_column("part_details", "installed_keys", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("qa_flags", "severity", "TEXT NOT NULL DEFAULT 'Medium'")
+            db._ensure_column("qa_flags", "icon_path", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("qa_flags", "sort_order", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("client_parts", "followup_last_action", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("client_parts", "followup_last_action_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("client_parts", "followup_last_actor", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("client_parts", "followup_no_contact_count", "INTEGER NOT NULL DEFAULT 0")
+            db._ensure_column("client_parts", "followup_stage_logged", "INTEGER NOT NULL DEFAULT -1")
+            db._ensure_column("client_parts", "alert_quiet_until", "TEXT NOT NULL DEFAULT ''")
+            cursor.execute(
+                "UPDATE submissions "
+                "SET entry_date=SUBSTR(COALESCE(created_at, ''), 1, 10) "
+                "WHERE TRIM(COALESCE(entry_date, ''))=''"
+            )
+            cursor.execute(
+                "UPDATE submissions "
+                "SET updated_at=COALESCE(NULLIF(TRIM(updated_at), ''), created_at) "
+                "WHERE TRIM(COALESCE(updated_at, ''))=''"
+            )
+            DepotSchema._collapse_duplicate_submissions(db, cursor)
+            cursor.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_submissions_entry_date_user_work_order
+                ON submissions(entry_date, user_id, work_order)
+                """
+            )
+
+    @staticmethod
+    def _seed_default_role_definitions(cursor: sqlite3.Cursor) -> None:
+        for sort_order, (role_name, role_slot) in enumerate(DepotRules.DEFAULT_ROLE_DEFINITIONS, start=1):
+            cursor.execute(
+                "INSERT OR IGNORE INTO role_definitions (role_name, role_slot, sort_order) VALUES (?, ?, ?)",
+                (
+                    str(role_name or "").strip(),
+                    DepotRules.normalize_role_slot(role_slot, default=DepotRules.ROLE_SLOT_NONE),
+                    int(sort_order),
+                ),
+            )
+
+    @staticmethod
+    def _collapse_duplicate_submissions(db: DepotDB, cursor: sqlite3.Cursor) -> None:
+        duplicate_groups = cursor.execute(
+            """
+            SELECT entry_date, user_id, work_order, COUNT(*) AS duplicate_count
+            FROM submissions
+            WHERE TRIM(COALESCE(entry_date, '')) <> ''
+            GROUP BY entry_date, user_id, work_order
+            HAVING COUNT(*) > 1
+            ORDER BY entry_date ASC, user_id ASC, work_order ASC
+            """
+        ).fetchall()
+        if not duplicate_groups:
+            return
+
+        merged_groups = 0
+        removed_rows = 0
+        for group in duplicate_groups:
+            entry_date = str(group["entry_date"] or "").strip()
+            user_id = str(group["user_id"] or "").strip()
+            work_order = str(group["work_order"] or "").strip()
+            rows = cursor.execute(
+                f"""
+                SELECT
+                    id,
+                    COALESCE(created_at, '') AS created_at,
+                    {_submission_latest_ts_sql()} AS latest_stamp,
+                    COALESCE(touch, '') AS touch,
+                    COALESCE(category, '') AS category,
+                    COALESCE(client_unit, 0) AS client_unit
+                FROM submissions
+                WHERE entry_date=? AND user_id=? AND work_order=?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (entry_date, user_id, work_order),
+            ).fetchall()
+            if len(rows) < 2:
+                continue
+
+            keep_id = int(rows[0]["id"])
+            latest_row = max(
+                rows,
+                key=lambda row: (
+                    str(row["latest_stamp"] or row["created_at"] or ""),
+                    int(row["id"]),
+                ),
+            )
+            latest_stamp = str(latest_row["latest_stamp"] or latest_row["created_at"] or "").strip()
+            cursor.execute(
+                "UPDATE submissions "
+                "SET touch=?, category=?, client_unit=?, updated_at=? "
+                "WHERE id=?",
+                (
+                    str(latest_row["touch"] or "").strip(),
+                    str(latest_row["category"] or "").strip(),
+                    int(max(0, safe_int(latest_row["client_unit"], 0))),
+                    latest_stamp,
+                    keep_id,
+                ),
+            )
+
+            duplicate_ids = [int(row["id"]) for row in rows[1:]]
+            placeholders = ",".join("?" for _ in duplicate_ids)
+            cursor.execute(
+                f"UPDATE parts SET source_submission_id=? WHERE source_submission_id IN ({placeholders})",
+                (keep_id, *duplicate_ids),
+            )
+            cursor.execute(f"DELETE FROM submissions WHERE id IN ({placeholders})", tuple(duplicate_ids))
+            merged_groups += 1
+            removed_rows += len(duplicate_ids)
+
+        _runtime_log_event(
+            "depot.db.submissions_same_day_duplicates_collapsed",
+            severity="info",
+            summary="Collapsed historical duplicate same-day submissions to the newest payload per user/work-order/day.",
+            context={
+                "db_path": str(db.db_path),
+                "merged_groups": int(merged_groups),
+                "removed_rows": int(removed_rows),
+            },
+        )
+
+    @staticmethod
+    def run_backfills(db: DepotDB) -> None:
+        with db.write_transaction("schema.backfill"):
+            cursor = db.conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    UPDATE parts
+                    SET source_submission_id=COALESCE((
+                        SELECT s.id
+                        FROM submissions s
+                        WHERE s.work_order=parts.work_order AND s.touch=?
+                        ORDER BY COALESCE(NULLIF(TRIM(s.updated_at), ''), s.created_at) DESC, s.id DESC
+                        LIMIT 1
+                    ), 0)
+                    WHERE COALESCE(source_submission_id, 0)=0
+                    """,
+                    (DepotRules.TOUCH_PART_ORDER,),
+                )
+                cursor.execute("UPDATE parts SET source_submission_id=0 WHERE source_submission_id IS NULL")
+                cursor.execute(
+                    """
+                    UPDATE parts
+                    SET assigned_user_id=COALESCE((
+                        SELECT COALESCE(s.user_id, '')
+                        FROM submissions s
+                        WHERE s.id=parts.source_submission_id
+                        LIMIT 1
+                    ), '')
+                    WHERE TRIM(COALESCE(assigned_user_id, ''))=''
+                      AND COALESCE(source_submission_id, 0)<>0
+                    """
+                )
+                cursor.execute(
+                    "UPDATE parts SET qa_comment=COALESCE(comments, '') "
+                    "WHERE (qa_comment IS NULL OR qa_comment='') AND comments IS NOT NULL AND TRIM(comments) <> ''"
+                )
+                cursor.execute("UPDATE parts SET missing_part_order_followup=0 WHERE missing_part_order_followup IS NULL")
+                cursor.execute("UPDATE parts SET missing_part_order_logged_at='' WHERE missing_part_order_logged_at IS NULL")
+                cursor.execute("UPDATE parts SET missing_part_order_logged_by='' WHERE missing_part_order_logged_by IS NULL")
+                cursor.execute("UPDATE parts SET missing_part_order_resolved_at='' WHERE missing_part_order_resolved_at IS NULL")
+                cursor.execute("UPDATE parts SET missing_part_order_resolved_by='' WHERE missing_part_order_resolved_by IS NULL")
+                cursor.execute("UPDATE parts SET qa_comment='' WHERE qa_comment IS NULL")
+                cursor.execute("UPDATE parts SET agent_comment='' WHERE agent_comment IS NULL")
+                unresolved_source_row = cursor.execute(
+                    "SELECT COUNT(*) AS c FROM parts WHERE COALESCE(source_submission_id, 0)=0"
+                ).fetchone()
+                unresolved_source_count = int(unresolved_source_row["c"] if unresolved_source_row is not None else 0)
+                if unresolved_source_count > 0:
+                    _runtime_log_event(
+                        "depot.db.parts_source_submission_backfill_incomplete",
+                        severity="warning",
+                        summary="Parts migration could not link every row to a Part Order submission; leaving unresolved rows usable.",
+                        context={"db_path": str(db.db_path), "unresolved_source_submission_count": unresolved_source_count},
+                    )
+            except Exception as exc:
+                context = {"db_path": str(db.db_path)}
+                _runtime_log_event(
+                    "depot.db.backfill_migration_failed",
+                    severity="critical",
+                    summary="DB schema backfill failed while creating or upgrading tables.",
+                    exc=exc,
+                    context=context,
+                )
+                _escalate_runtime_issue_once(
+                    "depot.db.backfill_migration_failed",
+                    "Flowgrid database migration encountered an error. Some historical fields may be incomplete.",
+                    details=f"{type(exc).__name__}: {exc}",
+                    context=context,
+                )
+
+
+class DepotRules:
+    TOUCH_RTV = "RTV"
+    TOUCH_COMPLETE = "Complete"
+    TOUCH_JUNK = "Junk Out"
+    TOUCH_PART_ORDER = "Part Order"
+    TOUCH_OTHER = "Other"
+    CLOSING_TOUCHES: tuple[str, ...] = (
+        TOUCH_COMPLETE,
+        TOUCH_JUNK,
+        TOUCH_RTV,
+    )
+    AGENT_TIER_LABELS: dict[int, str] = {
+        1: "Tech 1",
+        2: "Tech 2",
+        3: "Tech 3",
+        4: "MP",
+    }
+    TOUCH_CHART_LABELS: dict[str, str] = {
+        TOUCH_COMPLETE: "Com.",
+        TOUCH_PART_ORDER: "PO",
+        TOUCH_JUNK: "JO",
+        "Triaged": "Tri",
+    }
+    CLIENT_FOLLOWUP_WORK_APPROVED = "Work approved"
+    CLIENT_FOLLOWUP_LEFT_MESSAGE = "Left message"
+    CLIENT_FOLLOWUP_COULDNT_CONTACT = "Couldn't contact"
+    CLIENT_FOLLOWUP_ACTIONS: tuple[str, ...] = (
+        CLIENT_FOLLOWUP_WORK_APPROVED,
+        CLIENT_FOLLOWUP_LEFT_MESSAGE,
+        CLIENT_FOLLOWUP_COULDNT_CONTACT,
+    )
+    CLIENT_FOLLOWUP_NO_CONTACT_ACTIONS: tuple[str, ...] = (
+        CLIENT_FOLLOWUP_LEFT_MESSAGE,
+        CLIENT_FOLLOWUP_COULDNT_CONTACT,
+    )
+    CATEGORY_OPTIONS: tuple[str, ...] = (
+        "Appliance",
+        "Audio",
+        "PC",
+        "TV",
+        "Other",
+    )
+    CLIENT_FOLLOWUP_STAGE_LABELS: tuple[str, ...] = ("Day 1", "Day 2", "Day 3")
+
+    @staticmethod
+    def normalize_user_id(value: str) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def normalize_work_order(value: str) -> str:
+        return str(value or "").strip().upper()
+
+    @staticmethod
+    def chart_touch_label(value: str) -> str:
+        touch = str(value or "").strip()
+        if not touch:
+            return ""
+        return DepotRules.TOUCH_CHART_LABELS.get(touch, touch)
+
+    @staticmethod
+    def normalize_followup_action(value: str) -> str:
+        text = str(value or "").strip().lower()
+        if not text:
+            return ""
+        canonical = {
+            "work approved": DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED,
+            "approved": DepotRules.CLIENT_FOLLOWUP_WORK_APPROVED,
+            "left message": DepotRules.CLIENT_FOLLOWUP_LEFT_MESSAGE,
+            "message left": DepotRules.CLIENT_FOLLOWUP_LEFT_MESSAGE,
+            "couldn't contact": DepotRules.CLIENT_FOLLOWUP_COULDNT_CONTACT,
+            "couldnt contact": DepotRules.CLIENT_FOLLOWUP_COULDNT_CONTACT,
+            "no contact": DepotRules.CLIENT_FOLLOWUP_COULDNT_CONTACT,
+        }
+        return canonical.get(text, "")
+
+    @staticmethod
+    def followup_stage_label(stage_index: int) -> str:
+        idx = int(clamp(int(stage_index), 0, len(DepotRules.CLIENT_FOLLOWUP_STAGE_LABELS) - 1))
+        return DepotRules.CLIENT_FOLLOWUP_STAGE_LABELS[idx]
+
+    @staticmethod
+    def normalize_agent_tier(value: Any, default: int = 1) -> int:
+        raw = value
+        if isinstance(raw, str):
+            text = raw.strip().upper()
+            if text in {"MP", "TECH MP"}:
+                return 4
+            if text.startswith("TECH "):
+                text = text[5:].strip()
+            elif text.startswith("TIER "):
+                text = text[5:].strip()
+            raw = text
+        try:
+            numeric = int(raw)
+        except Exception:
+            numeric = int(default)
+        return int(clamp(numeric, 1, 4))
+
+    @staticmethod
+    def agent_tier_label(value: Any) -> str:
+        tier = DepotRules.normalize_agent_tier(value)
+        return DepotRules.AGENT_TIER_LABELS.get(tier, f"Tech {tier}")
+
+
+# ---------------------------- Depot Tracker UI Layer ----------------------------
+
+class DepotTracker:
+    DASHBOARD_NOTE_TARGET_SPECS: dict[str, dict[str, Any]] = {
+        "parts.qa_comment": {
+            "label": "Parts - QA Note",
+            "table": "parts",
+            "column": "qa_comment",
+            "order_by": "created_at DESC, id DESC",
+            "sync_comments_with_column": True,
+        },
+        "parts.agent_comment": {
+            "label": "Parts - Agent Note",
+            "table": "parts",
+            "column": "agent_comment",
+            "order_by": "created_at DESC, id DESC",
+            "sync_comments_with_column": False,
+        },
+        "client_parts.comments": {
+            "label": "Client Parts - Comment",
+            "table": "client_parts",
+            "column": "comments",
+            "order_by": "created_at DESC, id DESC",
+            "sync_comments_with_column": False,
+        },
+        "rtvs.comments": {
+            "label": "RTVs - Comment",
+            "table": "rtvs",
+            "column": "comments",
+            "order_by": "created_at DESC, id DESC",
+            "sync_comments_with_column": False,
+        },
+        "client_jo.comments": {
+            "label": "Client JO - Comment",
+            "table": "client_jo",
+            "column": "comments",
+            "order_by": "created_at DESC, id DESC",
+            "sync_comments_with_column": False,
+        },
+    }
+
+    def __init__(self, db: DepotDB):
+        self.db = db
+        self.user_repository: UserRepository | None = None
+        self.permission_service: PermissionService | None = None
+        self._ensure_default_qa_flags()
+        self._repair_closed_workorder_queues()
+
+    def _repair_closed_workorder_queues(self) -> None:
+        try:
+            close_statuses = (
+                DepotRules.TOUCH_COMPLETE,
+                DepotRules.TOUCH_JUNK,
+                DepotRules.TOUCH_RTV,
+            )
+            # Do not auto-close active parts on startup based only on latest submission touch.
+            # Reason: teams frequently reuse work-order IDs in testing/iteration cycles; applying
+            # a historical "Complete/Junk Out/RTV" touch during app startup can incorrectly
+            # deactivate newly queued QA parts and make lists appear empty after restart.
+            #
+            # Active-part closure remains enforced at submit time in submit_work().
+            self.db.execute(
+                "DELETE FROM client_parts "
+                "WHERE COALESCE(("
+                "SELECT s.touch FROM submissions s WHERE s.work_order=client_parts.work_order "
+                f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
+                "), '') IN (?, ?, ?)",
+                close_statuses,
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.closed_queue_repair_failed",
+                severity="warning",
+                summary="Failed repairing closed work orders in active queues during startup.",
+                exc=exc,
+            )
+
+    def dashboard_category_options(self) -> list[str]:
+        rows = self.db.fetchall(
+            "SELECT category FROM ("
+            "SELECT TRIM(COALESCE(category, '')) AS category FROM submissions "
+            "WHERE TRIM(COALESCE(category, '')) <> '' "
+            "UNION "
+            "SELECT TRIM(COALESCE(category, '')) AS category FROM parts "
+            "WHERE TRIM(COALESCE(category, '')) <> ''"
+            ") ORDER BY category COLLATE NOCASE ASC"
+        )
+        categories: list[str] = list(DepotRules.CATEGORY_OPTIONS)
+        seen = {str(category).strip().casefold() for category in categories if str(category).strip()}
+        for row in rows:
+            category_text = str(row["category"] or "").strip()
+            if not category_text:
+                continue
+            key = category_text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            categories.append(category_text)
+        return categories
+
+    def dashboard_note_target_options(self) -> list[tuple[str, str]]:
+        return [
+            (key, str(spec.get("label", key)))
+            for key, spec in self.DASHBOARD_NOTE_TARGET_SPECS.items()
+        ]
+
+    def _dashboard_note_target_spec(self, target_key: str) -> dict[str, Any]:
+        normalized_key = str(target_key or "").strip()
+        spec = self.DASHBOARD_NOTE_TARGET_SPECS.get(normalized_key)
+        if spec is None:
+            raise ValueError("Invalid dashboard note target.")
+        return spec
+
+    def _dashboard_resolved_category_expr(self, work_order_expr: str) -> str:
+        return (
+            "COALESCE("
+            "NULLIF(TRIM(("
+            "SELECT ds.category FROM submissions ds "
+            f"WHERE ds.work_order={work_order_expr} AND TRIM(COALESCE(ds.category, '')) <> '' "
+            f"ORDER BY {_submission_latest_ts_sql('ds')} DESC, ds.id DESC LIMIT 1"
+            ")), ''), "
+            "NULLIF(TRIM(("
+            "SELECT dp.category FROM parts dp "
+            f"WHERE dp.work_order={work_order_expr} AND TRIM(COALESCE(dp.category, '')) <> '' "
+            "ORDER BY dp.is_active DESC, dp.created_at DESC, dp.id DESC LIMIT 1"
+            ")), ''), "
+            "''"
+            ")"
+        )
+
+    def _dashboard_parts_category_expr(self, work_order_expr: str, category_expr: str) -> str:
+        return (
+            "COALESCE("
+            f"NULLIF(TRIM(COALESCE({category_expr}, '')), ''), "
+            f"{self._dashboard_resolved_category_expr(work_order_expr)}"
+            ")"
+        )
+
+    @staticmethod
+    def _append_dashboard_category_filter(
+        where_parts: list[str],
+        params: list[Any],
+        category_filter: str | None,
+        category_expr: str,
+    ) -> None:
+        normalized_category = str(category_filter or "").strip()
+        if not normalized_category:
+            return
+        where_parts.append(f"UPPER(TRIM(COALESCE({category_expr}, ''))) = ?")
+        params.append(normalized_category.upper())
+
+    def fetch_dashboard_table_rows(
+        self,
+        table_name: str,
+        *,
+        limit: int = 300,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_id: str | None = None,
+        category_filter: str | None = None,
+    ) -> list[sqlite3.Row]:
+        normalized_table = str(table_name or "").strip()
+        allowed_tables = {name for name, _label in TRACKER_DASHBOARD_TABLES}
+        if normalized_table not in allowed_tables:
+            raise ValueError("Invalid dashboard table selection.")
+
+        max_rows = int(clamp(safe_int(limit, 300), 1, 5000))
+        params: list[Any] = []
+
+        if normalized_table == "submissions":
+            where_parts: list[str] = []
+            entry_date_expr = _submission_entry_date_sql("s0")
+            if start_date:
+                where_parts.append(f"{entry_date_expr} >= ?")
+                params.append(str(start_date))
+            if end_date:
+                where_parts.append(f"{entry_date_expr} <= ?")
+                params.append(str(end_date))
+            normalized_user = DepotRules.normalize_user_id(user_id or "")
+            if normalized_user:
+                where_parts.append("s0.user_id = ?")
+                params.append(normalized_user)
+            self._append_dashboard_category_filter(
+                where_parts,
+                params,
+                category_filter,
+                self._dashboard_resolved_category_expr("s0.work_order"),
+            )
+            where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            query = (
+                "SELECT s0.id, s0.created_at, s0.user_id, s0.work_order, s0.touch, s0.client_unit, s0.entry_date, "
+                "CASE "
+                "WHEN s0.touch='Part Order' THEN "
+                "SUM(CASE WHEN s0.touch='Part Order' THEN 1 ELSE 0 END) OVER ("
+                f"PARTITION BY s0.user_id, s0.work_order ORDER BY {_submission_latest_ts_sql('s0')}, s0.id "
+                "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW"
+                ") "
+                "ELSE 0 "
+                "END AS part_order_count "
+                f"FROM submissions s0{where_clause} ORDER BY {_submission_latest_ts_sql('s0')} DESC, s0.id DESC LIMIT ?"
+            )
+            params.append(max_rows)
+            return self.db.fetchall(query, tuple(params))
+
+        where_parts = []
+        if normalized_table == "parts":
+            category_expr = self._dashboard_parts_category_expr("t.work_order", "t.category")
+        else:
+            category_expr = self._dashboard_resolved_category_expr("t.work_order")
+        self._append_dashboard_category_filter(where_parts, params, category_filter, category_expr)
+        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        order_clause = " ORDER BY created_at DESC"
+        query = f"SELECT t.* FROM {normalized_table} t{where_clause}{order_clause} LIMIT ?"
+        params.append(max_rows)
+        return self.db.fetchall(query, tuple(params))
+
+    def fetch_dashboard_note_rows(
+        self,
+        target_key: str,
+        *,
+        limit: int = 200,
+        work_order_filter: str | None = None,
+        category_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        spec = self._dashboard_note_target_spec(target_key)
+        table_name = str(spec.get("table", "")).strip()
+        column_name = str(spec.get("column", "")).strip()
+        order_by = str(spec.get("order_by", "id DESC")).strip() or "id DESC"
+        if not table_name or not column_name:
+            raise ValueError("Dashboard note target configuration is incomplete.")
+
+        where_parts: list[str] = []
+        params: list[Any] = []
+        normalized_work_order = DepotRules.normalize_work_order(str(work_order_filter or ""))
+        if normalized_work_order:
+            where_parts.append("UPPER(COALESCE(t.work_order, '')) LIKE ?")
+            params.append(f"%{normalized_work_order}%")
+        if table_name == "parts":
+            category_expr = self._dashboard_parts_category_expr("t.work_order", "t.category")
+        else:
+            category_expr = self._dashboard_resolved_category_expr("t.work_order")
+        self._append_dashboard_category_filter(where_parts, params, category_filter, category_expr)
+        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+        max_rows = int(clamp(safe_int(limit, 200), 1, 5000))
+        query = (
+            "SELECT t.id, COALESCE(t.created_at, '') AS created_at, COALESCE(t.user_id, '') AS user_id, "
+            "COALESCE(t.work_order, '') AS work_order, COALESCE("
+            f"{column_name}, '') AS note_text "
+            f"FROM {table_name} t{where_clause} ORDER BY {order_by} LIMIT ?"
+        )
+        params.append(max_rows)
+        rows = self.db.fetchall(query, tuple(params))
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": int(max(0, safe_int(row["id"], 0))),
+                    "created_at": str(row["created_at"] or "").strip(),
+                    "user_id": str(row["user_id"] or "").strip(),
+                    "work_order": str(row["work_order"] or "").strip(),
+                    "note_text": str(row["note_text"] or "").strip(),
+                }
+            )
+        return result
+
+    def update_dashboard_note_value(self, target_key: str, row_id: int, note_text: str) -> None:
+        spec = self._dashboard_note_target_spec(target_key)
+        table_name = str(spec.get("table", "")).strip()
+        column_name = str(spec.get("column", "")).strip()
+        if not table_name or not column_name:
+            raise ValueError("Dashboard note target configuration is incomplete.")
+
+        normalized_row_id = int(row_id)
+        existing = self.db.fetchone(f"SELECT id FROM {table_name} WHERE id=? LIMIT 1", (normalized_row_id,))
+        if existing is None:
+            raise ValueError("Selected row no longer exists.")
+
+        normalized_note = str(note_text or "").strip()
+        if bool(spec.get("sync_comments_with_column", False)) and column_name != "comments":
+            self.db.execute(
+                f"UPDATE {table_name} SET {column_name}=?, comments=? WHERE id=?",
+                (normalized_note, normalized_note, normalized_row_id),
+            )
+            return
+        self.db.execute(
+            f"UPDATE {table_name} SET {column_name}=? WHERE id=?",
+            (normalized_note, normalized_row_id),
+        )
+
+    def get_admin_access_level(self, user_id: str) -> str:
+        snapshot = self._user_repository_or_fallback().get_role_snapshot(user_id)
+        if not snapshot.user_id:
+            return DepotRules.ADMIN_ACCESS_NONE
+        return DepotRules.normalize_admin_access_level(
+            snapshot.access_level,
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+
+    def _user_repository_or_fallback(self) -> UserRepository:
+        repository = self.user_repository
+        if repository is not None:
+            return repository
+        return UserRepository(self, DepotRules)
+
+    def is_admin_user(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().is_admin_user(user_id))
+
+    def can_open_agent_window(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().can_open_agent_window(user_id))
+
+    def can_open_qa_window(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().get_role_snapshot(user_id).can_open_qa_window)
+
+    def can_access_hidden_tabs(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().can_access_hidden_tabs(user_id))
+
+    def can_access_dashboard(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().can_access_dashboard(user_id))
+
+    def get_agent_tier(self, user_id: str, default: int = 1) -> int:
+        repository = self._user_repository_or_fallback()
+        return int(repository.get_agent_tier(user_id, default=default))
+
+    def can_access_missing_po_followups(self, user_id: str) -> bool:
+        return bool(self._user_repository_or_fallback().can_access_missing_po_followups(user_id))
+
+    def _asset_subdir(self, folder_name: str) -> Path:
+        folder = str(folder_name or "").strip()
+        if not folder:
+            return self.db.db_path.parent / ASSETS_DIR_NAME
+        path = self.db.db_path.parent / ASSETS_DIR_NAME / folder
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _resolve_stored_asset_path(self, stored_path: str, folder_name: str, *, allow_external_absolute: bool = False) -> Path | None:
+        raw = str(stored_path or "").strip()
+        if not raw:
+            return None
+        data_root = self.db.db_path.parent
+        folder = str(folder_name or "").strip()
+        asset_dir = self._asset_subdir(folder)
+        raw_norm = raw.replace("\\", "/").lstrip("./")
+        path_obj = Path(raw_norm)
+
+        candidates: list[Path] = []
+        if path_obj.is_absolute():
+            resolved_abs = path_obj.resolve()
+            if allow_external_absolute:
+                candidates.append(resolved_abs)
+            else:
+                try:
+                    candidates.append(data_root / resolved_abs.relative_to(data_root))
+                except Exception:
+                    pass
+            candidates.append(asset_dir / path_obj.name)
+        else:
+            candidates.append(data_root / path_obj)
+            candidates.append(asset_dir / path_obj.name)
+            parts = [p for p in path_obj.parts if p]
+            if parts:
+                if parts[0].lower() == folder.lower():
+                    tail = Path(*parts[1:]) if len(parts) > 1 else Path(path_obj.name)
+                    candidates.append(asset_dir / tail)
+                elif parts[0].lower() == ASSETS_DIR_NAME.lower() and len(parts) > 1 and parts[1].lower() == folder.lower():
+                    tail = Path(*parts[2:]) if len(parts) > 2 else Path(path_obj.name)
+                    candidates.append(asset_dir / tail)
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = str(candidate).replace("\\", "/").lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if candidate.exists() and candidate.is_file():
+                return candidate
+        return None
+
+    def _admin_icons_dir(self) -> Path:
+        return self._asset_subdir(ASSET_ADMIN_ICON_DIR_NAME)
+
+    def _stored_admin_icon_to_abs_path(self, stored_path: str) -> Path | None:
+        return self._resolve_stored_asset_path(stored_path, ASSET_ADMIN_ICON_DIR_NAME)
+
+    def _find_icon_for_admin_user(self, user_id: str) -> Path | None:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return None
+        icon_dir = self._admin_icons_dir()
+        candidates = [p for p in icon_dir.glob(f"{normalized}.*") if p.is_file()]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.suffix.lower())
+        return candidates[0]
+
+    def _relative_admin_icon_store_path(self, abs_path: Path) -> str:
+        try:
+            rel = abs_path.relative_to(self.db.db_path.parent)
+            return str(rel).replace("\\", "/")
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                _runtime_log_event(
+                    "depot.admin_icon_relative_path_failed",
+                    severity="warning",
+                    summary="Failed converting admin icon path to relative path; storing absolute path.",
+                    exc=exc,
+                    context={"abs_path": str(abs_path), "data_root": str(self.db.db_path.parent)},
+                )
+            return str(abs_path)
+
+    def _store_admin_icon(self, user_id: str, icon_path: str, existing_stored_path: str = "") -> str:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return ""
+        requested = str(icon_path or "").strip()
+        icon_dir = self._admin_icons_dir()
+
+        if not requested:
+            for existing in icon_dir.glob(f"{normalized}.*"):
+                try:
+                    if existing.is_file():
+                        existing.unlink()
+                except Exception as exc:
+                    _runtime_log_event(
+                        "depot.admin_icon_cleanup_failed",
+                        severity="warning",
+                        summary="Failed deleting existing admin icon during clear operation.",
+                        exc=exc,
+                        context={"user_id": normalized, "path": str(existing)},
+                    )
+            return ""
+
+        source = Path(requested)
+        if not source.is_absolute():
+            source = (self.db.db_path.parent / source).resolve()
+        if not source.exists() or not source.is_file():
+            existing_abs = self._stored_admin_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_admin_icon_store_path(existing_abs)
+            fallback = self._find_icon_for_admin_user(normalized)
+            return self._relative_admin_icon_store_path(fallback) if fallback is not None else ""
+
+        suffix = source.suffix.lower() or ".img"
+        target = icon_dir / f"{normalized}{suffix}"
+        for existing in icon_dir.glob(f"{normalized}.*"):
+            if existing.resolve() == target.resolve():
+                continue
+            try:
+                if existing.is_file():
+                    existing.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.admin_icon_replace_cleanup_failed",
+                    severity="warning",
+                    summary="Failed deleting stale admin icon during replacement.",
+                    exc=exc,
+                    context={"user_id": normalized, "path": str(existing), "target_path": str(target)},
+                )
+        try:
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+            elif not target.exists():
+                shutil.copy2(source, target)
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.admin_icon_copy_failed",
+                severity="warning",
+                summary="Failed copying admin icon; keeping previous icon path when possible.",
+                exc=exc,
+                context={"user_id": normalized, "source_path": str(source), "target_path": str(target)},
+            )
+            existing_abs = self._stored_admin_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_admin_icon_store_path(existing_abs)
+            return ""
+        return self._relative_admin_icon_store_path(target)
+
+    def list_role_definitions(self) -> list[dict[str, Any]]:
+        rows = self.db.fetchall(
+            "SELECT role_name, role_slot, sort_order FROM role_definitions "
+            "ORDER BY sort_order ASC, role_name COLLATE NOCASE ASC"
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            role_name = str(row["role_name"] or "").strip()
+            if not role_name:
+                continue
+            result.append(
+                {
+                    "role_name": role_name,
+                    "role_slot": DepotRules.normalize_role_slot(
+                        row["role_slot"],
+                        default=DepotRules.ROLE_SLOT_NONE,
+                    ),
+                    "sort_order": int(row["sort_order"] or 0),
+                }
+            )
+        return result
+
+    def _role_definition_maps(self) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        by_name: dict[str, dict[str, Any]] = {}
+        preferred_by_slot: dict[str, dict[str, Any]] = {}
+        for row in self.list_role_definitions():
+            role_name = str(row.get("role_name", "") or "").strip()
+            role_slot = DepotRules.normalize_role_slot(
+                row.get("role_slot", ""),
+                default=DepotRules.ROLE_SLOT_NONE,
+            )
+            if not role_name:
+                continue
+            entry = {
+                "role_name": role_name,
+                "role_slot": role_slot,
+                "sort_order": int(row.get("sort_order", 0) or 0),
+            }
+            by_name[role_name.casefold()] = entry
+            preferred_by_slot.setdefault(role_slot, entry)
+        return by_name, preferred_by_slot
+
+    def _resolve_role_assignment(self, stored_role_name: str, tech_tier: int) -> tuple[str, str]:
+        normalized_role_name = str(stored_role_name or "").strip()
+        by_name, preferred_by_slot = self._role_definition_maps()
+        if normalized_role_name:
+            matched = by_name.get(normalized_role_name.casefold())
+            if matched is not None:
+                return str(matched.get("role_name", "") or ""), str(matched.get("role_slot", "") or "")
+        if int(tech_tier) > 0:
+            role_slot = DepotRules.role_slot_from_agent_tier(tech_tier, default=DepotRules.ROLE_SLOT_NONE)
+            fallback = preferred_by_slot.get(role_slot)
+            if fallback is not None:
+                return str(fallback.get("role_name", "") or ""), str(fallback.get("role_slot", "") or "")
+        return "", DepotRules.ROLE_SLOT_NONE
+
+    def list_admin_users(self) -> list[dict[str, Any]]:
+        if self.user_repository is not None:
+            return self.user_repository.list_admin_users()
+        rows = self.db.fetchall(
+            "SELECT user_id, admin_name, position, location, icon_path, COALESCE(access_level, '') AS access_level "
+            "FROM admin_users ORDER BY user_id ASC"
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            user_id = DepotRules.normalize_user_id(str(row["user_id"] or ""))
+            stored_icon = str(row["icon_path"] or "").strip()
+            abs_icon = self._stored_admin_icon_to_abs_path(stored_icon)
+            if abs_icon is None:
+                fallback = self._find_icon_for_admin_user(user_id)
+                if fallback is not None:
+                    fallback_stored = self._relative_admin_icon_store_path(fallback)
+                    if fallback_stored != stored_icon:
+                        self.db.execute("UPDATE admin_users SET icon_path=? WHERE user_id=?", (fallback_stored, user_id))
+                    abs_icon = fallback
+            out.append(
+                {
+                    "user_id": user_id,
+                    "admin_name": str(row["admin_name"] or "").strip(),
+                    "position": str(row["position"] or "").strip(),
+                    "role_name": str(row["position"] or "").strip(),
+                    "location": str(row["location"] or "").strip(),
+                    "access_level": DepotRules.normalize_admin_access_level(
+                        row["access_level"],
+                        default=DepotRules.ADMIN_ACCESS_NONE,
+                    ),
+                    "icon_path": str(abs_icon) if abs_icon is not None else "",
+                }
+            )
+        return out
+
+    def add_admin_user(
+        self,
+        user_id: str,
+        admin_name: str = "",
+        position: str = "",
+        location: str = "",
+        icon_path: str = "",
+        *,
+        access_level: str = "admin",
+    ) -> str:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return ""
+        normalized_name = str(admin_name or "").strip()
+        normalized_position = str(position or "").strip()
+        normalized_location = str(location or "").strip()
+        normalized_icon = str(icon_path or "").strip()
+        raw_access_level = str(access_level or "").strip()
+        normalized_access_level = DepotRules.normalize_admin_access_level(
+            access_level,
+            default=DepotRules.ADMIN_ACCESS_NONE if not raw_access_level else DepotRules.ADMIN_ACCESS_ADMIN,
+        )
+
+        existing = self.db.fetchone("SELECT icon_path FROM admin_users WHERE user_id=?", (normalized,))
+        existing_stored = str(existing["icon_path"] or "").strip() if existing is not None else ""
+        stored_icon = self._store_admin_icon(normalized, normalized_icon, existing_stored)
+
+        self.db.execute(
+            "INSERT INTO admin_users (user_id, admin_name, position, location, icon_path, access_level) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "admin_name=excluded.admin_name, position=excluded.position, location=excluded.location, "
+            "icon_path=excluded.icon_path, access_level=excluded.access_level",
+            (
+                normalized,
+                normalized_name,
+                normalized_position,
+                normalized_location,
+                stored_icon,
+                normalized_access_level,
+            ),
+        )
+        return stored_icon
+
+    def upsert_role_definition(
+        self,
+        role_name: str,
+        role_slot: str,
+        original_role_name: str = "",
+    ) -> dict[str, Any]:
+        normalized_name = str(role_name or "").strip()
+        if not normalized_name:
+            raise ValueError("Role name is required.")
+        normalized_slot = DepotRules.normalize_role_slot(
+            role_slot,
+            default=DepotRules.ROLE_SLOT_NONE,
+        )
+        original_name = str(original_role_name or "").strip()
+        lookup_name = original_name or normalized_name
+        existing_row = self.db.fetchone(
+            "SELECT id, role_name, sort_order FROM role_definitions WHERE LOWER(TRIM(role_name))=LOWER(TRIM(?)) LIMIT 1",
+            (lookup_name,),
+        )
+        conflicting_row = self.db.fetchone(
+            "SELECT id, role_name, sort_order FROM role_definitions WHERE LOWER(TRIM(role_name))=LOWER(TRIM(?)) LIMIT 1",
+            (normalized_name,),
+        )
+        if existing_row is not None and conflicting_row is not None and int(existing_row["id"] or 0) != int(conflicting_row["id"] or 0):
+            raise ValueError("A role with that name already exists.")
+
+        if existing_row is None and conflicting_row is not None:
+            existing_row = conflicting_row
+
+        if existing_row is None:
+            row = self.db.fetchone("SELECT COALESCE(MAX(sort_order), 0) AS max_sort FROM role_definitions")
+            sort_order = int(row["max_sort"] or 0) + 1 if row is not None else 1
+            self.db.execute(
+                "INSERT INTO role_definitions (role_name, role_slot, sort_order) VALUES (?, ?, ?)",
+                (normalized_name, normalized_slot, int(sort_order)),
+            )
+        else:
+            sort_order = int(existing_row["sort_order"] or 0)
+            self.db.execute(
+                "UPDATE role_definitions SET role_name=?, role_slot=? WHERE id=?",
+                (normalized_name, normalized_slot, int(existing_row["id"] or 0)),
+            )
+
+        assigned_rows = self.db.fetchall(
+            "SELECT user_id, admin_name, location, icon_path, COALESCE(access_level, '') AS access_level "
+            "FROM admin_users WHERE LOWER(TRIM(position))=LOWER(TRIM(?)) ORDER BY user_id ASC",
+            (lookup_name,),
+        )
+        for row in assigned_rows:
+            user_id = DepotRules.normalize_user_id(str(row["user_id"] or ""))
+            if not user_id:
+                continue
+            agent_row = self.db.fetchone(
+                "SELECT agent_name, location, icon_path FROM agents WHERE user_id=? LIMIT 1",
+                (user_id,),
+            )
+            stored_icon = str(row["icon_path"] or "").strip()
+            abs_icon = self._stored_admin_icon_to_abs_path(stored_icon)
+            if abs_icon is None:
+                stored_agent_icon = str(agent_row["icon_path"] or "").strip() if agent_row is not None else ""
+                abs_icon = self._stored_icon_to_abs_path(stored_agent_icon)
+            if abs_icon is None:
+                fallback = self._find_icon_for_admin_user(user_id)
+                if fallback is not None:
+                    abs_icon = fallback
+            if abs_icon is None:
+                fallback = self._find_icon_for_user(user_id)
+                if fallback is not None:
+                    abs_icon = fallback
+            self.upsert_setup_user(
+                user_id,
+                str(row["admin_name"] or "").strip()
+                or (str(agent_row["agent_name"] or "").strip() if agent_row is not None else "")
+                or user_id,
+                normalized_name,
+                str(row["location"] or "").strip()
+                or (str(agent_row["location"] or "").strip() if agent_row is not None else ""),
+                DepotRules.normalize_admin_access_level(
+                    row["access_level"],
+                    default=DepotRules.ADMIN_ACCESS_NONE,
+                ),
+                str(abs_icon) if abs_icon is not None else "",
+            )
+
+        return {
+            "role_name": normalized_name,
+            "role_slot": normalized_slot,
+            "sort_order": int(sort_order),
+        }
+
+    def delete_role_definition(self, role_name: str) -> None:
+        normalized_name = str(role_name or "").strip()
+        if not normalized_name:
+            return
+        assigned_row = self.db.fetchone(
+            "SELECT user_id FROM admin_users WHERE LOWER(TRIM(position))=LOWER(TRIM(?)) LIMIT 1",
+            (normalized_name,),
+        )
+        if assigned_row is not None:
+            raise ValueError("That role is assigned to one or more users.")
+        self.db.execute(
+            "DELETE FROM role_definitions WHERE LOWER(TRIM(role_name))=LOWER(TRIM(?))",
+            (normalized_name,),
+        )
+
+    def remove_admin_user(self, user_id: str) -> None:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return
+        self.db.execute("DELETE FROM admin_users WHERE user_id=?", (normalized,))
+        for existing in self._admin_icons_dir().glob(f"{normalized}.*"):
+            try:
+                if existing.is_file():
+                    existing.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.admin_icon_delete_failed",
+                    severity="warning",
+                    summary="Failed deleting admin icon file during admin deletion.",
+                    exc=exc,
+                    context={"user_id": normalized, "path": str(existing)},
+                )
+
+    def list_setup_users(self) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for row in self.list_agents():
+            user_id = DepotRules.normalize_user_id(str(row.get("user_id", "") or ""))
+            if not user_id:
+                continue
+            entry = merged.setdefault(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "name": "",
+                    "role_name": "",
+                    "role_slot": DepotRules.ROLE_SLOT_NONE,
+                    "location": "",
+                    "tech_tier": 0,
+                    "access_level": DepotRules.ADMIN_ACCESS_NONE,
+                    "icon_path": "",
+                    "agent_name": "",
+                    "admin_name": "",
+                    "agent_icon_path": "",
+                    "admin_icon_path": "",
+                    "stored_role_name": "",
+                },
+            )
+            entry["agent_name"] = str(row.get("agent_name", "") or "").strip()
+            entry["name"] = entry["agent_name"] or str(entry.get("name", "") or "").strip()
+            entry["location"] = str(row.get("location", "") or "").strip() or str(entry.get("location", "") or "").strip()
+            entry["tech_tier"] = int(DepotRules.normalize_agent_tier(row.get("tier", 1)))
+            entry["agent_icon_path"] = str(row.get("icon_path", "") or "").strip()
+            entry["icon_path"] = entry["agent_icon_path"] or str(entry.get("icon_path", "") or "").strip()
+
+        for row in self.list_admin_users():
+            user_id = DepotRules.normalize_user_id(str(row.get("user_id", "") or ""))
+            if not user_id:
+                continue
+            entry = merged.setdefault(
+                user_id,
+                {
+                    "user_id": user_id,
+                    "name": "",
+                    "role_name": "",
+                    "role_slot": DepotRules.ROLE_SLOT_NONE,
+                    "location": "",
+                    "tech_tier": 0,
+                    "access_level": DepotRules.ADMIN_ACCESS_NONE,
+                    "icon_path": "",
+                    "agent_name": "",
+                    "admin_name": "",
+                    "agent_icon_path": "",
+                    "admin_icon_path": "",
+                    "stored_role_name": "",
+                },
+            )
+            entry["admin_name"] = str(row.get("admin_name", "") or "").strip()
+            if not str(entry.get("name", "") or "").strip():
+                entry["name"] = entry["admin_name"]
+            entry["stored_role_name"] = str(row.get("role_name", "") or row.get("position", "") or "").strip()
+            if not str(entry.get("location", "") or "").strip():
+                entry["location"] = str(row.get("location", "") or "").strip()
+            entry["access_level"] = DepotRules.normalize_admin_access_level(
+                row.get("access_level", ""),
+                default=DepotRules.ADMIN_ACCESS_NONE,
+            )
+            entry["admin_icon_path"] = str(row.get("icon_path", "") or "").strip()
+            if not str(entry.get("icon_path", "") or "").strip():
+                entry["icon_path"] = entry["admin_icon_path"]
+
+        repository = self.user_repository
+        for user_id, entry in merged.items():
+            if repository is not None:
+                snapshot = repository.get_role_snapshot(user_id)
+                entry["role_name"] = str(snapshot.role_name or "")
+                entry["role_slot"] = str(snapshot.role_slot or DepotRules.ROLE_SLOT_NONE)
+                entry["tech_tier"] = int(snapshot.agent_tier)
+                entry["access_level"] = str(snapshot.access_level or "")
+            else:
+                role_name, role_slot = self._resolve_role_assignment(
+                    str(entry.get("stored_role_name", "") or ""),
+                    int(entry.get("tech_tier", 0) or 0),
+                )
+                entry["role_name"] = role_name
+                entry["role_slot"] = role_slot
+                entry["tech_tier"] = int(DepotRules.role_slot_to_agent_tier(role_slot, default=0))
+            entry["name"] = str(entry.get("name", "") or "").strip() or user_id
+
+        return sorted(
+            merged.values(),
+            key=lambda row: (
+                str(row.get("user_id", "") or "").strip().casefold(),
+            ),
+        )
+
+    def upsert_setup_user(
+        self,
+        user_id: str,
+        name: str,
+        role_name: str,
+        location: str,
+        access_level: str,
+        icon_path: str = "",
+    ) -> dict[str, Any]:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        normalized_name = str(name or "").strip()
+        normalized_role_name = str(role_name or "").strip()
+        normalized_location = str(location or "").strip()
+        normalized_icon = str(icon_path or "").strip()
+        normalized_access = DepotRules.normalize_admin_access_level(
+            access_level,
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+        role_row = self.db.fetchone(
+            "SELECT role_name, role_slot FROM role_definitions WHERE LOWER(TRIM(role_name))=LOWER(TRIM(?)) LIMIT 1",
+            (normalized_role_name,),
+        )
+        if role_row is None:
+            raise ValueError("Selected role is no longer configured.")
+        stored_role_name = str(role_row["role_name"] or "").strip()
+        normalized_role_slot = DepotRules.normalize_role_slot(
+            role_row["role_slot"],
+            default=DepotRules.ROLE_SLOT_NONE,
+        )
+        normalized_tier = int(DepotRules.role_slot_to_agent_tier(normalized_role_slot, default=0))
+
+        agent_icon = ""
+        admin_icon = self.add_admin_user(
+            normalized_user,
+            normalized_name or normalized_user,
+            stored_role_name,
+            normalized_location,
+            normalized_icon,
+            access_level=normalized_access,
+        )
+        if normalized_tier > 0:
+            agent_icon = self.upsert_agent(
+                normalized_user,
+                normalized_name or normalized_user,
+                normalized_tier,
+                normalized_icon,
+                normalized_location,
+            )
+        else:
+            self.delete_agent(normalized_user)
+        merged_icon = str(agent_icon or admin_icon or normalized_icon or "").strip()
+        return {
+            "user_id": normalized_user,
+            "name": normalized_name or normalized_user,
+            "role_name": stored_role_name,
+            "role_slot": normalized_role_slot,
+            "location": normalized_location,
+            "tech_tier": normalized_tier,
+            "access_level": normalized_access,
+            "icon_path": merged_icon,
+        }
+
+    def delete_setup_user(self, user_id: str) -> None:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        if not normalized_user:
+            return
+        self.remove_admin_user(normalized_user)
+        self.delete_agent(normalized_user)
+
+    @staticmethod
+    def _normalize_flag_name(value: str) -> str:
+        return str(value or "").strip()
+
+    @staticmethod
+    def _normalize_flag_severity(value: str) -> str:
+        raw = str(value or "").strip().title()
+        return raw if raw in QA_FLAG_SEVERITY_OPTIONS else "Medium"
+
+    def _qa_flag_icons_dir(self) -> Path:
+        return self._asset_subdir(ASSET_QA_FLAG_ICON_DIR_NAME)
+
+    def _stored_qa_flag_icon_to_abs_path(self, stored_path: str) -> Path | None:
+        return self._resolve_stored_asset_path(stored_path, ASSET_QA_FLAG_ICON_DIR_NAME)
+
+    def _find_icon_for_qa_flag_id(self, flag_id: int) -> Path | None:
+        icon_dir = self._qa_flag_icons_dir()
+        candidates = [p for p in icon_dir.glob(f"flag_{int(flag_id)}.*") if p.is_file()]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.suffix.lower())
+        return candidates[0]
+
+    def _relative_qa_flag_icon_store_path(self, abs_path: Path) -> str:
+        try:
+            rel = abs_path.relative_to(self.db.db_path.parent)
+            return str(rel).replace("\\", "/")
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                _runtime_log_event(
+                    "depot.qa_flag_relative_path_failed",
+                    severity="warning",
+                    summary="Failed to convert QA flag icon path to data-root-relative path; storing absolute path.",
+                    exc=exc,
+                    context={"abs_path": str(abs_path), "data_root": str(self.db.db_path.parent)},
+                )
+            return str(abs_path)
+
+    def _store_qa_flag_icon(self, flag_id: int, icon_path: str, existing_stored_path: str = "") -> str:
+        fid = int(flag_id)
+        requested = str(icon_path or "").strip()
+        icon_dir = self._qa_flag_icons_dir()
+
+        if not requested:
+            for existing in icon_dir.glob(f"flag_{fid}.*"):
+                try:
+                    if existing.is_file():
+                        existing.unlink()
+                except Exception as exc:
+                    _runtime_log_event(
+                        "depot.qa_flag_icon_cleanup_failed",
+                        severity="warning",
+                        summary="Failed deleting existing QA flag icon during clear operation.",
+                        exc=exc,
+                        context={"flag_id": fid, "path": str(existing)},
+                    )
+            return ""
+
+        source = Path(requested)
+        if not source.is_absolute():
+            source = (self.db.db_path.parent / source).resolve()
+        if not source.exists() or not source.is_file():
+            existing_abs = self._stored_qa_flag_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_qa_flag_icon_store_path(existing_abs)
+            fallback = self._find_icon_for_qa_flag_id(fid)
+            return self._relative_qa_flag_icon_store_path(fallback) if fallback is not None else ""
+
+        suffix = source.suffix.lower() or ".img"
+        target = icon_dir / f"flag_{fid}{suffix}"
+        for existing in icon_dir.glob(f"flag_{fid}.*"):
+            if existing.resolve() == target.resolve():
+                continue
+            try:
+                if existing.is_file():
+                    existing.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.qa_flag_icon_replace_cleanup_failed",
+                    severity="warning",
+                    summary="Failed deleting stale QA flag icon while replacing icon.",
+                    exc=exc,
+                    context={"flag_id": fid, "path": str(existing), "target_path": str(target)},
+                )
+        try:
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+            elif not target.exists():
+                shutil.copy2(source, target)
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.qa_flag_icon_copy_failed",
+                severity="warning",
+                summary="Failed to copy QA flag icon; keeping previous icon path when possible.",
+                exc=exc,
+                context={"flag_id": fid, "source_path": str(source), "target_path": str(target)},
+            )
+            existing_abs = self._stored_qa_flag_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_qa_flag_icon_store_path(existing_abs)
+            return ""
+        return self._relative_qa_flag_icon_store_path(target)
+
+    def _ensure_default_qa_flags(self) -> None:
+        row = self.db.fetchone("SELECT COUNT(*) AS c FROM qa_flags")
+        if row is not None and int(row["c"] or 0) > 0:
+            return
+        default_names = [name for name in QA_FLAG_OPTIONS if name and name.lower() != "none"]
+        for idx, name in enumerate(default_names, start=1):
+            severity = "High" if name in {"Escalation", "Safety"} else "Medium"
+            self.db.execute(
+                "INSERT OR IGNORE INTO qa_flags (flag_name, severity, icon_path, sort_order) VALUES (?, ?, '', ?)",
+                (name, severity, idx),
+            )
+
+    def list_qa_flags(self) -> list[dict[str, Any]]:
+        rows = self.db.fetchall(
+            "SELECT id, flag_name, severity, icon_path, sort_order "
+            "FROM qa_flags ORDER BY sort_order ASC, flag_name ASC"
+        )
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            flag_id = int(row["id"])
+            stored_icon = str(row["icon_path"] or "").strip()
+            abs_icon = self._stored_qa_flag_icon_to_abs_path(stored_icon)
+            if abs_icon is None:
+                fallback = self._find_icon_for_qa_flag_id(flag_id)
+                if fallback is not None:
+                    fallback_stored = self._relative_qa_flag_icon_store_path(fallback)
+                    if fallback_stored != stored_icon:
+                        self.db.execute("UPDATE qa_flags SET icon_path=? WHERE id=?", (fallback_stored, flag_id))
+                    abs_icon = fallback
+            out.append(
+                {
+                    "id": flag_id,
+                    "flag_name": str(row["flag_name"] or "").strip(),
+                    "severity": self._normalize_flag_severity(str(row["severity"] or "Medium")),
+                    "icon_path": str(abs_icon) if abs_icon is not None else "",
+                    "sort_order": int(row["sort_order"] or 0),
+                }
+            )
+        return out
+
+    def get_qa_flag_options(self, include_none: bool = True) -> list[str]:
+        flags = [row["flag_name"] for row in self.list_qa_flags() if row.get("flag_name")]
+        if include_none:
+            return ["None", *flags]
+        return flags
+
+    def resolve_qa_flag_icon(self, qa_flag: str, legacy_part_image_path: str = "") -> str:
+        flag_name = self._normalize_flag_name(qa_flag)
+        if flag_name:
+            row = self.db.fetchone(
+                "SELECT icon_path FROM qa_flags WHERE flag_name=? LIMIT 1",
+                (flag_name,),
+            )
+            if row is not None:
+                stored = str(row["icon_path"] or "").strip()
+                abs_icon = self._stored_qa_flag_icon_to_abs_path(stored)
+                if abs_icon is not None:
+                    return str(abs_icon)
+        # Backward compatibility for old per-unit icons
+        return self.resolve_part_flag_image_path(legacy_part_image_path)
+
+    def upsert_qa_flag(self, flag_name: str, severity: str, icon_path: str = "") -> int:
+        normalized_name = self._normalize_flag_name(flag_name)
+        normalized_severity = self._normalize_flag_severity(severity)
+        if not normalized_name:
+            return 0
+        with self.db.write_transaction("tracker.upsert_qa_flag"):
+            existing = self.db.fetchone(
+                "SELECT id, icon_path, sort_order FROM qa_flags WHERE flag_name=?",
+                (normalized_name,),
+            )
+            if existing is None:
+                order_row = self.db.fetchone("SELECT COALESCE(MAX(sort_order), 0) AS m FROM qa_flags")
+                next_order = int(order_row["m"] or 0) + 1 if order_row is not None else 1
+                cur = self.db.execute(
+                    "INSERT INTO qa_flags (flag_name, severity, icon_path, sort_order) VALUES (?, ?, '', ?)",
+                    (normalized_name, normalized_severity, next_order),
+                )
+                flag_id = int(cur.lastrowid or 0)
+                existing_stored = ""
+            else:
+                flag_id = int(existing["id"] or 0)
+                existing_stored = str(existing["icon_path"] or "").strip()
+                self.db.execute(
+                    "UPDATE qa_flags SET severity=? WHERE id=?",
+                    (normalized_severity, flag_id),
+                )
+            if flag_id <= 0:
+                return 0
+            stored_icon = self._store_qa_flag_icon(flag_id, icon_path, existing_stored)
+            self.db.execute(
+                "UPDATE qa_flags SET flag_name=?, severity=?, icon_path=? WHERE id=?",
+                (normalized_name, normalized_severity, stored_icon, flag_id),
+            )
+        return flag_id
+
+    def delete_qa_flag(self, flag_name: str) -> None:
+        normalized_name = self._normalize_flag_name(flag_name)
+        if not normalized_name:
+            return
+        row = self.db.fetchone("SELECT id FROM qa_flags WHERE flag_name=?", (normalized_name,))
+        if row is None:
+            return
+        flag_id = int(row["id"] or 0)
+        self.db.execute("DELETE FROM qa_flags WHERE id=?", (flag_id,))
+        if flag_id > 0:
+            icon_dir = self._qa_flag_icons_dir()
+            for existing in icon_dir.glob(f"flag_{flag_id}.*"):
+                try:
+                    if existing.is_file():
+                        existing.unlink()
+                except Exception as exc:
+                    _runtime_log_event(
+                        "depot.qa_flag_icon_delete_failed",
+                        severity="warning",
+                        summary="Failed deleting QA flag icon file during QA flag deletion.",
+                        exc=exc,
+                        context={"flag_id": flag_id, "path": str(existing)},
+                    )
+
+    def ensure_shared_editable_asset_dirs(self) -> None:
+        for folder in (ASSET_AGENT_ICON_DIR_NAME, ASSET_ADMIN_ICON_DIR_NAME, ASSET_QA_FLAG_ICON_DIR_NAME):
+            self._asset_subdir(folder)
+
+    def shared_editable_icon_snapshot(self) -> tuple[tuple[str, str, int, int], ...]:
+        self.ensure_shared_editable_asset_dirs()
+        snapshot: list[tuple[str, str, int, int]] = []
+        data_root = self.db.db_path.parent
+        for folder in (ASSET_AGENT_ICON_DIR_NAME, ASSET_ADMIN_ICON_DIR_NAME, ASSET_QA_FLAG_ICON_DIR_NAME):
+            folder_path = self._asset_subdir(folder)
+            try:
+                files = sorted((path for path in folder_path.iterdir() if path.is_file()), key=lambda item: item.name.lower())
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.editable_icon_snapshot_failed",
+                    severity="warning",
+                    summary="Failed scanning a shared editable icon folder during refresh.",
+                    exc=exc,
+                    context={"folder": folder, "folder_path": str(folder_path)},
+                )
+                continue
+            for path in files:
+                try:
+                    stat = path.stat()
+                    rel = str(path.relative_to(data_root)).replace("\\", "/")
+                    snapshot.append((folder, rel, int(stat.st_mtime_ns), int(stat.st_size)))
+                except Exception as exc:
+                    _runtime_log_event(
+                        "depot.editable_icon_file_snapshot_failed",
+                        severity="warning",
+                        summary="Failed reading a shared editable icon file state during refresh.",
+                        exc=exc,
+                        context={"folder": folder, "path": str(path)},
+                    )
+        snapshot.sort()
+        return tuple(snapshot)
+
+    def reconcile_shared_editable_icons(self) -> None:
+        self.ensure_shared_editable_asset_dirs()
+        try:
+            self.list_agents()
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.agent_icon_reconcile_failed",
+                severity="warning",
+                summary="Failed reconciling shared agent icons.",
+                exc=exc,
+            )
+        try:
+            self.list_admin_users()
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.admin_icon_reconcile_failed",
+                severity="warning",
+                summary="Failed reconciling shared admin icons.",
+                exc=exc,
+            )
+        try:
+            self.list_qa_flags()
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.qa_flag_icon_reconcile_failed",
+                severity="warning",
+                summary="Failed reconciling shared QA flag icons.",
+                exc=exc,
+            )
+
+    def _agent_icons_dir(self) -> Path:
+        return self._asset_subdir(ASSET_AGENT_ICON_DIR_NAME)
+
+    def _stored_icon_to_abs_path(self, stored_path: str) -> Path | None:
+        return self._resolve_stored_asset_path(stored_path, ASSET_AGENT_ICON_DIR_NAME)
+
+    def _find_icon_for_user(self, user_id: str) -> Path | None:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return None
+        icon_dir = self._agent_icons_dir()
+        candidates = [p for p in icon_dir.glob(f"{normalized}.*") if p.is_file()]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.suffix.lower())
+        return candidates[0]
+
+    def _relative_icon_store_path(self, abs_path: Path) -> str:
+        try:
+            rel = abs_path.relative_to(self.db.db_path.parent)
+            return str(rel).replace("\\", "/")
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                _runtime_log_event(
+                    "depot.agent_icon_relative_path_failed",
+                    severity="warning",
+                    summary="Failed to convert agent icon path to data-root-relative path; storing absolute path.",
+                    exc=exc,
+                    context={"abs_path": str(abs_path), "data_root": str(self.db.db_path.parent)},
+                )
+            return str(abs_path)
+
+    def _part_flag_images_dir(self) -> Path:
+        return self._asset_subdir(ASSET_PART_FLAG_IMAGE_DIR_NAME)
+
+    def _stored_part_flag_image_to_abs_path(self, stored_path: str) -> Path | None:
+        return self._resolve_stored_asset_path(stored_path, ASSET_PART_FLAG_IMAGE_DIR_NAME, allow_external_absolute=True)
+
+    def resolve_part_flag_image_path(self, stored_path: str) -> str:
+        abs_path = self._stored_part_flag_image_to_abs_path(stored_path)
+        return str(abs_path) if abs_path is not None else ""
+
+    def _find_flag_image_for_part(self, part_id: int) -> Path | None:
+        flag_dir = self._part_flag_images_dir()
+        candidates = [p for p in flag_dir.glob(f"part_{int(part_id)}.*") if p.is_file()]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda p: p.suffix.lower())
+        return candidates[0]
+
+    def _relative_part_flag_image_store_path(self, abs_path: Path) -> str:
+        try:
+            rel = abs_path.relative_to(self.db.db_path.parent)
+            return str(rel).replace("\\", "/")
+        except Exception as exc:
+            if not isinstance(exc, ValueError):
+                _runtime_log_event(
+                    "depot.part_flag_relative_path_failed",
+                    severity="warning",
+                    summary="Failed to convert part flag image path to data-root-relative path; storing absolute path.",
+                    exc=exc,
+                    context={"abs_path": str(abs_path), "data_root": str(self.db.db_path.parent)},
+                )
+            return str(abs_path)
+
+    def _store_agent_icon(self, user_id: str, icon_path: str, existing_stored_path: str = "") -> str:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return ""
+
+        requested = str(icon_path or "").strip()
+        icon_dir = self._agent_icons_dir()
+
+        # Empty icon path means explicit clear.
+        if not requested:
+            for existing in icon_dir.glob(f"{normalized}.*"):
+                try:
+                    if existing.is_file():
+                        existing.unlink()
+                except Exception as exc:
+                    _runtime_log_event(
+                        "depot.agent_icon_cleanup_failed",
+                        severity="warning",
+                        summary="Failed deleting existing agent icon during clear operation.",
+                        exc=exc,
+                        context={"user_id": normalized, "path": str(existing)},
+                    )
+            return ""
+
+        source = Path(requested)
+        if not source.is_absolute():
+            source = (self.db.db_path.parent / source).resolve()
+
+        if not source.exists() or not source.is_file():
+            existing_abs = self._stored_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_icon_store_path(existing_abs)
+            fallback = self._find_icon_for_user(normalized)
+            return self._relative_icon_store_path(fallback) if fallback is not None else ""
+
+        suffix = source.suffix.lower() or ".img"
+        target = icon_dir / f"{normalized}{suffix}"
+
+        for existing in icon_dir.glob(f"{normalized}.*"):
+            if existing.resolve() == target.resolve():
+                continue
+            try:
+                if existing.is_file():
+                    existing.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.agent_icon_replace_cleanup_failed",
+                    severity="warning",
+                    summary="Failed deleting stale agent icon during replacement.",
+                    exc=exc,
+                    context={"user_id": normalized, "path": str(existing), "target_path": str(target)},
+                )
+
+        try:
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
+            elif not target.exists():
+                shutil.copy2(source, target)
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.agent_icon_copy_failed",
+                severity="warning",
+                summary="Failed copying agent icon; keeping previous icon path when possible.",
+                exc=exc,
+                context={"user_id": normalized, "source_path": str(source), "target_path": str(target)},
+            )
+            existing_abs = self._stored_icon_to_abs_path(existing_stored_path)
+            if existing_abs is not None:
+                return self._relative_icon_store_path(existing_abs)
+            return ""
+
+        return self._relative_icon_store_path(target)
+
+    def list_agents(self, tier_filter: int | None = None) -> list[dict[str, Any]]:
+        if self.user_repository is not None:
+            return self.user_repository.list_agents(tier_filter=tier_filter)
+        params: list[Any] = []
+        where = ""
+        if tier_filter in (1, 2, 3, 4):
+            where = "WHERE tier=?"
+            params.append(int(tier_filter))
+        rows = self.db.fetchall(
+            f"SELECT agent_name, user_id, tier, location, icon_path FROM agents {where} ORDER BY tier ASC, agent_name ASC, user_id ASC",
+            tuple(params),
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            user_id = DepotRules.normalize_user_id(row["user_id"])
+            stored_icon = str(row["icon_path"] or "").strip()
+            abs_icon = self._stored_icon_to_abs_path(stored_icon)
+
+            if abs_icon is None:
+                fallback = self._find_icon_for_user(user_id)
+                if fallback is not None:
+                    fallback_stored = self._relative_icon_store_path(fallback)
+                    if fallback_stored != stored_icon:
+                        self.db.execute("UPDATE agents SET icon_path=? WHERE user_id=?", (fallback_stored, user_id))
+                    abs_icon = fallback
+
+            result.append(
+                {
+                    "agent_name": str(row["agent_name"] or ""),
+                    "user_id": user_id,
+                    "tier": DepotRules.normalize_agent_tier(row["tier"]),
+                    "location": str(row["location"] or "").strip(),
+                    "icon_path": str(abs_icon) if abs_icon is not None else "",
+                }
+            )
+        return result
+
+    def part_owner_choice_items(self, work_order: str = "") -> tuple[list[str], dict[str, str], int]:
+        if self.user_repository is not None:
+            return self.user_repository.part_owner_choice_items(work_order)
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        current_owner = ""
+        if normalized_work_order:
+            existing_row = self.db.fetchone(
+                "SELECT COALESCE(assigned_user_id, '') AS assigned_user_id "
+                "FROM parts WHERE is_active=1 AND work_order=? ORDER BY id DESC LIMIT 1",
+                (normalized_work_order,),
+            )
+            if existing_row is not None:
+                current_owner = DepotRules.normalize_user_id(str(existing_row["assigned_user_id"] or ""))
+
+        items: list[str] = []
+        item_lookup: dict[str, str] = {}
+        current_index = 0
+        for agent_row in self.list_agents():
+            agent_user = DepotRules.normalize_user_id(str(agent_row.get("user_id", "") or ""))
+            if not agent_user:
+                continue
+            agent_name = str(agent_row.get("agent_name", "") or "").strip()
+            display_text = f"{agent_user} - {agent_name}" if agent_name else agent_user
+            item_lookup[display_text] = agent_user
+            items.append(display_text)
+            if current_owner and agent_user == current_owner:
+                current_index = len(items) - 1
+        return items, item_lookup, current_index
+
+    def agent_display_map(self) -> dict[str, tuple[str, str]]:
+        if self.user_repository is not None:
+            return self.user_repository.agent_display_map()
+        agent_meta: dict[str, tuple[str, str]] = {}
+        for agent_row in self.list_agents():
+            agent_user = DepotRules.normalize_user_id(str(agent_row.get("user_id", "") or ""))
+            if not agent_user:
+                continue
+            agent_meta[agent_user] = (
+                str(agent_row.get("agent_name", "") or "").strip(),
+                str(agent_row.get("icon_path", "") or "").strip(),
+            )
+        return agent_meta
+
+    def get_part_note_context(self, part_id: int) -> dict[str, Any] | None:
+        row = self.db.fetchone(
+            "SELECT id, work_order, category, client_unit, COALESCE(qa_comment, '') AS qa_comment, "
+            "COALESCE(agent_comment, '') AS agent_comment, COALESCE(qa_flag, '') AS qa_flag, "
+            "COALESCE(qa_flag_image_path, '') AS qa_flag_image_path, COALESCE(comments, '') AS comments, "
+            "COALESCE(working_user_id, '') AS working_user_id, COALESCE(working_updated_at, '') AS working_updated_at "
+            "FROM parts WHERE id=?",
+            (int(part_id),),
+        )
+        if row is None:
+            return None
+        qa_comment = str(row["qa_comment"] or row["comments"] or "").strip()
+        image_path = self.resolve_qa_flag_icon(
+            str(row["qa_flag"] or "").strip(),
+            str(row["qa_flag_image_path"] or ""),
+        )
+        resolved_category = self.resolve_work_order_category(
+            str(row["work_order"] or ""),
+            str(row["category"] or "").strip(),
+        )
+        return {
+            "id": int(row["id"]),
+            "work_order": str(row["work_order"] or ""),
+            "category": resolved_category,
+            "client_unit": bool(int(row["client_unit"] or 0)),
+            "qa_comment": qa_comment,
+            "agent_comment": str(row["agent_comment"] or "").strip(),
+            "qa_flag": str(row["qa_flag"] or "").strip(),
+            "qa_flag_image_path": image_path,
+            "working_user_id": DepotRules.normalize_user_id(str(row["working_user_id"] or "")),
+            "working_updated_at": str(row["working_updated_at"] or "").strip(),
+        }
+
+    @staticmethod
+    def next_alert_quiet_until() -> str:
+        return _next_alert_quiet_until()
+
+    @staticmethod
+    def is_alert_quiet(raw_value: str) -> bool:
+        return _alert_quiet_active(raw_value)
+
+    def quiet_part_alert_until_next_morning(self, part_id: int) -> str:
+        quiet_until = self.next_alert_quiet_until()
+        self.db.execute(
+            "UPDATE parts SET alert_quiet_until=? WHERE id=?",
+            (quiet_until, int(part_id)),
+        )
+        return quiet_until
+
+    def quiet_client_followup_until_next_morning(self, client_part_id: int) -> str:
+        quiet_until = self.next_alert_quiet_until()
+        self.db.execute(
+            "UPDATE client_parts SET alert_quiet_until=? WHERE id=?",
+            (quiet_until, int(client_part_id)),
+        )
+        return quiet_until
+
+    def list_agent_active_parts(self, user_id: str, search_text: str = "") -> list[sqlite3.Row]:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        query = (
+            "SELECT p.id, p.created_at, p.work_order, p.category, p.client_unit, COALESCE(p.qa_comment, '') AS qa_comment, "
+            "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
+            "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
+            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until, "
+            "COALESCE(p.parts_installed, 0) AS parts_installed, "
+            "COALESCE(p.parts_installed_by, '') AS parts_installed_by, COALESCE(p.parts_installed_at, '') AS parts_installed_at "
+            "FROM parts p "
+            "WHERE p.assigned_user_id=? AND p.is_active=1 "
+            "AND p.id=("
+            "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
+            ")"
+        )
+        params: list[Any] = [normalized_user]
+        if search_text:
+            query += " AND p.work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY p.created_at ASC, p.id ASC LIMIT 300"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_category_active_parts(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT p.id, p.created_at, p.work_order, COALESCE(p.assigned_user_id, '') AS assigned_user_id, "
+            "p.category, p.client_unit, COALESCE(p.qa_comment, '') AS qa_comment, "
+            "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
+            "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
+            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until, "
+            "COALESCE(p.parts_installed, 0) AS parts_installed, "
+            "COALESCE(p.parts_installed_by, '') AS parts_installed_by, COALESCE(p.parts_installed_at, '') AS parts_installed_at "
+            "FROM parts p "
+            "WHERE p.is_active=1 "
+            "AND p.id=("
+            "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
+            ")"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " AND p.work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += (
+            " ORDER BY p.client_unit DESC, CASE WHEN TRIM(COALESCE(p.qa_flag, '')) <> '' THEN 1 ELSE 0 END DESC, "
+            "p.created_at ASC, p.id ASC LIMIT 300"
+        )
+        return self.db.fetchall(query, tuple(params))
+
+    def list_qa_assigned_parts(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT p.id, p.created_at, p.work_order, p.assigned_user_id, p.category, p.client_unit, COALESCE(p.qa_comment, '') AS qa_comment, "
+            "COALESCE(p.agent_comment, '') AS agent_comment, COALESCE(p.comments, '') AS comments, "
+            "COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
+            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(p.alert_quiet_until, '') AS alert_quiet_until "
+            "FROM parts p WHERE p.is_active=1 "
+            "AND p.id=("
+            "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
+            ")"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " AND p.work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY p.created_at ASC, p.id ASC LIMIT 300"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_qa_delivered_parts(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT p.id, p.created_at, p.work_order, p.assigned_user_id, p.category, "
+            "COALESCE(p.qa_comment, '') AS qa_comment, COALESCE(p.comments, '') AS comments, "
+            "COALESCE(p.parts_installed, 0) AS parts_installed, "
+            "COALESCE(p.parts_installed_by, '') AS parts_installed_by, COALESCE(p.parts_installed_at, '') AS parts_installed_at "
+            "FROM parts p "
+            "WHERE p.is_active=1 "
+            "AND p.id=("
+            "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
+            ") "
+            "AND EXISTS ("
+            "SELECT 1 FROM part_details d2 "
+            "JOIN parts p3 ON p3.id=d2.part_id "
+            "WHERE p3.is_active=1 AND p3.work_order=p.work_order AND COALESCE(d2.delivered, 0)=1"
+            ")"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " AND p.work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY COALESCE(p.parts_installed, 0) ASC, p.created_at ASC, p.id ASC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_delivered_part_details(self, work_order: str) -> list[sqlite3.Row]:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        if not normalized_work_order:
+            return []
+        return list(self.list_delivered_part_details_bulk([normalized_work_order]).get(normalized_work_order, []))
+
+    def list_delivered_part_details_bulk(
+        self,
+        work_orders: list[str] | tuple[str, ...] | set[str],
+    ) -> dict[str, list[sqlite3.Row]]:
+        normalized_orders: list[str] = []
+        seen: set[str] = set()
+        for raw_value in work_orders:
+            work_order = DepotRules.normalize_work_order(str(raw_value or ""))
+            if not work_order or work_order in seen:
+                continue
+            seen.add(work_order)
+            normalized_orders.append(work_order)
+        if not normalized_orders:
+            return {}
+
+        result: dict[str, list[sqlite3.Row]] = {work_order: [] for work_order in normalized_orders}
+        chunk_size = 300
+        for start in range(0, len(normalized_orders), chunk_size):
+            chunk = normalized_orders[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.fetchall(
+                f"""
+                SELECT
+                    COALESCE(p.work_order, '') AS work_order,
+                    COALESCE(d.lpn, '') AS lpn,
+                    COALESCE(d.part_number, '') AS part_number,
+                    COALESCE(d.part_description, '') AS part_description,
+                    COALESCE(d.installed_keys, '') AS installed_keys,
+                    COALESCE(d.shipping_info, '') AS shipping_info
+                FROM part_details d
+                JOIN parts p ON p.id=d.part_id
+                WHERE p.is_active=1
+                  AND p.work_order IN ({placeholders})
+                  AND COALESCE(d.delivered, 0)=1
+                ORDER BY p.work_order ASC, d.id ASC
+                """,
+                tuple(chunk),
+            )
+            for row in rows:
+                work_order = DepotRules.normalize_work_order(str(row["work_order"] or ""))
+                if not work_order:
+                    continue
+                result.setdefault(work_order, []).append(row)
+        return result
+
+    def list_completed_parts(self, search_text: str = "", category_filter: str | None = None) -> list[sqlite3.Row]:
+        query = (
+            "SELECT p.id, p.created_at, p.work_order, p.assigned_user_id, p.category, p.client_unit, "
+            "COALESCE(p.qa_comment, '') AS qa_comment, COALESCE(p.agent_comment, '') AS agent_comment, "
+            "COALESCE(p.comments, '') AS comments, COALESCE(p.qa_flag, '') AS qa_flag, COALESCE(p.qa_flag_image_path, '') AS qa_flag_image_path, "
+            "COALESCE(p.working_user_id, '') AS working_user_id, COALESCE(p.working_updated_at, '') AS working_updated_at, "
+            "COALESCE(ls.touch, '') AS latest_touch, "
+            f"COALESCE(NULLIF(TRIM(ls.updated_at), ''), COALESCE(ls.created_at, '')) AS latest_touch_at "
+            "FROM parts p "
+            "LEFT JOIN submissions ls ON ls.id = ("
+            "SELECT s2.id FROM submissions s2 WHERE s2.work_order = p.work_order "
+            f"ORDER BY {_submission_latest_ts_sql('s2')} DESC, s2.id DESC LIMIT 1"
+            ") "
+            "WHERE p.is_active=0 AND COALESCE(ls.touch, '') IN (?, ?, ?)"
+        )
+        params: list[Any] = [
+            DepotRules.TOUCH_COMPLETE,
+            DepotRules.TOUCH_JUNK,
+            DepotRules.TOUCH_RTV,
+        ]
+        if search_text:
+            query += " AND p.work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        normalized_category = str(category_filter or "").strip()
+        if normalized_category:
+            query += (
+                " AND UPPER(TRIM(COALESCE("
+                + self._dashboard_resolved_category_expr("p.work_order")
+                + ", ''))) = ?"
+            )
+            params.append(normalized_category.upper())
+        query += f" ORDER BY COALESCE(NULLIF(TRIM(ls.updated_at), ''), COALESCE(ls.created_at, p.created_at)) DESC, p.id DESC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_team_client_followups(self) -> list[sqlite3.Row]:
+        return self.db.fetchall(
+            "SELECT cp.id, COALESCE(cp.user_id, '') AS user_id, cp.work_order, cp.created_at, "
+            "COALESCE(cp.comments, '') AS comments, "
+            "COALESCE(cp.alert_quiet_until, '') AS alert_quiet_until, "
+            "COALESCE(cp.followup_last_action, '') AS followup_last_action, "
+            "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
+            "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
+            "COALESCE(cp.followup_no_contact_count, 0) AS followup_no_contact_count, "
+            "COALESCE(("
+            "SELECT s.touch FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
+            "), '') AS latest_touch, "
+            "COALESCE(("
+            f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
+            "), '') AS latest_touch_date, "
+            "COALESCE(("
+            f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch='Part Order'"
+            "), '') AS last_part_order_date "
+            "FROM client_parts cp "
+            "ORDER BY cp.created_at DESC, cp.id DESC LIMIT 600"
+        )
+
+    def list_client_followups(self, user_id: str) -> list[sqlite3.Row]:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        return self.db.fetchall(
+            "SELECT cp.id, cp.work_order, cp.created_at, COALESCE(cp.comments, '') AS comments, "
+            "COALESCE(cp.alert_quiet_until, '') AS alert_quiet_until, "
+            "COALESCE(cp.followup_last_action, '') AS followup_last_action, "
+            "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
+            "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
+            "COALESCE(cp.followup_no_contact_count, 0) AS followup_no_contact_count, "
+            "COALESCE(cp.followup_stage_logged, -1) AS followup_stage_logged, "
+            "COALESCE(("
+            "SELECT s.touch FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
+            "), '') AS latest_touch, "
+            "COALESCE(("
+            f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
+            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
+            "), '') AS latest_touch_date, "
+            "COALESCE(("
+            f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
+            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            "AND s.client_unit=1 AND s.touch='Part Order'"
+            "), '') AS last_part_order_date "
+            "FROM client_parts cp "
+            "WHERE cp.user_id=? "
+            "ORDER BY cp.created_at DESC, cp.id DESC LIMIT 300",
+            (normalized_user,),
+        )
+
+    def get_part_work_order(self, part_id: int) -> str:
+        row = self.db.fetchone(
+            "SELECT COALESCE(work_order, '') AS work_order FROM parts WHERE id=?",
+            (int(part_id),),
+        )
+        if row is None:
+            return ""
+        return DepotRules.normalize_work_order(str(row["work_order"] or ""))
+
+    def list_client_jo_rows(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(user_id, '') AS user_id, "
+            "COALESCE(work_order, '') AS work_order, COALESCE(comments, '') AS comments "
+            "FROM client_jo"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " WHERE work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY created_at DESC, id DESC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
+
+    def list_rtv_rows(self, search_text: str = "") -> list[sqlite3.Row]:
+        query = (
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(user_id, '') AS user_id, "
+            "COALESCE(work_order, '') AS work_order, COALESCE(comments, '') AS comments "
+            "FROM rtvs"
+        )
+        params: list[Any] = []
+        if search_text:
+            query += " WHERE work_order LIKE ?"
+            params.append(f"%{str(search_text).strip()}%")
+        query += " ORDER BY created_at DESC, id DESC LIMIT 400"
+        return self.db.fetchall(query, tuple(params))
+
+    def upsert_agent(self, user_id: str, agent_name: str, tier: int, icon_path: str = "", location: str = "") -> str:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        normalized_name = str(agent_name or "").strip()
+        normalized_tier = DepotRules.normalize_agent_tier(tier)
+        normalized_icon = str(icon_path or "").strip()
+        normalized_location = str(location or "").strip()
+        if not normalized_user or not normalized_name:
+            return ""
+
+        with self.db.write_transaction("tracker.upsert_agent"):
+            existing = self.db.fetchone("SELECT icon_path FROM agents WHERE user_id=?", (normalized_user,))
+            existing_stored = str(existing["icon_path"] or "").strip() if existing else ""
+            stored_icon = self._store_agent_icon(normalized_user, normalized_icon, existing_stored)
+            self.db.execute(
+                """
+                INSERT INTO agents (agent_name, user_id, tier, location, icon_path)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                  agent_name=excluded.agent_name,
+                  tier=excluded.tier,
+                  location=excluded.location,
+                  icon_path=excluded.icon_path
+                """,
+                (normalized_name, normalized_user, normalized_tier, normalized_location, stored_icon),
+            )
+        return stored_icon
+
+    def delete_agent(self, user_id: str) -> None:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        if not normalized_user:
+            return
+        self.db.execute("DELETE FROM agents WHERE user_id=?", (normalized_user,))
+        for existing in self._agent_icons_dir().glob(f"{normalized_user}.*"):
+            try:
+                if existing.is_file():
+                    existing.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "depot.agent_icon_delete_failed",
+                    severity="warning",
+                    summary="Failed deleting agent icon file during agent deletion.",
+                    exc=exc,
+                    context={"user_id": normalized_user, "path": str(existing)},
+                )
+
+    @staticmethod
+    def _normalize_submission_timestamp(submitted_at: datetime | date | str | None) -> datetime:
+        if isinstance(submitted_at, datetime):
+            if submitted_at.tzinfo is not None:
+                return submitted_at.astimezone().replace(tzinfo=None)
+            return submitted_at
+        if isinstance(submitted_at, date):
+            return datetime.combine(submitted_at, datetime.min.time())
+        raw_value = str(submitted_at or "").strip()
+        if not raw_value:
+            return datetime.now()
+        try:
+            parsed = datetime.fromisoformat(raw_value)
+            if parsed.tzinfo is not None:
+                return parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        except Exception:
+            try:
+                return datetime.combine(datetime.strptime(raw_value, "%Y-%m-%d").date(), datetime.min.time())
+            except Exception:
+                return datetime.now()
+
+    def _find_existing_same_day_submission(
+        self,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+    ) -> sqlite3.Row | None:
+        return self.db.fetchone(
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at "
+            "FROM submissions "
+            "WHERE entry_date=? AND user_id=? AND work_order=? "
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+            (str(entry_date or "").strip(), DepotRules.normalize_user_id(user_id), DepotRules.normalize_work_order(work_order)),
+        )
+
+    def _upsert_same_day_submission(
+        self,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+        touch: str,
+        category_text: str,
+        client_unit_int: int,
+        stamp_text: str,
+    ) -> int:
+        existing = self._find_existing_same_day_submission(entry_date, user_id, work_order)
+        if existing is not None:
+            self.db.execute(
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+            )
+            return int(existing["id"])
+        try:
+            cursor = self.db.execute(
+                "INSERT INTO submissions (created_at, updated_at, user_id, work_order, touch, category, client_unit, entry_date) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(stamp_text or "").strip(),
+                    str(stamp_text or "").strip(),
+                    DepotRules.normalize_user_id(user_id),
+                    DepotRules.normalize_work_order(work_order),
+                    str(touch or "").strip(),
+                    str(category_text or "").strip(),
+                    int(client_unit_int),
+                    str(entry_date or "").strip(),
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+        except sqlite3.IntegrityError:
+            existing = self._find_existing_same_day_submission(entry_date, user_id, work_order)
+            if existing is None:
+                raise
+            self.db.execute(
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+            )
+            return int(existing["id"])
+
+    def _upsert_same_day_aux_log(
+        self,
+        table_name: str,
+        entry_date: str,
+        user_id: str,
+        work_order: str,
+        comments: str,
+        stamp_text: str,
+    ) -> None:
+        normalized_table = str(table_name or "").strip().lower()
+        if normalized_table not in {"rtvs", "client_jo"}:
+            raise ValueError(f"Unsupported same-day aux log table: {table_name}")
+        existing = self.db.fetchone(
+            f"SELECT id FROM {normalized_table} "
+            "WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (
+                DepotRules.normalize_user_id(user_id),
+                DepotRules.normalize_work_order(work_order),
+                str(entry_date or "").strip(),
+            ),
+        )
+        if existing is not None:
+            self.db.execute(
+                f"UPDATE {normalized_table} SET created_at=?, comments=? WHERE id=?",
+                (str(stamp_text or "").strip(), str(comments or ""), int(existing["id"])),
+            )
+            return
+        self.db.execute(
+            f"INSERT INTO {normalized_table} (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+            (
+                str(stamp_text or "").strip(),
+                DepotRules.normalize_user_id(user_id),
+                DepotRules.normalize_work_order(work_order),
+                str(comments or ""),
+            ),
+        )
+
+    def submit_work(
+        self,
+        user_id: str,
+        work_order: str,
+        touch: str,
+        client_unit: bool,
+        comments: str | None = None,
+        category: str | None = "",
+        submitted_at: datetime | date | str | None = None,
+    ) -> None:
+        stamp_dt = self._normalize_submission_timestamp(submitted_at)
+        stamp_text = stamp_dt.isoformat(timespec="seconds")
+        user_id = DepotRules.normalize_user_id(user_id)
+        work_order = DepotRules.normalize_work_order(work_order)
+        entry_date = stamp_dt.date().isoformat()
+        category_text = str(category or "").strip()
+        comments_text = str(comments or "")
+        client_unit_int = 1 if client_unit else 0
+
+        with self.db.write_transaction("tracker.submit_work"):
+            submission_id = self._upsert_same_day_submission(
+                entry_date,
+                user_id,
+                work_order,
+                touch,
+                category_text,
+                client_unit_int,
+                stamp_text,
+            )
+
+            if touch == DepotRules.TOUCH_PART_ORDER and submission_id > 0:
+                self.db.execute(
+                    "UPDATE parts SET assigned_user_id=?, source_submission_id=?, "
+                    "missing_part_order_followup=0, "
+                    "missing_part_order_resolved_at=CASE "
+                    "WHEN COALESCE(missing_part_order_followup, 0)=1 THEN ? "
+                    "ELSE COALESCE(missing_part_order_resolved_at, '') END, "
+                    "missing_part_order_resolved_by=CASE "
+                    "WHEN COALESCE(missing_part_order_followup, 0)=1 THEN ? "
+                    "ELSE COALESCE(missing_part_order_resolved_by, '') END "
+                    "WHERE work_order=? AND is_active=1",
+                    (user_id, submission_id, stamp_text, user_id, work_order),
+                )
+                if category_text:
+                    self.db.execute(
+                        "UPDATE parts SET category=? WHERE work_order=? AND is_active=1",
+                        (category_text, work_order),
+                    )
+
+            if touch == DepotRules.TOUCH_RTV:
+                self._upsert_same_day_aux_log("rtvs", entry_date, user_id, work_order, comments_text, stamp_text)
+
+            if client_unit and touch == DepotRules.TOUCH_JUNK:
+                self._upsert_same_day_aux_log("client_jo", entry_date, user_id, work_order, comments_text, stamp_text)
+
+            if client_unit and touch in (DepotRules.TOUCH_PART_ORDER, DepotRules.TOUCH_OTHER):
+                existing = self.db.fetchone(
+                    "SELECT id FROM client_parts WHERE work_order = ?", (work_order,)
+                )
+                if existing:
+                    self.db.execute(
+                        "UPDATE client_parts SET user_id=?, comments=?, created_at=? WHERE work_order = ?",
+                        (user_id, comments_text, stamp_text, work_order),
+                    )
+                else:
+                    self.db.execute(
+                        "INSERT INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+                        (stamp_text, user_id, work_order, comments_text),
+                    )
+
+            if touch in DepotRules.CLOSING_TOUCHES:
+                self.db.execute(
+                    "DELETE FROM part_details WHERE part_id IN (SELECT id FROM parts WHERE work_order=?)",
+                    (work_order,),
+                )
+                self.db.execute(
+                    "UPDATE parts SET is_active=0, working_user_id='', working_updated_at='' WHERE work_order=?",
+                    (work_order,),
+                )
+                self.db.execute(
+                    "DELETE FROM client_parts WHERE work_order = ?", (work_order,)
+                )
+
+    def resolve_work_order_category(self, work_order: str, fallback: str = "") -> str:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        if not normalized_work_order:
+            return str(fallback or "").strip()
+
+        submission_row = self.db.fetchone(
+            "SELECT COALESCE(category, '') AS category "
+            "FROM submissions "
+            "WHERE work_order=? AND TRIM(COALESCE(category, '')) <> '' "
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+            (normalized_work_order,),
+        )
+        if submission_row is not None:
+            category_text = str(submission_row["category"] or "").strip()
+            if category_text:
+                return category_text
+
+        part_row = self.db.fetchone(
+            "SELECT COALESCE(category, '') AS category "
+            "FROM parts "
+            "WHERE work_order=? AND TRIM(COALESCE(category, '')) <> '' "
+            "ORDER BY is_active DESC, created_at DESC, id DESC LIMIT 1",
+            (normalized_work_order,),
+        )
+        if part_row is not None:
+            category_text = str(part_row["category"] or "").strip()
+            if category_text:
+                return category_text
+
+        return str(fallback or "").strip()
+
+    def resolve_work_order_categories_bulk(
+        self,
+        work_orders: list[str] | tuple[str, ...] | set[str],
+        fallback_map: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        normalized_orders: list[str] = []
+        seen: set[str] = set()
+        for raw_value in work_orders:
+            work_order = DepotRules.normalize_work_order(str(raw_value or ""))
+            if not work_order or work_order in seen:
+                continue
+            seen.add(work_order)
+            normalized_orders.append(work_order)
+        if not normalized_orders:
+            return {}
+
+        fallback_lookup: dict[str, str] = {}
+        if fallback_map:
+            for raw_key, raw_value in fallback_map.items():
+                normalized_key = DepotRules.normalize_work_order(str(raw_key or ""))
+                if normalized_key:
+                    fallback_lookup[normalized_key] = str(raw_value or "").strip()
+
+        resolved: dict[str, str] = {
+            work_order: str(fallback_lookup.get(work_order, "") or "").strip()
+            for work_order in normalized_orders
+        }
+        chunk_size = 300
+        for start in range(0, len(normalized_orders), chunk_size):
+            chunk = normalized_orders[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            submission_rows = self.db.fetchall(
+                f"""
+                SELECT
+                    work_order,
+                    COALESCE(category, '') AS category,
+                    {_submission_latest_ts_sql()} AS latest_stamp,
+                    id
+                FROM submissions
+                WHERE work_order IN ({placeholders})
+                  AND TRIM(COALESCE(category, '')) <> ''
+                ORDER BY work_order ASC, {_submission_latest_ts_sql()} DESC, id DESC
+                """,
+                tuple(chunk),
+            )
+            seen_submission: set[str] = set()
+            for row in submission_rows:
+                work_order = DepotRules.normalize_work_order(str(row["work_order"] or ""))
+                if not work_order or work_order in seen_submission:
+                    continue
+                category_text = str(row["category"] or "").strip()
+                if category_text:
+                    resolved[work_order] = category_text
+                    seen_submission.add(work_order)
+
+            unresolved = [work_order for work_order in chunk if not str(resolved.get(work_order, "") or "").strip()]
+            if not unresolved:
+                continue
+            unresolved_placeholders = ",".join("?" for _ in unresolved)
+            part_rows = self.db.fetchall(
+                f"""
+                SELECT
+                    work_order,
+                    COALESCE(category, '') AS category,
+                    is_active,
+                    COALESCE(created_at, '') AS created_at,
+                    id
+                FROM parts
+                WHERE work_order IN ({unresolved_placeholders})
+                  AND TRIM(COALESCE(category, '')) <> ''
+                ORDER BY work_order ASC, is_active DESC, created_at DESC, id DESC
+                """,
+                tuple(unresolved),
+            )
+            seen_parts: set[str] = set()
+            for row in part_rows:
+                work_order = DepotRules.normalize_work_order(str(row["work_order"] or ""))
+                if not work_order or work_order in seen_parts:
+                    continue
+                category_text = str(row["category"] or "").strip()
+                if category_text:
+                    resolved[work_order] = category_text
+                    seen_parts.add(work_order)
+
+        return {work_order: str(value or "").strip() for work_order, value in resolved.items()}
+
+    def active_part_category_options(self) -> list[str]:
+        rows = self.db.fetchall(
+            "SELECT DISTINCT work_order, COALESCE(category, '') AS category "
+            "FROM parts WHERE is_active=1 ORDER BY work_order ASC"
+        )
+        fallback_map = {
+            DepotRules.normalize_work_order(str(row["work_order"] or "")): str(row["category"] or "").strip()
+            for row in rows
+            if DepotRules.normalize_work_order(str(row["work_order"] or ""))
+        }
+        resolved_map = self.resolve_work_order_categories_bulk(list(fallback_map.keys()), fallback_map)
+        categories: list[str] = list(DepotRules.CATEGORY_OPTIONS)
+        seen_categories = {str(category).strip().casefold() for category in categories if str(category).strip()}
+        for work_order in fallback_map.keys():
+            category_text = str(resolved_map.get(work_order, "") or "").strip()
+            if not category_text:
+                continue
+            category_key = category_text.casefold()
+            if category_key in seen_categories:
+                continue
+            seen_categories.add(category_key)
+            categories.append(category_text)
+        return categories
+
+    def get_latest_part_order_submission(self, work_order: str) -> dict[str, Any] | None:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        if not normalized_work_order:
+            return None
+        row = self.db.fetchone(
+            "SELECT id, user_id, COALESCE(category, '') AS category, COALESCE(created_at, '') AS created_at, "
+            "COALESCE(updated_at, '') AS updated_at "
+            "FROM submissions "
+            "WHERE work_order=? AND touch=? "
+            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+            (normalized_work_order, DepotRules.TOUCH_PART_ORDER),
+        )
+        if row is None:
+            return None
+        return {
+            "id": int(row["id"]),
+            "user_id": DepotRules.normalize_user_id(str(row["user_id"] or "")),
+            "category": str(row["category"] or "").strip(),
+            "created_at": str(row["created_at"] or "").strip(),
+            "updated_at": str(row["updated_at"] or "").strip(),
+        }
+
+    def update_work_order_category(self, work_order: str, category: str) -> str:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        category_text = str(category or "").strip()
+        if not normalized_work_order or not category_text:
+            return ""
+
+        latest_part_order = self.get_latest_part_order_submission(normalized_work_order)
+        target_row = {"id": int(latest_part_order["id"])} if latest_part_order is not None else None
+        if target_row is None:
+            target_row = self.db.fetchone(
+                f"SELECT id FROM submissions WHERE work_order=? ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                (normalized_work_order,),
+            )
+        if target_row is None:
+            return ""
+
+        self.db.execute(
+            "UPDATE submissions SET category=? WHERE id=?",
+            (category_text, int(target_row["id"])),
+        )
+        return category_text
+
+    def submit_part(
+        self,
+        user_id: str,
+        work_order: str,
+        category: str,
+        client_unit: bool,
+        qa_comment: str | None = "",
+        qa_flag: str | None = "",
+        parts_on_hand: bool = False,
+        fallback_assigned_user_id: str = "",
+    ) -> int:
+        now = datetime.utcnow().isoformat()
+        user_id = DepotRules.normalize_user_id(user_id)
+        fallback_assigned_user_id = DepotRules.normalize_user_id(fallback_assigned_user_id)
+        work_order = DepotRules.normalize_work_order(work_order)
+        category = str(category or "").strip()
+        client_unit_int = 1 if client_unit else 0
+        parts_on_hand_int = 1 if bool(parts_on_hand) else 0
+        qa_comment_text = str(qa_comment or "").strip()
+        qa_flag_text = str(qa_flag or "").strip()
+        source_submission = self.get_latest_part_order_submission(work_order)
+        source_submission_id = int(source_submission["id"]) if source_submission is not None else 0
+        assigned_user_id = (
+            DepotRules.normalize_user_id(str(source_submission.get("user_id", "") or ""))
+            if source_submission is not None
+            else fallback_assigned_user_id
+        )
+        if not category and source_submission is not None:
+            category = str(source_submission.get("category", "") or "").strip()
+        if source_submission is None and not fallback_assigned_user_id:
+            raise ValueError("A Part Order work submission is required before parts can be submitted for this work order.")
+        if qa_flag_text.lower() == "none":
+            qa_flag_text = ""
+        existing = self.db.fetchone(
+            "SELECT id FROM parts WHERE is_active=1 AND work_order=? ORDER BY id DESC LIMIT 1",
+            (work_order,),
+        )
+        if existing is not None:
+            existing_id = int(existing["id"])
+            self.db.execute(
+                "UPDATE parts SET user_id=?, assigned_user_id=?, source_submission_id=?, client_unit=?, category=?, comments=?, qa_comment=?, "
+                "qa_flag=?, qa_flag_image_path='', "
+                "parts_on_hand=CASE WHEN ?=1 THEN 1 ELSE parts_on_hand END "
+                "WHERE id=?",
+                (
+                    user_id,
+                    assigned_user_id,
+                    source_submission_id,
+                    client_unit_int,
+                    category,
+                    qa_comment_text,
+                    qa_comment_text,
+                    qa_flag_text,
+                    parts_on_hand_int,
+                    existing_id,
+                ),
+            )
+            return existing_id
+        insert_cursor = self.db.execute(
+            "INSERT INTO parts (created_at, user_id, assigned_user_id, source_submission_id, work_order, client_unit, category, comments, qa_comment, "
+            "agent_comment, qa_flag, qa_flag_image_path, is_active, parts_on_hand, parts_installed, parts_installed_by, parts_installed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, '', '')",
+            (
+                now,
+                user_id,
+                assigned_user_id,
+                source_submission_id,
+                work_order,
+                client_unit_int,
+                category,
+                qa_comment_text,
+                qa_comment_text,
+                "",
+                qa_flag_text,
+                "",
+                parts_on_hand_int,
+            ),
+        )
+        return int(insert_cursor.lastrowid or 0)
+
+    def submit_part_missing_part_order(
+        self,
+        user_id: str,
+        work_order: str,
+        category: str,
+        client_unit: bool,
+        assigned_user_id: str,
+        qa_comment: str | None = "",
+        qa_flag: str | None = "",
+        parts_on_hand: bool = False,
+    ) -> int:
+        now = datetime.utcnow().isoformat()
+        followup_stamp = datetime.now().isoformat(timespec="seconds")
+        user_id = DepotRules.normalize_user_id(user_id)
+        assigned_user_id = DepotRules.normalize_user_id(assigned_user_id)
+        work_order = DepotRules.normalize_work_order(work_order)
+        category = str(category or "").strip()
+        client_unit_int = 1 if client_unit else 0
+        parts_on_hand_int = 1 if bool(parts_on_hand) else 0
+        qa_comment_text = str(qa_comment or "").strip()
+        qa_flag_text = str(qa_flag or "").strip()
+        if qa_flag_text.lower() == "none":
+            qa_flag_text = ""
+        if not assigned_user_id:
+            raise ValueError("An assigned agent is required when no Part Order submission exists.")
+        if self.get_latest_part_order_submission(work_order) is not None:
+            raise ValueError("A Part Order submission already exists for this work order.")
+        agent_row = self.db.fetchone("SELECT 1 FROM agents WHERE user_id=?", (assigned_user_id,))
+        if agent_row is None:
+            raise ValueError("Selected agent is no longer configured.")
+
+        existing = self.db.fetchone(
+            "SELECT id FROM parts WHERE is_active=1 AND work_order=? ORDER BY id DESC LIMIT 1",
+            (work_order,),
+        )
+        if existing is not None:
+            existing_id = int(existing["id"])
+            self.db.execute(
+                "UPDATE parts SET user_id=?, assigned_user_id=?, source_submission_id=0, client_unit=?, category=?, comments=?, qa_comment=?, "
+                "qa_flag=?, qa_flag_image_path='', missing_part_order_followup=1, missing_part_order_logged_at=?, "
+                "missing_part_order_logged_by=?, missing_part_order_resolved_at='', missing_part_order_resolved_by='', "
+                "parts_on_hand=CASE WHEN ?=1 THEN 1 ELSE parts_on_hand END "
+                "WHERE id=?",
+                (
+                    user_id,
+                    assigned_user_id,
+                    client_unit_int,
+                    category,
+                    qa_comment_text,
+                    qa_comment_text,
+                    qa_flag_text,
+                    followup_stamp,
+                    user_id,
+                    parts_on_hand_int,
+                    existing_id,
+                ),
+            )
+            part_id = existing_id
+        else:
+            insert_cursor = self.db.execute(
+                "INSERT INTO parts (created_at, user_id, assigned_user_id, source_submission_id, "
+                "missing_part_order_followup, missing_part_order_logged_at, missing_part_order_logged_by, "
+                "missing_part_order_resolved_at, missing_part_order_resolved_by, work_order, client_unit, category, "
+                "comments, qa_comment, agent_comment, qa_flag, qa_flag_image_path, is_active, parts_on_hand, "
+                "parts_installed, parts_installed_by, parts_installed_at) "
+                "VALUES (?, ?, ?, 0, 1, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 0, '', '')",
+                (
+                    now,
+                    user_id,
+                    assigned_user_id,
+                    followup_stamp,
+                    user_id,
+                    work_order,
+                    client_unit_int,
+                    category,
+                    qa_comment_text,
+                    qa_comment_text,
+                    "",
+                    qa_flag_text,
+                    "",
+                    parts_on_hand_int,
+                ),
+            )
+            part_id = int(insert_cursor.lastrowid or 0)
+
+        _runtime_log_event(
+            "depot.part_missing_part_order_followup_logged",
+            severity="warning",
+            summary="QA parts submission proceeded without a Part Order submission and was logged for admin follow up.",
+            context={
+                "part_id": int(part_id),
+                "qa_user_id": str(user_id),
+                "assigned_user_id": str(assigned_user_id),
+                "work_order": str(work_order),
+                "client_unit": int(client_unit_int),
+            },
+        )
+        return int(part_id)
+
+    def list_missing_part_order_followups(self) -> list[dict[str, Any]]:
+        rows = self.db.fetchall(
+            "SELECT p.id, p.created_at, p.work_order, COALESCE(p.user_id, '') AS user_id, "
+            "COALESCE(p.assigned_user_id, '') AS assigned_user_id, COALESCE(p.category, '') AS category, "
+            "COALESCE(p.client_unit, 0) AS client_unit, COALESCE(p.qa_comment, '') AS qa_comment, "
+            "COALESCE(p.comments, '') AS comments, COALESCE(p.missing_part_order_logged_at, '') AS missing_part_order_logged_at, "
+            "COALESCE(p.missing_part_order_logged_by, '') AS missing_part_order_logged_by "
+            "FROM parts p "
+            "WHERE p.is_active=1 AND COALESCE(p.missing_part_order_followup, 0)=1 AND COALESCE(p.source_submission_id, 0)=0 "
+            "AND p.id=("
+            "SELECT MAX(p2.id) FROM parts p2 WHERE p2.is_active=1 AND p2.work_order=p.work_order"
+            ") "
+            "ORDER BY COALESCE(NULLIF(TRIM(p.missing_part_order_logged_at), ''), p.created_at) ASC, p.id ASC"
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "id": int(row["id"]),
+                    "created_at": str(row["created_at"] or "").strip(),
+                    "work_order": str(row["work_order"] or "").strip(),
+                    "user_id": DepotRules.normalize_user_id(str(row["user_id"] or "")),
+                    "assigned_user_id": DepotRules.normalize_user_id(str(row["assigned_user_id"] or "")),
+                    "category": str(row["category"] or "").strip(),
+                    "client_unit": int(row["client_unit"] or 0),
+                    "qa_comment": str(row["qa_comment"] or row["comments"] or "").strip(),
+                    "logged_at": str(row["missing_part_order_logged_at"] or "").strip(),
+                    "logged_by": DepotRules.normalize_user_id(str(row["missing_part_order_logged_by"] or "")),
+                }
+            )
+        return result
+
+    def reassign_part_owner(self, part_id: int, assigned_user_id: str) -> None:
+        normalized_agent = DepotRules.normalize_user_id(assigned_user_id)
+        if not normalized_agent:
+            raise ValueError("An agent is required.")
+        agent_row = self.db.fetchone("SELECT 1 FROM agents WHERE user_id=?", (normalized_agent,))
+        if agent_row is None:
+            raise ValueError("Selected agent is no longer configured.")
+        row = self.db.fetchone("SELECT id, work_order FROM parts WHERE id=?", (int(part_id),))
+        if row is None:
+            raise ValueError("Selected part no longer exists.")
+        self.db.execute(
+            "UPDATE parts SET assigned_user_id=? WHERE id=?",
+            (normalized_agent, int(part_id)),
+        )
+        _runtime_log_event(
+            "depot.part_owner_reassigned",
+            severity="info",
+            summary="A parts row owner was reassigned.",
+            context={
+                "part_id": int(part_id),
+                "assigned_user_id": str(normalized_agent),
+                "work_order": str(row["work_order"] or ""),
+            },
+        )
+
+    def resolve_missing_part_order_followup(self, part_id: int, actor_user_id: str) -> None:
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        row = self.db.fetchone("SELECT id, work_order FROM parts WHERE id=?", (int(part_id),))
+        if row is None:
+            raise ValueError("Selected part no longer exists.")
+        stamp = datetime.now().isoformat(timespec="seconds")
+        self.db.execute(
+            "UPDATE parts SET missing_part_order_followup=0, missing_part_order_resolved_at=?, missing_part_order_resolved_by=? "
+            "WHERE id=?",
+            (stamp, actor, int(part_id)),
+        )
+        _runtime_log_event(
+            "depot.part_missing_part_order_followup_resolved",
+            severity="info",
+            summary="A missing-Part-Order follow-up item was resolved.",
+            context={
+                "part_id": int(part_id),
+                "actor_user_id": str(actor),
+                "work_order": str(row["work_order"] or ""),
+            },
+        )
+
+    def upsert_part_detail(
+        self,
+        part_id: int,
+        lpn: str,
+        part_number: str,
+        part_description: str,
+        shipping_info: str,
+        delivered: bool,
+    ) -> None:
+        now = datetime.utcnow().isoformat()
+        normalized_lpn = DepotRules.normalize_work_order(lpn)
+        part_no_text = str(part_number or "").strip()
+        part_desc_text = str(part_description or "").strip()
+        shipping_text = str(shipping_info or "").strip()
+        incoming_row = (normalized_lpn, part_no_text, part_desc_text, shipping_text)
+        incoming_key = _part_detail_row_key(*incoming_row)
+
+        existing = self.db.fetchone(
+            "SELECT COALESCE(lpn, '') AS lpn, COALESCE(part_number, '') AS part_number, "
+            "COALESCE(part_description, '') AS part_description, COALESCE(shipping_info, '') AS shipping_info, "
+            "COALESCE(installed_keys, '') AS installed_keys, COALESCE(delivered, 0) AS delivered "
+            "FROM part_details WHERE part_id=?",
+            (int(part_id),),
+        )
+        if existing is None:
+            if not incoming_key:
+                return
+            self.db.execute(
+                "INSERT INTO part_details (part_id, created_at, lpn, part_number, part_description, shipping_info, delivered) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(part_id),
+                    now,
+                    normalized_lpn,
+                    part_no_text,
+                    part_desc_text,
+                    shipping_text,
+                    1 if bool(delivered) else 0,
+                ),
+            )
+            return
+
+        line_rows = _merged_part_detail_rows(
+            str(existing["lpn"] or ""),
+            str(existing["part_number"] or ""),
+            str(existing["part_description"] or ""),
+            str(existing["shipping_info"] or ""),
+        )
+        non_empty_ship = [str(row[3] or "").strip() for row in line_rows if str(row[3] or "").strip()]
+        ship_seen: set[str] = set()
+        ship_unique: list[str] = []
+        for ship in non_empty_ship:
+            key = str(ship or "").strip().casefold()
+            if key in ship_seen:
+                continue
+            ship_seen.add(key)
+            ship_unique.append(str(ship or "").strip())
+        if len(ship_unique) == 1:
+            shared_ship = ship_unique[0]
+            line_rows = [
+                (row[0], row[1], row[2], shared_ship if not str(row[3] or "").strip() else str(row[3] or "").strip())
+                for row in line_rows
+            ]
+        line_rows = _dedupe_part_detail_rows(line_rows)
+
+        appended_new_row = False
+        if incoming_key:
+            replaced = False
+            for idx, row in enumerate(line_rows):
+                if _part_detail_row_key(*row) == incoming_key:
+                    line_rows[idx] = incoming_row
+                    replaced = True
+                    break
+            if not replaced:
+                line_rows.append(incoming_row)
+                appended_new_row = True
+        line_rows = _dedupe_part_detail_rows(line_rows)
+
+        installed_key_set = _installed_key_set_from_text(str(existing["installed_keys"] or "").strip())
+
+        retained_installed_keys: list[str] = []
+        for row in line_rows:
+            key = _part_detail_row_key(row[0], row[1], row[2], row[3])
+            if key in installed_key_set:
+                retained_installed_keys.append(key)
+
+        merged_lpn, merged_part_number, merged_part_desc, merged_shipping = _serialize_part_detail_rows(line_rows)
+        merged_installed_keys = (
+            json.dumps(retained_installed_keys, ensure_ascii=True, separators=(",", ":"))
+            if retained_installed_keys
+            else ""
+        )
+        delivered_value = 1 if (bool(delivered) or bool(int(existing["delivered"] or 0))) else 0
+        with self.db.write_transaction("tracker.upsert_part_detail"):
+            self.db.execute(
+                "UPDATE part_details SET lpn=?, part_number=?, part_description=?, shipping_info=?, installed_keys=?, delivered=? WHERE part_id=?",
+                (
+                    merged_lpn,
+                    merged_part_number,
+                    merged_part_desc,
+                    merged_shipping,
+                    merged_installed_keys,
+                    delivered_value,
+                    int(part_id),
+                ),
+            )
+            if appended_new_row:
+                # New delivered rows become pending install by default.
+                self.db.execute(
+                    "UPDATE parts SET parts_installed=0, parts_installed_by='', parts_installed_at='' WHERE id=?",
+                    (int(part_id),),
+                )
+
+    def find_active_parts_by_work_orders(self, work_orders: list[str]) -> dict[str, int]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_value in work_orders:
+            work_order = DepotRules.normalize_work_order(str(raw_value or ""))
+            if not work_order or work_order in seen:
+                continue
+            seen.add(work_order)
+            normalized.append(work_order)
+        if not normalized:
+            return {}
+
+        by_work_order: dict[str, int] = {}
+        chunk_size = 400
+        for start in range(0, len(normalized), chunk_size):
+            chunk = normalized[start : start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.fetchall(
+                f"SELECT id, work_order FROM parts WHERE is_active=1 AND work_order IN ({placeholders}) "
+                "ORDER BY id DESC",
+                tuple(chunk),
+            )
+            for row in rows:
+                existing_work_order = DepotRules.normalize_work_order(str(row["work_order"] or ""))
+                if not existing_work_order or existing_work_order in by_work_order:
+                    continue
+                by_work_order[existing_work_order] = int(row["id"])
+        return by_work_order
+
+    def get_active_part_qa_flag(self, work_order: str) -> str:
+        normalized_work_order = DepotRules.normalize_work_order(work_order)
+        if not normalized_work_order:
+            return ""
+        row = self.db.fetchone(
+            "SELECT COALESCE(qa_flag, '') AS qa_flag FROM parts WHERE is_active=1 AND work_order=? ORDER BY id DESC LIMIT 1",
+            (normalized_work_order,),
+        )
+        if row is None:
+            return ""
+        return str(row["qa_flag"] or "").strip()
+
+    def update_part_agent_comment(self, part_id: int, agent_comment: str) -> None:
+        self.db.execute(
+            "UPDATE parts SET agent_comment=? WHERE id=?",
+            (str(agent_comment or "").strip(), int(part_id)),
+        )
+
+    def set_part_working_user(self, part_id: int, working_user_id: str) -> None:
+        normalized = DepotRules.normalize_user_id(working_user_id)
+        stamp = datetime.now().isoformat(timespec="seconds") if normalized else ""
+        quiet_until = self.next_alert_quiet_until() if normalized else ""
+        # One agent may actively "work" only one part row at a time.
+        with self.db.write_transaction("tracker.set_part_working_user"):
+            if normalized:
+                self.db.execute(
+                    "UPDATE parts SET working_user_id='', working_updated_at='' "
+                    "WHERE working_user_id=? AND id<>?",
+                    (normalized, int(part_id)),
+                )
+            self.db.execute(
+                "UPDATE parts SET working_user_id=?, working_updated_at=?, alert_quiet_until=? WHERE id=?",
+                (normalized, stamp, quiet_until, int(part_id)),
+            )
+
+    def set_part_installed(self, part_id: int, installed_row_keys: list[str] | tuple[str, ...] | set[str], actor_user_id: str = "") -> None:
+        detail = self.db.fetchone(
+            "SELECT COALESCE(lpn, '') AS lpn, COALESCE(part_number, '') AS part_number, "
+            "COALESCE(part_description, '') AS part_description, COALESCE(shipping_info, '') AS shipping_info "
+            "FROM part_details WHERE part_id=?",
+            (int(part_id),),
+        )
+        if detail is None:
+            raise ValueError("Delivered part details were not found for the selected work order.")
+
+        detail_rows = _dedupe_part_detail_rows(
+            _merged_part_detail_rows(
+                str(detail["lpn"] or ""),
+                str(detail["part_number"] or ""),
+                str(detail["part_description"] or ""),
+                str(detail["shipping_info"] or ""),
+            )
+        )
+        valid_keys = {
+            row_key
+            for row_key in (_part_detail_row_key(*row) for row in detail_rows)
+            if row_key
+        }
+        selected_keys: list[str] = []
+        seen: set[str] = set()
+        for value in installed_row_keys:
+            row_key = str(value or "").strip()
+            if not row_key or row_key not in valid_keys or row_key in seen:
+                continue
+            seen.add(row_key)
+            selected_keys.append(row_key)
+
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        stamp = datetime.now().isoformat(timespec="seconds")
+        installed = bool(selected_keys)
+        with self.db.write_transaction("tracker.set_part_installed"):
+            self.db.execute(
+                "UPDATE part_details SET installed_keys=? WHERE part_id=?",
+                (_serialized_installed_keys(selected_keys), int(part_id)),
+            )
+            self.db.execute(
+                "UPDATE parts SET parts_on_hand=1, parts_installed=?, parts_installed_by=?, parts_installed_at=?, "
+                "working_user_id='', working_updated_at='', alert_quiet_until=? WHERE id=?",
+                (
+                    1 if installed else 0,
+                    actor if installed else "",
+                    stamp if installed else "",
+                    self.next_alert_quiet_until(),
+                    int(part_id),
+                ),
+            )
+
+    def mark_client_followup_action(self, client_part_id: int, action: str, actor_user_id: str) -> int:
+        normalized_action = DepotRules.normalize_followup_action(action)
+        if not normalized_action:
+            raise ValueError("Invalid follow-up action.")
+        row = self.db.fetchone(
+            "SELECT COALESCE(followup_no_contact_count, 0) AS followup_no_contact_count, "
+            "COALESCE(followup_last_action, '') AS followup_last_action, "
+            "COALESCE(followup_last_action_at, '') AS followup_last_action_at, "
+            "COALESCE(comments, '') AS comments "
+            "FROM client_parts WHERE id=?",
+            (int(client_part_id),),
+        )
+        if row is None:
+            raise ValueError("Client follow-up row no longer exists.")
+        existing_count = int(max(0, safe_int(row["followup_no_contact_count"], 0)))
+        previous_action = DepotRules.normalize_followup_action(str(row["followup_last_action"] or ""))
+        previous_stamp = str(row["followup_last_action_at"] or "").strip()
+        previous_day = previous_stamp[:10] if len(previous_stamp) >= 10 else ""
+        stamp_dt = datetime.now()
+        stamp = stamp_dt.isoformat(timespec="seconds")
+        today_iso = stamp_dt.date().isoformat()
+        same_day_replacement = bool(previous_day == today_iso)
+
+        if normalized_action in DepotRules.CLIENT_FOLLOWUP_NO_CONTACT_ACTIONS:
+            if same_day_replacement:
+                if previous_action in DepotRules.CLIENT_FOLLOWUP_NO_CONTACT_ACTIONS:
+                    existing_count = int(max(1, existing_count))
+                else:
+                    existing_count = 1
+            else:
+                existing_count += 1
+        else:
+            existing_count = 0
+
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        action_tag = f"Follow-up {today_iso}: {normalized_action} - [{actor or 'UNKNOWN'}]"
+        stage_logged = -1
+        existing_comments = str(row["comments"] or "").strip()
+        lines = [line.rstrip() for line in existing_comments.splitlines() if str(line).strip()]
+        action_prefix = f"Follow-up {today_iso}:"
+        stage_prefix = f"Waiting Stage {today_iso}:"
+        lines = [line for line in lines if not line.startswith(action_prefix)]
+        lines = [line for line in lines if not line.startswith(stage_prefix)]
+        stage_lines: list[str] = [action_tag]
+        if normalized_action in DepotRules.CLIENT_FOLLOWUP_NO_CONTACT_ACTIONS:
+            stage_logged = 0
+            stage_lines.append(f"{stage_prefix} {DepotRules.followup_stage_label(0)} - [SYSTEM]")
+        lines.extend(stage_lines)
+        updated_comments = "\n".join([line for line in lines if str(line).strip()])
+        self.db.execute(
+            "UPDATE client_parts SET followup_last_action=?, followup_last_action_at=?, "
+            "followup_last_actor=?, followup_no_contact_count=?, followup_stage_logged=?, comments=?, alert_quiet_until=? WHERE id=?",
+            (
+                normalized_action,
+                stamp,
+                actor,
+                int(existing_count),
+                int(stage_logged),
+                updated_comments,
+                self.next_alert_quiet_until(),
+                int(client_part_id),
+            ),
+        )
+        return int(existing_count)
+
+    def update_client_followup_stage(self, client_part_id: int, stage_index: int) -> str:
+        next_stage = int(clamp(int(stage_index), 0, 2))
+        row = self.db.fetchone(
+            "SELECT COALESCE(comments, '') AS comments, "
+            "COALESCE(followup_stage_logged, -1) AS followup_stage_logged "
+            "FROM client_parts WHERE id=?",
+            (int(client_part_id),),
+        )
+        if row is None:
+            raise ValueError("Client follow-up row no longer exists.")
+        current_stage = int(safe_int(row["followup_stage_logged"], -1))
+        current_comments = str(row["comments"] or "").strip()
+        if next_stage <= current_stage:
+            return current_comments
+
+        stamp_day = datetime.now().date().isoformat()
+        stage_prefix = f"Waiting Stage {stamp_day}:"
+        chunks: list[str] = [line.rstrip() for line in current_comments.splitlines() if str(line).strip()]
+        chunks = [line for line in chunks if not line.startswith(stage_prefix)]
+        for idx in range(max(0, current_stage + 1), next_stage + 1):
+            chunks.append(f"{stage_prefix} {DepotRules.followup_stage_label(idx)} - [SYSTEM]")
+        updated_comments = "\n".join([chunk for chunk in chunks if str(chunk).strip()])
+        self.db.execute(
+            "UPDATE client_parts SET followup_stage_logged=?, comments=? WHERE id=?",
+            (int(next_stage), updated_comments, int(client_part_id)),
+        )
+        return updated_comments
+
+    def update_part_qa_fields(self, part_id: int, qa_comment: str, qa_flag: str) -> None:
+        qa_flag_text = str(qa_flag or "").strip()
+        if qa_flag_text.lower() == "none":
+            qa_flag_text = ""
+        qa_comment_text = str(qa_comment or "").strip()
+        self.db.execute(
+            "UPDATE parts SET qa_comment=?, comments=?, qa_flag=?, qa_flag_image_path=? WHERE id=?",
+            (qa_comment_text, qa_comment_text, qa_flag_text, "", int(part_id)),
+        )
+
+    def get_dashboard_metrics(
+        self,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        user_id: str | None = None,
+        touch: str | None = None,
+        client_only: bool | None = None,
+        category: str | None = None,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        params: list[Any] = []
+        entry_date_expr = _submission_entry_date_sql("s0")
+
+        if start_date:
+            where.append(f"{entry_date_expr} >= ?")
+            params.append(start_date)
+        if end_date:
+            where.append(f"{entry_date_expr} <= ?")
+            params.append(end_date)
+        if user_id:
+            where.append("s0.user_id = ?")
+            params.append(DepotRules.normalize_user_id(user_id))
+        if touch:
+            where.append("s0.touch = ?")
+            params.append(touch)
+        if client_only is not None:
+            where.append("s0.client_unit = ?")
+            params.append(1 if client_only else 0)
+        self._append_dashboard_category_filter(
+            where,
+            params,
+            category,
+            self._dashboard_resolved_category_expr("s0.work_order"),
+        )
+
+        where_clause = "WHERE " + " AND ".join(where) if where else ""
+        from_clause = "FROM submissions s0"
+
+        total = self.db.fetchone(f"SELECT COUNT(*) AS c {from_clause} {where_clause}", tuple(params))
+        total_units = self.db.fetchone(
+            f"SELECT COUNT(DISTINCT s0.work_order) AS c {from_clause} {where_clause}",
+            tuple(params),
+        )
+        by_touch = self.db.fetchall(
+            f"SELECT s0.touch AS touch, COUNT(*) AS c {from_clause} {where_clause} GROUP BY s0.touch",
+            tuple(params),
+        )
+        by_user = self.db.fetchall(
+            f"SELECT s0.user_id AS user_id, COUNT(*) AS c {from_clause} {where_clause} GROUP BY s0.user_id",
+            tuple(params),
+        )
+        daily = self.db.fetchall(
+            f"SELECT {entry_date_expr} AS entry_date, COUNT(*) AS c {from_clause} {where_clause} "
+            f"GROUP BY {entry_date_expr} ORDER BY {entry_date_expr} DESC LIMIT 30",
+            tuple(params),
+        )
+        trend_daily = self.db.fetchall(
+            f"""
+            WITH filtered AS (
+                SELECT
+                    {entry_date_expr} AS effective_date,
+                    s0.work_order AS work_order,
+                    s0.touch AS touch
+                {from_clause}
+                {where_clause}
+            )
+            SELECT
+                effective_date AS entry_date,
+                COUNT(*) AS total_rows,
+                COUNT(DISTINCT work_order) AS units,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS complete,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS junk,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS part_order,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS rtv,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS triaged,
+                SUM(CASE WHEN touch = ? THEN 1 ELSE 0 END) AS other_units
+            FROM filtered
+            WHERE COALESCE(effective_date, '') <> ''
+            GROUP BY effective_date
+            ORDER BY effective_date ASC
+            """,
+            (
+                *params,
+                DepotRules.TOUCH_COMPLETE,
+                DepotRules.TOUCH_JUNK,
+                DepotRules.TOUCH_PART_ORDER,
+                DepotRules.TOUCH_RTV,
+                "Triaged",
+                DepotRules.TOUCH_OTHER,
+            ),
+        )
+
+        if start_date and end_date:
+            try:
+                start_dt = datetime.strptime(str(start_date), "%Y-%m-%d").date()
+                end_dt = datetime.strptime(str(end_date), "%Y-%m-%d").date()
+                day_span = max(1, (end_dt - start_dt).days + 1)
+            except Exception:
+                day_span = max(1, len(daily))
+        else:
+            day_span = max(1, len(daily))
+
+        by_touch_map = {str(row["touch"] or "").strip(): int(max(0, safe_int(row["c"], 0))) for row in by_touch}
+        complete_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_COMPLETE, 0), 0)))
+        junk_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_JUNK, 0), 0)))
+        part_order_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_PART_ORDER, 0), 0)))
+        rtv_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_RTV, 0), 0)))
+        triaged_count = int(max(0, safe_int(by_touch_map.get("Triaged", 0), 0)))
+        other_touch_count = int(max(0, safe_int(by_touch_map.get(DepotRules.TOUCH_OTHER, 0), 0)))
+
+        return {
+            "total_submissions": int(total["c"] if total else 0),
+            "total_units": int(total_units["c"] if total_units else 0),
+            "by_touch": by_touch_map,
+            "by_user": {str(row["user_id"] or "").strip(): int(max(0, safe_int(row["c"], 0))) for row in by_user},
+            "daily": [{"entry_date": str(r["entry_date"] or ""), "count": int(max(0, safe_int(r["c"], 0)))} for r in daily],
+            "trend_daily": [
+                {
+                    "entry_date": str(row["entry_date"] or ""),
+                    "total_rows": int(max(0, safe_int(row["total_rows"], 0))),
+                    "units": int(max(0, safe_int(row["units"], 0))),
+                    "complete": int(max(0, safe_int(row["complete"], 0))),
+                    "junk": int(max(0, safe_int(row["junk"], 0))),
+                    "part_order": int(max(0, safe_int(row["part_order"], 0))),
+                    "rtv": int(max(0, safe_int(row["rtv"], 0))),
+                    "triaged": int(max(0, safe_int(row["triaged"], 0))),
+                    "other": int(max(0, safe_int(row["other_units"], 0))),
+                }
+                for row in trend_daily
+            ],
+            "day_span": int(day_span),
+            "complete_count": int(complete_count),
+            "junk_count": int(junk_count),
+            "part_order_count": int(part_order_count),
+            "rtv_count": int(rtv_count),
+            "triaged_count": int(triaged_count),
+            "other_touch_count": int(other_touch_count),
+            "avg_submission_rows_per_day": float((int(total["c"]) if total else 0) / day_span) if day_span > 0 else 0.0,
+            "avg_units_per_day": float((int(total_units["c"]) if total_units else 0) / day_span) if day_span > 0 else 0.0,
+            "avg_complete_per_day": float(complete_count / day_span) if day_span > 0 else 0.0,
+            "avg_junk_per_day": float(junk_count / day_span) if day_span > 0 else 0.0,
+            "active_client_follow_up": int(self.db.fetchone("SELECT COUNT(*) AS c FROM client_parts", ())["c"]),
+            "active_parts": int(self.db.fetchone("SELECT COUNT(*) AS c FROM parts WHERE is_active=1", ())["c"]),
+            "rtv_log_count": int(self.db.fetchone("SELECT COUNT(*) AS c FROM rtvs", ())["c"]),
+            "client_jo_count": int(self.db.fetchone("SELECT COUNT(*) AS c FROM client_jo", ())["c"]),
+        }
+
+    def import_workbook(self, xlsm_path: Path, import_tables: set[str] | None = None) -> tuple[bool, str]:
+        if openpyxl is None:
+            return False, "openpyxl not installed"
+        if not xlsm_path.exists():
+            return False, "workbook not found"
+        try:
+            wb = openpyxl.load_workbook(str(xlsm_path), keep_vba=True, data_only=True)
+            selected: set[str] | None = None
+            if import_tables is not None:
+                selected = {str(name or "").strip().lower() for name in import_tables if str(name or "").strip()}
+                if not selected:
+                    return False, "No tables were selected for import."
+
+            def nx(val):
+                return DepotRules.normalize_user_id(str(val)) if val is not None else ""
+
+            def include(table_key: str) -> bool:
+                return selected is None or table_key in selected
+
+            counts = {key: 0 for key, _sheet, _label in WORKBOOK_IMPORT_SPECS}
+            missing_sheets: list[str] = []
+            parts_import_without_source_link = 0
+
+            # Submissions
+            if include("submissions") and "Table1" in wb.sheetnames:
+                sh = wb["Table1"]
+                for i, row in enumerate(sh.iter_rows(min_row=2), start=2):
+                    date_time = row[0].value
+                    user = nx(row[1].value)
+                    work_order = DepotRules.normalize_work_order(row[2].value)
+                    touch = str(row[3].value or "").strip()
+                    client_unit = bool(row[4].value)
+                    comments = str(row[6].value or "") if len(row) > 6 else ""
+                    if not user or not work_order or not touch:
+                        continue
+                    category = str(row[5].value or "").strip() if len(row) > 5 else ""
+                    self.submit_work(user, work_order, touch, client_unit, comments, category, submitted_at=date_time)
+                    counts["submissions"] += 1
+            elif include("submissions"):
+                missing_sheets.append("Table1")
+
+            # Parts
+            if include("parts") and "tblParts" in wb.sheetnames:
+                sh = wb["tblParts"]
+                for row in sh.iter_rows(min_row=2):
+                    date_time = row[0].value
+                    user = nx(row[1].value)
+                    work_order = DepotRules.normalize_work_order(row[2].value)
+                    client_unit = bool(row[4].value) if len(row) > 4 else False
+                    category = str(row[5].value or "").strip()
+                    if not user or not work_order or not category:
+                        continue
+                    if self.get_latest_part_order_submission(work_order) is None:
+                        parts_import_without_source_link += 1
+                    self.submit_part(user, work_order, category, client_unit, "", fallback_assigned_user_id=user)
+                    counts["parts"] += 1
+            elif include("parts"):
+                missing_sheets.append("tblParts")
+
+            # RTVs
+            if include("rtvs") and "RTVs" in wb.sheetnames:
+                sh = wb["RTVs"]
+                for row in sh.iter_rows(min_row=2):
+                    user = nx(row[1].value)
+                    work_order = DepotRules.normalize_work_order(row[2].value)
+                    comments = str(row[3].value or "")
+                    if user and work_order:
+                        now = datetime.utcnow().isoformat()
+                        self.db.execute("INSERT OR IGNORE INTO rtvs (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)", (now, user, work_order, comments))
+                        counts["rtvs"] += 1
+            elif include("rtvs"):
+                missing_sheets.append("RTVs")
+
+            # Client JO
+            if include("client_jo") and "Client_JO" in wb.sheetnames:
+                sh = wb["Client_JO"]
+                for row in sh.iter_rows(min_row=2):
+                    user = nx(row[1].value)
+                    work_order = DepotRules.normalize_work_order(row[2].value)
+                    comments = str(row[3].value or "")
+                    if user and work_order:
+                        now = datetime.utcnow().isoformat()
+                        self.db.execute("INSERT OR IGNORE INTO client_jo (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)", (now, user, work_order, comments))
+                        counts["client_jo"] += 1
+            elif include("client_jo"):
+                missing_sheets.append("Client_JO")
+
+            # client_parts
+            if include("client_parts") and "client_parts" in wb.sheetnames:
+                sh = wb["client_parts"]
+                for row in sh.iter_rows(min_row=2):
+                    user = nx(row[1].value)
+                    work_order = DepotRules.normalize_work_order(row[2].value)
+                    comments = str(row[4].value or "") if len(row) > 4 else ""
+                    if user and work_order:
+                        now = datetime.utcnow().isoformat()
+                        self.db.execute("INSERT OR IGNORE INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)", (now, user, work_order, comments))
+                        counts["client_parts"] += 1
+            elif include("client_parts"):
+                missing_sheets.append("client_parts")
+
+            # agents
+            if include("agents") and "agents" in wb.sheetnames:
+                sh = wb["agents"]
+                for row in sh.iter_rows(min_row=2):
+                    agent_name = str(row[0].value or "").strip()
+                    a_num = DepotRules.normalize_user_id(row[1].value)
+                    tier = 1
+                    if len(row) > 2 and row[2].value is not None:
+                        try:
+                            tier = DepotRules.normalize_agent_tier(row[2].value)
+                        except Exception as exc:
+                            _runtime_log_event(
+                                "depot.import_workbook.agent_tier_parse_failed",
+                                severity="warning",
+                                summary="Agent tier value in workbook could not be parsed; defaulting to tier 1.",
+                                exc=exc,
+                                context={"raw_tier": row[2].value},
+                            )
+                            tier = 1
+                    icon_path = str(row[3].value or "").strip() if len(row) > 3 else ""
+                    location = str(row[4].value or "").strip() if len(row) > 4 else ""
+                    if a_num:
+                        self.upsert_agent(a_num, agent_name or a_num, tier, icon_path, location)
+                        counts["agents"] += 1
+            elif include("agents"):
+                missing_sheets.append("agents")
+
+            # QA flags
+            if include("qa_flags") and "qa_flags" in wb.sheetnames:
+                sh = wb["qa_flags"]
+                for row in sh.iter_rows(min_row=2):
+                    flag_name = str(row[0].value or "").strip()
+                    severity = str(row[1].value or "Medium").strip() if len(row) > 1 else "Medium"
+                    icon_path = str(row[2].value or "").strip() if len(row) > 2 else ""
+                    if flag_name:
+                        self.upsert_qa_flag(flag_name, severity, icon_path)
+                        counts["qa_flags"] += 1
+            elif include("qa_flags"):
+                missing_sheets.append("qa_flags")
+
+            # admin allowlist
+            if include("admin_users") and "admin" in wb.sheetnames:
+                sh = wb["admin"]
+                for row in sh.iter_rows(min_row=2):
+                    user_id = DepotRules.normalize_user_id(row[0].value)
+                    admin_name = str(row[1].value or "").strip() if len(row) > 1 else ""
+                    position = str(row[2].value or "").strip() if len(row) > 2 else ""
+                    location = str(row[3].value or "").strip() if len(row) > 3 else ""
+                    icon_path = str(row[4].value or "").strip() if len(row) > 4 else ""
+                    access_level = (
+                        DepotRules.normalize_admin_access_level(row[5].value, default=DepotRules.ADMIN_ACCESS_ADMIN)
+                        if len(row) > 5
+                        else DepotRules.ADMIN_ACCESS_ADMIN
+                    )
+                    if user_id:
+                        self.add_admin_user(
+                            user_id,
+                            admin_name,
+                            position,
+                            location,
+                            icon_path,
+                            access_level=access_level,
+                        )
+                        counts["admin_users"] += 1
+            elif include("admin_users"):
+                missing_sheets.append("admin")
+            imported_total = sum(int(v) for v in counts.values())
+            label_by_key = {key: label for key, _sheet, label in WORKBOOK_IMPORT_SPECS}
+            included_keys = [key for key, _sheet, _label in WORKBOOK_IMPORT_SPECS if include(key)]
+            lines: list[str] = [f"Import complete. Rows processed: {imported_total}"]
+            if included_keys:
+                lines.append("Selected tables:")
+                for key in included_keys:
+                    lines.append(f"- {label_by_key.get(key, key)}: {counts.get(key, 0)}")
+            if parts_import_without_source_link > 0:
+                lines.append(f"Parts imported without source submission link: {parts_import_without_source_link}")
+                _runtime_log_event(
+                    "depot.import_workbook.parts_missing_part_order_submission",
+                    severity="warning",
+                    summary="Workbook parts import preserved legacy owners for rows without matching Part Order submissions.",
+                    context={
+                        "workbook_path": str(xlsm_path),
+                        "parts_rows_without_source_submission": int(parts_import_without_source_link),
+                    },
+                )
+            if missing_sheets:
+                lines.append("Missing sheets skipped: " + ", ".join(missing_sheets))
+            return True, "\n".join(lines)
+        except Exception as exc:
+            context = {
+                "workbook_path": str(xlsm_path),
+                "selected_tables": sorted(str(name) for name in import_tables) if import_tables else [],
+            }
+            _runtime_log_event(
+                "depot.import_workbook_unhandled",
+                severity="critical",
+                summary="Unhandled workbook import failure.",
+                exc=exc,
+                context=context,
+            )
+            _escalate_runtime_issue_once(
+                "depot.import_workbook_unhandled",
+                "Workbook import failed unexpectedly. Review the runtime log for diagnostics.",
+                details=f"{type(exc).__name__}: {exc}",
+                context=context,
+            )
+            return False, str(exc)
+
+
+class PartNotesDialog(QDialog):
+    def __init__(
+        self,
+        role: str,
+        part_data: dict[str, Any],
+        tracker: DepotTracker | None = None,
+        app_window: "QuickInputsWindow" | None = None,
+        current_user: str = "",
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setObjectName("PartNotesDialog")
+        self.role = "qa" if str(role).strip().lower() == "qa" else "agent"
+        self.app_window = app_window
+        self._style_kind = "qa" if self.role == "qa" else "agent"
+        self.part_data = part_data
+        self.tracker = tracker
+        self.current_user = DepotRules.normalize_user_id(current_user)
+        self._working_original_user = DepotRules.normalize_user_id(str(part_data.get("working_user_id", "") or ""))
+
+        work_order = str(part_data.get("work_order", "") or "")
+        self.setWindowTitle(f"Notes - {work_order}")
+        self.setModal(True)
+        self.resize(560, 320)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        resolved_category = ""
+        try:
+            resolved_category = self.tracker.resolve_work_order_category(
+                work_order,
+                str(part_data.get("category", "") or "").strip(),
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.part_notes_category_resolve_failed",
+                severity="warning",
+                summary="Failed resolving work-order category for notes dialog.",
+                exc=exc,
+                context={
+                    "work_order": str(work_order),
+                    "role": str(self.role),
+                },
+            )
+        summary = QLabel(
+            f"Work Order: {work_order}    Category: {resolved_category or '-'}    "
+            f"Client: {'Yes' if bool(part_data.get('client_unit', False)) else 'No'}"
+        )
+        summary.setWordWrap(True)
+        layout.addWidget(summary)
+
+        other_label = QLabel("Agent Note (Other User)" if self.role == "qa" else "QA Note (Other User)")
+        other_label.setProperty("section", True)
+        layout.addWidget(other_label)
+        self.other_note_value = QLabel()
+        self.other_note_value.setWordWrap(True)
+        self.other_note_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        other_text = str(part_data.get("agent_comment" if self.role == "qa" else "qa_comment", "") or "").strip()
+        self.other_note_value.setText(other_text if other_text else "(none)")
+        layout.addWidget(self.other_note_value)
+
+        own_label = QLabel("QA Note (Your Note)" if self.role == "qa" else "Agent Note (Your Note)")
+        own_label.setProperty("section", True)
+        layout.addWidget(own_label)
+        self.own_note_input = QTextEdit()
+        self.own_note_input.setFixedHeight(86)
+        own_value = str(part_data.get("qa_comment" if self.role == "qa" else "agent_comment", "") or "").strip()
+        self.own_note_input.setPlainText(own_value)
+        layout.addWidget(self.own_note_input)
+
+        if self.role == "qa":
+            qa_flag_row = QHBoxLayout()
+            qa_flag_row.addWidget(QLabel("Flag"), 0)
+            self.qa_flag_combo = QComboBox()
+            flag_options = self.tracker.get_qa_flag_options(include_none=True) if self.tracker is not None else list(QA_FLAG_OPTIONS)
+            for option in flag_options:
+                self.qa_flag_combo.addItem(option)
+            current_flag = str(part_data.get("qa_flag", "") or "").strip()
+            current_display = current_flag if current_flag else "None"
+            idx = self.qa_flag_combo.findText(current_display)
+            self.qa_flag_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            qa_flag_row.addWidget(self.qa_flag_combo, 1)
+            layout.addLayout(qa_flag_row)
+        else:
+            self.work_toggle_check = QCheckBox("Working this unit (\U0001F527)")
+            if self.current_user:
+                if self._working_original_user and self._working_original_user != self.current_user:
+                    self.work_toggle_check.setChecked(True)
+                    self.work_toggle_check.setEnabled(False)
+                    lock_notice = QLabel(f"Currently marked by {self._working_original_user}.")
+                    lock_notice.setProperty("muted", True)
+                    layout.addWidget(lock_notice)
+                else:
+                    self.work_toggle_check.setChecked(self._working_original_user == self.current_user)
+            else:
+                self.work_toggle_check.setEnabled(False)
+            layout.addWidget(self.work_toggle_check)
+
+            flag_text = str(part_data.get("qa_flag", "") or "").strip()
+            flag_value = flag_text if flag_text else "None"
+            layout.addWidget(QLabel(f"Flag: {flag_value}"))
+
+        buttons = QHBoxLayout()
+        self.save_btn = QPushButton("Save")
+        self.cancel_btn = QPushButton("Cancel")
+        self.save_btn.setProperty("actionRole", "save")
+        self.cancel_btn.setProperty("actionRole", "reset")
+        buttons.addWidget(self.save_btn)
+        buttons.addWidget(self.cancel_btn)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.save_btn.clicked.connect(self.accept)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        if app_window is not None:
+            base_css = app_window._popup_theme_stylesheet(self._style_kind, force_opaque_root=True)
+            resolved = app_window._resolved_popup_theme(self._style_kind)
+            dialog_bg = normalize_hex(
+                resolved.get("background", app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE)),
+                app_window.palette_data.get("surface", DEFAULT_THEME_SURFACE),
+            )
+            dialog_text = normalize_hex(
+                resolved.get("text", app_window.palette_data.get("label_text", "#FFFFFF")),
+                app_window.palette_data.get("label_text", "#FFFFFF"),
+            )
+            if contrast_ratio(dialog_bg, dialog_text) < 4.0:
+                dialog_text = readable_text(dialog_bg)
+            field_bg = normalize_hex(
+                resolved.get("field_bg", app_window.palette_data.get("input_bg", "#FFFFFF")),
+                app_window.palette_data.get("input_bg", "#FFFFFF"),
+            )
+            field_text = dialog_text if contrast_ratio(field_bg, dialog_text) >= 4.0 else readable_text(field_bg)
+            field_border = shift(field_bg, -0.38)
+            self.setStyleSheet(
+                base_css
+                + (
+                    "QDialog#PartNotesDialog {"
+                    "background-color: transparent;"
+                    f"color: {dialog_text};"
+                    "}"
+                    "QDialog#PartNotesDialog QLabel {"
+                    f"color: {dialog_text};"
+                    "background-color: transparent;"
+                    "font-weight: 700;"
+                    "}"
+                    "QDialog#PartNotesDialog QTextEdit, QDialog#PartNotesDialog QLineEdit, QDialog#PartNotesDialog QComboBox {"
+                    f"background-color: {rgba_css(field_bg, 0.95)};"
+                    f"color: {field_text};"
+                    f"border: 1px solid {field_border};"
+                    "}"
+                )
+            )
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        if self.app_window is not None:
+            _paint_flowgrid_popup_background(self, painter, self.app_window, self._style_kind)
+        super().paintEvent(event)
+
+    def values(self) -> dict[str, str]:
+        own_note = self.own_note_input.toPlainText().strip()
+        out: dict[str, str] = {
+            "own_note": own_note,
+            "qa_flag": "",
+            "qa_flag_image_path": "",
+            "working_user_id": "__UNCHANGED__",
+        }
+        if self.role == "qa":
+            selected_flag = str(self.qa_flag_combo.currentText() if hasattr(self, "qa_flag_combo") else "").strip()
+            if selected_flag.lower() == "none":
+                selected_flag = ""
+            out["qa_flag"] = selected_flag
+            out["qa_flag_image_path"] = ""
+        elif hasattr(self, "work_toggle_check") and self.work_toggle_check.isEnabled():
+            out["working_user_id"] = self.current_user if self.work_toggle_check.isChecked() else ""
+        return out
+
+
+
+def _edit_aux_queue_comment(
+    owner: DepotFramelessToolWindow,
+    tracker: DepotTracker,
+    *,
+    table: QTableWidget,
+    target_key: str,
+    theme_kind: str,
+    title: str,
+) -> bool:
+    row = table.currentRow()
+    if row < 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return False
+    row_id_item = table.item(row, 0)
+    if row_id_item is None:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return False
+    row_id = safe_int(row_id_item.data(Qt.ItemDataRole.UserRole), 0)
+    if row_id <= 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Selected row no longer exists.")
+        return False
+    work_order_item = table.item(row, max(0, _table_column_index_by_header(table, "Work Order")))
+    comments_item = table.item(row, max(0, _table_column_index_by_header(table, "Comments")))
+    work_order = str(work_order_item.text() or "").strip() if work_order_item is not None else ""
+    current_text = str(comments_item.text() or "").strip() if comments_item is not None else ""
+    if comments_item is not None:
+        stored_text = str(comments_item.data(Qt.ItemDataRole.UserRole + 1) or "").strip()
+        if stored_text:
+            current_text = stored_text
+    note_text, ok = show_flowgrid_themed_input_text(
+        owner,
+        owner.app_window,
+        theme_kind,
+        title,
+        f"Work Order: {work_order or '-'}\nUpdate comment:",
+        current_text if current_text != "(none)" else "",
+    )
+    if not ok:
+        return False
+    try:
+        tracker.update_dashboard_note_value(target_key, int(row_id), str(note_text or "").strip())
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.aux_queue_comment_save_failed",
+            severity="warning",
+            summary="Failed saving queue comment update.",
+            exc=exc,
+            context={"target_key": str(target_key), "row_id": int(row_id), "work_order": str(work_order)},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Warning,
+            "Save Failed",
+            f"Could not save comment:\n{type(exc).__name__}: {exc}",
+        )
+        return False
+    return True
+
+
+def _copy_work_order_with_notice(
+    owner: DepotFramelessToolWindow,
+    item: QTableWidgetItem | None,
+    *,
+    header_text: str = "Work Order",
+    duration_ms: int = 4200,
+) -> str:
+    table, work_order = _copy_work_order_from_table_item(item, header_text=header_text)
+    if work_order:
+        owner._show_copy_notice(table, f"Copied Work Order: {work_order}", duration_ms=duration_ms)
+    return work_order
+
+
+def _edit_part_notes(
+    owner: DepotFramelessToolWindow,
+    tracker: DepotTracker,
+    *,
+    role: str,
+    current_user: str = "",
+    table: QTableWidget | None = None,
+    part_id: int | None = None,
+) -> tuple[bool, int | None]:
+    target_part_id = int(part_id) if part_id is not None else _selected_part_id_from_table(table) if table is not None else None
+    if target_part_id is None:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return False, None
+    try:
+        part_data = tracker.get_part_note_context(target_part_id)
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.part_notes_context_load_failed",
+            severity="warning",
+            summary="Failed loading part-note context.",
+            exc=exc,
+            context={"role": str(role), "part_id": int(target_part_id), "current_user": str(current_user or "")},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Critical,
+            "Load Failed",
+            f"Could not load notes:\n{type(exc).__name__}: {exc}",
+        )
+        return False, int(target_part_id)
+    if part_data is None:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Missing", "Selected part no longer exists.")
+        return False, int(target_part_id)
+
+    dialog = PartNotesDialog(
+        role,
+        part_data,
+        tracker=tracker,
+        app_window=owner.app_window,
+        current_user=current_user,
+        parent=owner,
+    )
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return False, int(target_part_id)
+
+    values = dialog.values()
+    try:
+        if str(role).strip().lower() == "qa":
+            tracker.update_part_qa_fields(
+                int(target_part_id),
+                values.get("own_note", ""),
+                values.get("qa_flag", ""),
+            )
+        else:
+            tracker.update_part_agent_comment(int(target_part_id), values.get("own_note", ""))
+            working_user_id = str(values.get("working_user_id", "__UNCHANGED__"))
+            if working_user_id != "__UNCHANGED__":
+                tracker.set_part_working_user(int(target_part_id), working_user_id)
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.part_notes_save_failed",
+            severity="warning",
+            summary="Failed saving part-note changes.",
+            exc=exc,
+            context={"role": str(role), "part_id": int(target_part_id), "current_user": str(current_user or "")},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Critical,
+            "Save Failed",
+            f"Could not save notes:\n{type(exc).__name__}: {exc}",
+        )
+        return False, int(target_part_id)
+    return True, int(target_part_id)
+
+
+def _populate_missing_po_followup_table(
+    table: QTableWidget,
+    *,
+    rows: list[dict[str, Any]],
+    all_rows_count: int,
+    search_text: str,
+    summary_label: QLabel | None,
+    agent_meta: dict[str, tuple[str, str]],
+    icon_host: QWidget,
+) -> None:
+    client_icon = icon_host.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+    table.setRowCount(0)
+    for row_idx, row in enumerate(rows):
+        table.insertRow(row_idx)
+        part_id = int(row.get("id", 0) or 0)
+        work_order = str(row.get("work_order", "") or "").strip()
+        assigned_user = DepotRules.normalize_user_id(str(row.get("assigned_user_id", "") or ""))
+        assigned_name, assigned_icon = agent_meta.get(assigned_user, ("", ""))
+        assigned_text = f"{assigned_user} - {assigned_name}" if assigned_user and assigned_name else (assigned_user or "-")
+        submitted_by = DepotRules.normalize_user_id(str(row.get("logged_by", "") or row.get("user_id", "") or ""))
+        logged_at = str(row.get("logged_at", "") or row.get("created_at", "") or "").strip()
+        logged_display = DepotAgentWindow._format_working_updated_stamp(logged_at) if logged_at else "-"
+        age_text = DepotAgentWindow._part_age_label(logged_at)
+        category = str(row.get("resolved_category", "") or row.get("category", "") or "").strip() or "Other"
+        qa_comment = str(row.get("qa_comment", "") or "").strip()
+
+        work_item = _center_table_item(QTableWidgetItem(work_order))
+        work_item.setData(Qt.ItemDataRole.UserRole, part_id)
+        assigned_item = _center_table_item(QTableWidgetItem(assigned_text))
+        if assigned_icon and Path(assigned_icon).exists():
+            assigned_item.setIcon(QIcon(assigned_icon))
+        submitted_item = _center_table_item(QTableWidgetItem(submitted_by or "-"))
+        submitted_icon = _resolve_user_icon_from_agent_meta(submitted_by, agent_meta)
+        if submitted_icon is not None:
+            submitted_item.setIcon(submitted_icon)
+        logged_item = _center_table_item(QTableWidgetItem(logged_display))
+        if logged_at:
+            logged_item.setToolTip(logged_at.replace("T", " "))
+        age_item = _center_table_item(QTableWidgetItem(age_text))
+        category_item = _center_table_item(QTableWidgetItem(category))
+        client_item = _center_table_item(QTableWidgetItem(""))
+        client_item.setData(Qt.ItemDataRole.UserRole, part_id)
+        if int(row.get("client_unit", 0) or 0):
+            client_item.setIcon(client_icon)
+            client_item.setToolTip("Client unit")
+        else:
+            client_item.setToolTip("Non-client unit")
+        qa_note_item = _center_table_item(QTableWidgetItem(DepotAgentWindow._note_preview(qa_comment)))
+        qa_note_item.setToolTip(f"QA Note: {qa_comment if qa_comment else '(none)'}")
+
+        table.setItem(row_idx, 0, work_item)
+        table.setItem(row_idx, 1, assigned_item)
+        table.setItem(row_idx, 2, submitted_item)
+        table.setItem(row_idx, 3, logged_item)
+        table.setItem(row_idx, 4, age_item)
+        table.setItem(row_idx, 5, category_item)
+        table.setItem(row_idx, 6, client_item)
+        table.setItem(row_idx, 7, qa_note_item)
+
+    if summary_label is not None:
+        if search_text:
+            summary_label.setText(
+                f"Missing PO rows: {all_rows_count} | Showing: {len(rows)}" if all_rows_count else "No Missing PO rows."
+            )
+        else:
+            summary_label.setText(
+                f"Missing PO rows: {all_rows_count}" if all_rows_count else "No Missing PO rows."
+            )
+
+
+def _reassign_missing_po_followup(
+    owner: DepotFramelessToolWindow,
+    tracker: DepotTracker,
+    *,
+    table: QTableWidget,
+    current_user: str,
+    role_key: str,
+    refresh_callback: Callable[[], None],
+) -> None:
+    if table.currentRow() < 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return
+    part_id = _selected_part_id_from_table(table)
+    if part_id is None:
+        return
+
+    work_order = tracker.get_part_work_order(part_id)
+    if not work_order:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Missing", "Selected part no longer exists.")
+        return
+    try:
+        agent_items, item_lookup, current_index = tracker.part_owner_choice_items(work_order)
+    except Exception as exc:
+        _runtime_log_event(
+            f"ui.{role_key}_missing_po_reassign_agent_query_failed",
+            severity="warning",
+            summary=f"{role_key.title()} Missing PO reassignment could not load the agent list.",
+            exc=exc,
+            context={"user_id": str(current_user), "part_id": int(part_id), "work_order": work_order},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Critical,
+            "Reassign Agent",
+            f"Could not load the agent list:\n{type(exc).__name__}: {exc}\n\nDetails were logged for support.",
+        )
+        return
+    if not agent_items:
+        owner._show_themed_message(
+            QMessageBox.Icon.Warning,
+            "Reassign Agent",
+            "No agents are configured. Add an agent before reassigning this Missing PO item.",
+        )
+        return
+
+    selection, ok = show_flowgrid_themed_input_item(
+        owner,
+        owner.app_window,
+        owner._theme_kind,
+        "Reassign Agent",
+        (
+            f"Work Order: {work_order}\n"
+            "Select the agent who should own this Missing PO item."
+        ),
+        agent_items,
+        current_index,
+        False,
+    )
+    if not ok:
+        return
+    assigned_user_id = item_lookup.get(str(selection or "").strip(), "")
+    if not assigned_user_id:
+        return
+
+    try:
+        tracker.reassign_part_owner(part_id, assigned_user_id)
+    except Exception as exc:
+        _runtime_log_event(
+            f"ui.{role_key}_missing_po_reassign_failed",
+            severity="warning",
+            summary=f"{role_key.title()} Missing PO reassignment failed.",
+            exc=exc,
+            context={"user_id": str(current_user), "part_id": int(part_id), "work_order": work_order},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Critical,
+            "Save Failed",
+            f"Could not reassign this Missing PO item:\n{type(exc).__name__}: {exc}\n\nDetails were logged for support.",
+        )
+        return
+    owner._show_copy_notice(table, f"Reassigned to {assigned_user_id}", duration_ms=3200)
+    refresh_callback()
+
+
+def _resolve_missing_po_followup(
+    owner: DepotFramelessToolWindow,
+    tracker: DepotTracker,
+    *,
+    table: QTableWidget,
+    current_user: str,
+    role_key: str,
+    refresh_callback: Callable[[], None],
+) -> None:
+    if table.currentRow() < 0:
+        owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
+        return
+    part_id = _selected_part_id_from_table(table)
+    if part_id is None:
+        return
+    try:
+        tracker.resolve_missing_part_order_followup(part_id, current_user)
+    except Exception as exc:
+        _runtime_log_event(
+            f"ui.{role_key}_missing_po_resolve_failed",
+            severity="warning",
+            summary=f"{role_key.title()} Missing PO resolve action failed.",
+            exc=exc,
+            context={"user_id": str(current_user), "part_id": int(part_id)},
+        )
+        owner._show_themed_message(
+            QMessageBox.Icon.Critical,
+            "Resolve Failed",
+            f"Could not resolve this Missing PO item:\n{type(exc).__name__}: {exc}\n\nDetails were logged for support.",
+        )
+        return
+    owner._show_copy_notice(table, "Missing PO resolved", duration_ms=3200)
+    refresh_callback()
+
+
+
+def _ensure_depot_window_classes_loaded() -> None:
+    global DepotAgentWindow, DepotQAWindow
+    current_agent = globals().get("DepotAgentWindow")
+    current_qa = globals().get("DepotQAWindow")
+    if isinstance(current_agent, type) and isinstance(current_qa, type):
+        return
+    from flowgrid_app.window.agent import DepotAgentWindow as _DepotAgentWindow
+    from flowgrid_app.window.qa_qcs import DepotQAWindow as _DepotQAWindow
+
+    DepotAgentWindow = _DepotAgentWindow
+    DepotQAWindow = _DepotQAWindow
+
+
+class IconCropDialog(FlowgridThemedDialog):
+    def __init__(self, image: QImage, app_window: "QuickInputsWindow" | None = None, parent: QWidget | None = None):
+        super().__init__(parent, app_window, "admin")
+        self._source_image = image.copy()
+        self._result_image = QImage()
+
+        self.setWindowTitle("Icon Creator")
+        self.setModal(True)
+        self.resize(920, 560)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        hint = QLabel(
+            "Drag to move the image inside the icon frame. "
+            "Use mouse wheel or slider to zoom. The live preview shows the final icon."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        body = QHBoxLayout()
+        body.setSpacing(8)
+        self.arrange_preview = IconArrangePreview(self._source_image, self)
+        body.addWidget(self.arrange_preview, 1)
+
+        preview_col = QVBoxLayout()
+        preview_col.setSpacing(6)
+        preview_col.addWidget(QLabel("Final Icon Preview"))
+        self.output_preview = QLabel()
+        self.output_preview.setFixedSize(130, 130)
+        self.output_preview.setFrameShape(QFrame.Shape.Box)
+        preview_col.addWidget(self.output_preview, 0, Qt.AlignmentFlag.AlignCenter)
+        preview_col.addStretch(1)
+        body.addLayout(preview_col, 0)
+        layout.addLayout(body, 1)
+
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel("Zoom"), 0)
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(100, 400)
+        self.zoom_slider.setSingleStep(5)
+        self.zoom_slider.setPageStep(20)
+        self.zoom_slider.setValue(100)
+        zoom_row.addWidget(self.zoom_slider, 1)
+        layout.addLayout(zoom_row)
+
+        actions = QHBoxLayout()
+        self.crop_btn = QPushButton("Apply")
+        self.cancel_btn = QPushButton("Cancel")
+        self.crop_btn.setProperty("actionRole", "save")
+        self.cancel_btn.setProperty("actionRole", "reset")
+        actions.addWidget(self.crop_btn)
+        actions.addWidget(self.cancel_btn)
+        layout.addLayout(actions)
+
+        self.zoom_slider.valueChanged.connect(self._on_zoom_slider_changed)
+        self.arrange_preview.zoom_changed.connect(self._on_preview_zoom_changed)
+        self.arrange_preview.view_changed.connect(self._update_output_preview)
+        self.crop_btn.clicked.connect(self._accept_crop)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.apply_theme_styles(force_opaque_root=True)
+        self._update_output_preview()
+
+    @staticmethod
+    def _set_preview_label_image(target: QLabel, image: QImage) -> None:
+        if image.isNull():
+            target.clear()
+            return
+        pix = QPixmap.fromImage(image)
+        if pix.isNull():
+            target.clear()
+            return
+        fitted = pix.scaled(
+            target.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        target.setPixmap(fitted)
+
+    def _on_zoom_slider_changed(self, value: int) -> None:
+        self.arrange_preview.set_zoom(float(value) / 100.0)
+
+    def _on_preview_zoom_changed(self, value: float) -> None:
+        slider_value = int(round(float(value) * 100.0))
+        if self.zoom_slider.value() == slider_value:
+            return
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(slider_value)
+        self.zoom_slider.blockSignals(False)
+
+    def _update_output_preview(self) -> None:
+        preview = self.arrange_preview.render_cropped_image(180)
+        self._set_preview_label_image(self.output_preview, preview)
+
+    def _accept_crop(self) -> None:
+        arranged = self.arrange_preview.render_cropped_image(256)
+        if arranged.isNull():
+            return
+        self._result_image = arranged
+        self.accept()
+
+    def result_image(self) -> QImage:
+        return self._result_image.copy()
+
+
+class IconArrangePreview(QWidget):
+    zoom_changed = Signal(float)
+    view_changed = Signal()
+
+    def __init__(self, image: QImage, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._image = image.copy()
+        self._frame_rect = QRect()
+        self._zoom = 1.0
+        self._pan = QPointF(0.0, 0.0)
+        self._drag_active = False
+        self._last_pos = QPoint()
+        self.setMinimumSize(360, 250)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.set_source_image(image, reset_view=True)
+
+    def set_source_image(self, image: QImage, *, reset_view: bool = True) -> None:
+        self._image = image.copy()
+        if reset_view:
+            self._zoom = 1.0
+            self._pan = QPointF(0.0, 0.0)
+            self.zoom_changed.emit(self._zoom)
+        self._clamp_pan()
+        self.view_changed.emit()
+        self.update()
+
+    def _calc_frame_rect(self) -> QRect:
+        bounds = self.rect().adjusted(10, 10, -10, -10)
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return QRect()
+        side = max(1, min(bounds.width(), bounds.height()))
+        x = bounds.left() + max(0, (bounds.width() - side) // 2)
+        y = bounds.top() + max(0, (bounds.height() - side) // 2)
+        return QRect(x, y, side, side)
+
+    def zoom(self) -> float:
+        return float(self._zoom)
+
+    def set_zoom(self, value: float) -> None:
+        new_zoom = float(clamp(float(value), 1.0, 4.0))
+        if abs(new_zoom - self._zoom) < 0.001:
+            return
+        self._zoom = new_zoom
+        self._clamp_pan()
+        self.zoom_changed.emit(self._zoom)
+        self.view_changed.emit()
+        self.update()
+
+    def _clamp_pan(self, frame: QRectF | None = None) -> None:
+        if self._image.isNull():
+            self._pan = QPointF(0.0, 0.0)
+            return
+        draw_frame = QRectF(frame) if frame is not None else QRectF(self._frame_rect if self._frame_rect.isValid() else self._calc_frame_rect())
+        if draw_frame.width() <= 0 or draw_frame.height() <= 0:
+            self._pan = QPointF(0.0, 0.0)
+            return
+        base_scale = max(
+            draw_frame.width() / max(1, self._image.width()),
+            draw_frame.height() / max(1, self._image.height()),
+        )
+        scale = base_scale * self._zoom
+        scaled_w = float(self._image.width()) * scale
+        scaled_h = float(self._image.height()) * scale
+        max_x = max(0.0, (scaled_w - draw_frame.width()) / 2.0)
+        max_y = max(0.0, (scaled_h - draw_frame.height()) / 2.0)
+        self._pan.setX(float(clamp(self._pan.x(), -max_x, max_x)))
+        self._pan.setY(float(clamp(self._pan.y(), -max_y, max_y)))
+
+    def _draw_image_in_frame(self, painter: QPainter, frame: QRectF) -> None:
+        if self._image.isNull() or frame.width() <= 0 or frame.height() <= 0:
+            return
+        self._clamp_pan(frame)
+        base_scale = max(
+            frame.width() / max(1, self._image.width()),
+            frame.height() / max(1, self._image.height()),
+        )
+        scale = base_scale * self._zoom
+        scaled_w = float(self._image.width()) * scale
+        scaled_h = float(self._image.height()) * scale
+        center = frame.center()
+        target = QRectF(
+            center.x() - (scaled_w / 2.0) + self._pan.x(),
+            center.y() - (scaled_h / 2.0) + self._pan.y(),
+            scaled_w,
+            scaled_h,
+        )
+
+        clip = QPainterPath()
+        clip.addRoundedRect(frame, 6, 6)
+        painter.save()
+        painter.setClipPath(clip)
+        painter.drawImage(target, self._image)
+        painter.restore()
+        painter.setPen(QPen(QColor(42, 224, 203), 2, Qt.PenStyle.SolidLine))
+        painter.drawRoundedRect(frame, 6, 6)
+
+    def render_cropped_image(self, target_size: int = 256) -> QImage:
+        if self._image.isNull():
+            return QImage()
+        side = max(64, int(target_size))
+        output = QImage(side, side, QImage.Format.Format_ARGB32_Premultiplied)
+        output.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(output)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._draw_image_in_frame(painter, QRectF(0.0, 0.0, float(side), float(side)))
+        painter.end()
+        return output
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if event.button() != Qt.MouseButton.LeftButton:
+            return super().mousePressEvent(event)
+        point = event.position().toPoint()
+        if not self._frame_rect.isValid() or not self._frame_rect.contains(point):
+            return super().mousePressEvent(event)
+        self._drag_active = True
+        self._last_pos = point
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._drag_active:
+            return super().mouseMoveEvent(event)
+        point = event.position().toPoint()
+        delta = point - self._last_pos
+        self._last_pos = point
+        self._pan = QPointF(self._pan.x() + delta.x(), self._pan.y() + delta.y())
+        self._clamp_pan()
+        self.view_changed.emit()
+        self.update()
+        event.accept()
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if not self._drag_active:
+            return super().mouseReleaseEvent(event)
+        self._drag_active = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        event.accept()
+
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        point = event.position().toPoint()
+        if self._frame_rect.isValid() and self._frame_rect.contains(point):
+            delta_y = event.angleDelta().y()
+            if delta_y != 0:
+                factor = 1.1 if delta_y > 0 else (1.0 / 1.1)
+                self.set_zoom(self._zoom * factor)
+                event.accept()
+                return
+        super().wheelEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.fillRect(self.rect(), QColor(10, 10, 10, 220))
+        if self._image.isNull():
+            return
+        self._frame_rect = self._calc_frame_rect()
+        if not self._frame_rect.isValid():
+            return
+        self._draw_image_in_frame(painter, QRectF(self._frame_rect))
+
+
+class DroppableImagePathLineEdit(QLineEdit):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        path_handler: Callable[[str], str] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._path_handler = path_handler
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _first_local_file_path(event) -> str:
+        mime = event.mimeData() if event is not None else None
+        if mime is None or not mime.hasUrls():
+            return ""
+        for url in mime.urls():
+            if url.isLocalFile():
+                local_path = str(url.toLocalFile() or "").strip()
+                if local_path:
+                    return local_path
+        return ""
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        path = self._first_local_file_path(event)
+        if path and Path(path).exists() and Path(path).is_file():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        path = self._first_local_file_path(event)
+        if path and Path(path).exists() and Path(path).is_file():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        path = self._first_local_file_path(event)
+        if not path:
+            super().dropEvent(event)
+            return
+        accepted_path = str(path).strip()
+        if self._path_handler is not None:
+            try:
+                accepted_path = str(self._path_handler(accepted_path) or "").strip()
+            except Exception:
+                accepted_path = ""
+        if accepted_path:
+            self.setText(accepted_path)
+        event.acceptProposedAction()
+
+
+class DepotAdminDialog(DepotFramelessToolWindow):
+    def __init__(self, tracker: DepotTracker, current_user: str, app_window: "QuickInputsWindow" | None = None):
+        super().__init__(app_window, window_title="User Setup", theme_kind="admin", size=(760, 520))
+        self.tracker = tracker
+        self.current_user = DepotRules.normalize_user_id(current_user)
+        permission_service = getattr(self.tracker, "permission_service", None)
+        if permission_service is not None:
+            permission_service.require_admin_access(self.current_user)
+        elif not self.tracker.is_admin_user(self.current_user):
+            raise PermissionDeniedError(PermissionService.ADMIN_ACCESS_DENIED_MESSAGE)
+        self._always_on_top_config_key = "admin_window_always_on_top"
+        self._window_always_on_top = self._load_window_always_on_top_preference(self._always_on_top_config_key, default=False)
+        self.set_window_always_on_top(self._window_always_on_top)
+        self._users_cache: dict[str, dict[str, Any]] = {}
+        self._roles_cache: dict[str, dict[str, Any]] = {}
+        self._qa_flag_cache: dict[str, dict[str, Any]] = {}
+        self._selected_role_name = ""
+
+        self.whoami_label = QLabel(f"Current User: {self.current_user}")
+        self.root_layout.addWidget(self.whoami_label)
+
+        self.admin_tabs = QTabWidget(self)
+        self.admin_tabs.setObjectName("AdminTabs")
+        self.root_layout.addWidget(self.admin_tabs, 1)
+
+        self.users_tab = QWidget()
+        self.roles_tab = QWidget()
+        self.qa_tab = QWidget()
+        self.users_tab.setObjectName("AdminUsersTab")
+        self.roles_tab.setObjectName("AdminRolesTab")
+        self.qa_tab.setObjectName("AdminQaTab")
+        self.admin_tabs.addTab(self.users_tab, "Users")
+        self.admin_tabs.addTab(self.roles_tab, "Roles")
+        self.admin_tabs.addTab(self.qa_tab, "Action Flags")
+
+        self._build_users_tab()
+        self._build_roles_tab()
+        self._build_qa_tab()
+
+        if self.app_window is not None:
+            self.apply_theme_styles()
+
+        self.refresh_roles()
+        self.refresh_users()
+        self.refresh_qa_flags()
+
+    def apply_theme_styles(self) -> None:
+        if self.app_window is None:
+            return
+        super().apply_theme_styles()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
+
+    def _build_users_tab(self) -> None:
+        layout = QVBoxLayout(self.users_tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        self.user_id_input = QLineEdit()
+        self.user_name_input = QLineEdit()
+        self.user_location_input = QLineEdit()
+        self.user_role_combo = QComboBox()
+        self.user_role_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self.user_access_combo = QComboBox()
+        self.user_access_combo.addItem("None", DepotRules.ADMIN_ACCESS_NONE)
+        self.user_access_combo.addItem("Reporting", DepotRules.ADMIN_ACCESS_REPORTING)
+        self.user_access_combo.addItem("Admin", DepotRules.ADMIN_ACCESS_ADMIN)
+
+        self.user_icon_input = DroppableImagePathLineEdit(
+            self,
+            path_handler=lambda path: self._accept_dropped_icon_path(
+                path,
+                role_key="user",
+                failure_event_key="ui.user_setup_user_icon_open_failed",
+                failure_summary="User icon drop failed because the image could not be decoded.",
+            ),
+        )
+        self.user_icon_browse = QPushButton("Browse")
+        self.user_icon_browse.setProperty("actionRole", "pick")
+        icon_row = QHBoxLayout()
+        icon_row.setContentsMargins(0, 0, 0, 0)
+        icon_row.setSpacing(4)
+        icon_row.addWidget(self.user_icon_input, 1)
+        icon_row.addWidget(self.user_icon_browse, 0)
+        icon_wrap = QWidget()
+        icon_wrap.setLayout(icon_row)
+
+        form.addRow("User ID", self.user_id_input)
+        form.addRow("Name", self.user_name_input)
+        form.addRow("Location", self.user_location_input)
+        form.addRow("Role", self.user_role_combo)
+        form.addRow("Access", self.user_access_combo)
+        form.addRow("Icon", icon_wrap)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.user_save_btn = QPushButton("Add / Update")
+        self.user_remove_btn = QPushButton("Remove")
+        self.user_clear_btn = QPushButton("Clear")
+        self.user_save_btn.setProperty("actionRole", "save")
+        self.user_remove_btn.setProperty("actionRole", "reset")
+        self.user_clear_btn.setProperty("actionRole", "pick")
+        btn_row.addWidget(self.user_save_btn)
+        btn_row.addWidget(self.user_remove_btn)
+        btn_row.addWidget(self.user_clear_btn)
+        layout.addLayout(btn_row)
+
+        self.users_table = QTableWidget()
+        configure_standard_table(
+            self.users_table,
+            ["User ID", "Name", "Location", "Role", "Access", "Icon"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.Stretch,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+            },
+            stretch_last=True,
+        )
+        layout.addWidget(self.users_table, 1)
+
+        self.user_icon_browse.clicked.connect(self._browse_user_icon)
+        self.user_save_btn.clicked.connect(self._save_user)
+        self.user_remove_btn.clicked.connect(self._remove_selected_user)
+        self.user_clear_btn.clicked.connect(self._clear_user_form)
+        self.users_table.itemSelectionChanged.connect(self._on_user_selected)
+        self.users_table.cellDoubleClicked.connect(self._on_user_double_clicked_row)
+        self._reload_user_role_combo()
+
+    def _build_roles_tab(self) -> None:
+        layout = QVBoxLayout(self.roles_tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        self.role_name_input = QLineEdit()
+        self.role_behavior_combo = QComboBox()
+        for role_slot in (
+            DepotRules.ROLE_SLOT_NONE,
+            DepotRules.ROLE_SLOT_QA,
+            DepotRules.ROLE_SLOT_TECH1,
+            DepotRules.ROLE_SLOT_TECH2,
+            DepotRules.ROLE_SLOT_TECH3,
+            DepotRules.ROLE_SLOT_MP,
+        ):
+            self.role_behavior_combo.addItem(DepotRules.role_slot_label(role_slot), role_slot)
+        form.addRow("Role Name", self.role_name_input)
+        form.addRow("Behavior", self.role_behavior_combo)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.role_save_btn = QPushButton("Add / Update")
+        self.role_remove_btn = QPushButton("Remove")
+        self.role_clear_btn = QPushButton("Clear")
+        self.role_save_btn.setProperty("actionRole", "save")
+        self.role_remove_btn.setProperty("actionRole", "reset")
+        self.role_clear_btn.setProperty("actionRole", "pick")
+        btn_row.addWidget(self.role_save_btn)
+        btn_row.addWidget(self.role_remove_btn)
+        btn_row.addWidget(self.role_clear_btn)
+        layout.addLayout(btn_row)
+
+        self.roles_table = QTableWidget()
+        configure_standard_table(
+            self.roles_table,
+            ["Role", "Behavior"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.Stretch,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+            },
+            stretch_last=True,
+        )
+        layout.addWidget(self.roles_table, 1)
+
+        self.role_save_btn.clicked.connect(self._save_role)
+        self.role_remove_btn.clicked.connect(self._remove_selected_role)
+        self.role_clear_btn.clicked.connect(self._clear_role_form)
+        self.roles_table.itemSelectionChanged.connect(self._on_role_selected)
+        self.roles_table.cellDoubleClicked.connect(self._on_role_double_clicked_row)
+
+    def _build_qa_tab(self) -> None:
+        layout = QVBoxLayout(self.qa_tab)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        form = QFormLayout()
+        self.qa_flag_name_input = QLineEdit()
+        self.qa_flag_severity_combo = QComboBox()
+        for value in QA_FLAG_SEVERITY_OPTIONS:
+            self.qa_flag_severity_combo.addItem(value)
+
+        self.qa_flag_icon_input = DroppableImagePathLineEdit(
+            self,
+            path_handler=lambda path: self._accept_dropped_icon_path(
+                path,
+                role_key="qa_flag",
+                failure_event_key="ui.admin_qa_flag_icon_open_failed",
+                failure_summary="Action flag icon drop failed because the image could not be decoded.",
+            ),
+        )
+        self.qa_flag_icon_browse = QPushButton("Browse")
+        self.qa_flag_icon_browse.setProperty("actionRole", "pick")
+        icon_row = QHBoxLayout()
+        icon_row.setContentsMargins(0, 0, 0, 0)
+        icon_row.setSpacing(4)
+        icon_row.addWidget(self.qa_flag_icon_input, 1)
+        icon_row.addWidget(self.qa_flag_icon_browse, 0)
+        icon_wrap = QWidget()
+        icon_wrap.setLayout(icon_row)
+
+        form.addRow("Flag Name", self.qa_flag_name_input)
+        form.addRow("Severity", self.qa_flag_severity_combo)
+        form.addRow("Icon", icon_wrap)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.qa_flag_save_btn = QPushButton("Add / Update")
+        self.qa_flag_remove_btn = QPushButton("Remove")
+        self.qa_flag_clear_btn = QPushButton("Clear")
+        self.qa_flag_save_btn.setProperty("actionRole", "save")
+        self.qa_flag_remove_btn.setProperty("actionRole", "reset")
+        self.qa_flag_clear_btn.setProperty("actionRole", "pick")
+        btn_row.addWidget(self.qa_flag_save_btn)
+        btn_row.addWidget(self.qa_flag_remove_btn)
+        btn_row.addWidget(self.qa_flag_clear_btn)
+        layout.addLayout(btn_row)
+
+        self.qa_flags_table = QTableWidget()
+        configure_standard_table(
+            self.qa_flags_table,
+            ["Flag Name", "Severity", "Icon"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.Stretch,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+            },
+            stretch_last=True,
+        )
+        layout.addWidget(self.qa_flags_table, 1)
+
+        self.qa_flag_icon_browse.clicked.connect(self._browse_qa_flag_icon)
+        self.qa_flag_save_btn.clicked.connect(self._save_qa_flag)
+        self.qa_flag_remove_btn.clicked.connect(self._remove_selected_qa_flag)
+        self.qa_flag_clear_btn.clicked.connect(self._clear_qa_flag_form)
+        self.qa_flags_table.itemSelectionChanged.connect(self._on_qa_flag_selected)
+        self.qa_flags_table.cellDoubleClicked.connect(self._on_qa_flag_double_clicked_row)
+
+    def _reload_user_role_combo(self) -> None:
+        current_text = str(self.user_role_combo.currentText() or "").strip() if hasattr(self, "user_role_combo") else ""
+        self.user_role_combo.blockSignals(True)
+        self.user_role_combo.clear()
+        self.user_role_combo.addItem("", "")
+        for row in self._roles_cache.values():
+            role_name = str(row.get("role_name", "") or "").strip()
+            if role_name:
+                self.user_role_combo.addItem(role_name, role_name)
+        if current_text:
+            index = self.user_role_combo.findData(current_text)
+            if index < 0:
+                index = self.user_role_combo.findText(current_text)
+            self.user_role_combo.setCurrentIndex(index if index >= 0 else 0)
+        else:
+            self.user_role_combo.setCurrentIndex(0)
+        self.user_role_combo.blockSignals(False)
+
+    def refresh_roles(self) -> None:
+        self._roles_cache.clear()
+        self.roles_table.setRowCount(0)
+        repository = getattr(self.tracker, "user_repository", None)
+        rows = repository.list_role_definitions() if repository is not None else self.tracker.list_role_definitions()
+        for row in rows:
+            role_name = str(row.get("role_name", "") or "").strip()
+            if not role_name:
+                continue
+            role_slot = DepotRules.normalize_role_slot(
+                row.get("role_slot", ""),
+                default=DepotRules.ROLE_SLOT_NONE,
+            )
+            row_idx = self.roles_table.rowCount()
+            self.roles_table.insertRow(row_idx)
+            role_item = QTableWidgetItem(role_name)
+            role_item.setData(Qt.ItemDataRole.UserRole, role_name)
+            behavior_item = QTableWidgetItem(DepotRules.role_slot_label(role_slot))
+            behavior_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            self.roles_table.setItem(row_idx, 0, role_item)
+            self.roles_table.setItem(row_idx, 1, behavior_item)
+            self._roles_cache[role_name] = {
+                "role_slot": role_slot,
+                "sort_order": int(row.get("sort_order", 0) or 0),
+            }
+        self._reload_user_role_combo()
+
+    def refresh_users(self) -> None:
+        self._users_cache.clear()
+        self.users_table.setRowCount(0)
+        repository = getattr(self.tracker, "user_repository", None)
+        rows = repository.list_setup_users() if repository is not None else self.tracker.list_setup_users()
+        for row in rows:
+            user_id = DepotRules.normalize_user_id(str(row.get("user_id", "") or ""))
+            name = str(row.get("name", "") or "").strip()
+            location = str(row.get("location", "") or "").strip()
+            icon_path = str(row.get("icon_path", "") or "").strip()
+            role_name = str(row.get("role_name", "") or "").strip()
+            role_slot = DepotRules.normalize_role_slot(
+                row.get("role_slot", ""),
+                default=DepotRules.ROLE_SLOT_NONE,
+            )
+            access_level = DepotRules.normalize_admin_access_level(
+                row.get("access_level", ""),
+                default=DepotRules.ADMIN_ACCESS_NONE,
+            )
+            row_idx = self.users_table.rowCount()
+            self.users_table.insertRow(row_idx)
+            user_item = QTableWidgetItem(user_id)
+            user_item.setData(Qt.ItemDataRole.UserRole, user_id)
+            name_item = QTableWidgetItem(name)
+            location_item = QTableWidgetItem(location or "-")
+            role_item = QTableWidgetItem(role_name or "-")
+            access_item = QTableWidgetItem(DepotRules.admin_access_label(access_level) if access_level else "-")
+            icon_item = QTableWidgetItem(Path(icon_path).name if icon_path else "-")
+            user_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            role_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            access_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            icon_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            if icon_path and Path(icon_path).exists():
+                user_item.setIcon(QIcon(icon_path))
+                icon_item.setIcon(QIcon(icon_path))
+            self.users_table.setItem(row_idx, 0, user_item)
+            self.users_table.setItem(row_idx, 1, name_item)
+            self.users_table.setItem(row_idx, 2, location_item)
+            self.users_table.setItem(row_idx, 3, role_item)
+            self.users_table.setItem(row_idx, 4, access_item)
+            self.users_table.setItem(row_idx, 5, icon_item)
+            self._users_cache[user_id] = {
+                "name": name,
+                "location": location,
+                "role_name": role_name,
+                "role_slot": role_slot,
+                "access_level": access_level,
+                "icon_path": icon_path,
+            }
+
+    def refresh_agents(self) -> None:
+        self.refresh_users()
+
+    def refresh_qa_flags(self) -> None:
+        self._qa_flag_cache.clear()
+        self.qa_flags_table.setRowCount(0)
+        for row in self.tracker.list_qa_flags():
+            flag_name = str(row.get("flag_name", "") or "").strip()
+            severity = str(row.get("severity", "Medium") or "Medium").strip()
+            icon_path = str(row.get("icon_path", "") or "").strip()
+            row_idx = self.qa_flags_table.rowCount()
+            self.qa_flags_table.insertRow(row_idx)
+            flag_item = QTableWidgetItem(flag_name)
+            flag_item.setData(Qt.ItemDataRole.UserRole, flag_name)
+            severity_item = QTableWidgetItem(severity)
+            icon_item = QTableWidgetItem(Path(icon_path).name if icon_path else "-")
+            flag_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            icon_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            if icon_path and Path(icon_path).exists():
+                flag_item.setIcon(QIcon(icon_path))
+                icon_item.setIcon(QIcon(icon_path))
+            self.qa_flags_table.setItem(row_idx, 0, flag_item)
+            self.qa_flags_table.setItem(row_idx, 1, severity_item)
+            self.qa_flags_table.setItem(row_idx, 2, icon_item)
+            self._qa_flag_cache[flag_name] = {
+                "severity": severity,
+                "icon_path": icon_path,
+            }
+        self._notify_qa_flag_list_changed()
+
+    def refresh_admins(self) -> None:
+        self.refresh_users()
+
+    def _notify_user_list_changed(self) -> None:
+        if self.app_window is None:
+            return
+        self.app_window._apply_depot_access_controls()
+        self.app_window._refresh_shared_linked_views(
+            "agent_missing_po",
+            "dashboard_completed",
+            "qa_assigned",
+            "qa_delivered",
+            "qa_missing_po",
+            "qa_owner",
+            reason="user_setup_users_changed",
+        )
+
+    def _notify_qa_flag_list_changed(self) -> None:
+        if self.app_window is None:
+            return
+        self.app_window._refresh_shared_linked_views(
+            "agent_category",
+            "agent_parts",
+            "dashboard_completed",
+            "qa_assigned",
+            "qa_delivered",
+            "qa_flags",
+            "qa_missing_po",
+            reason="admin_qa_flags_changed",
+        )
+
+    def _clear_user_form(self) -> None:
+        self.user_id_input.clear()
+        self.user_name_input.clear()
+        self.user_location_input.clear()
+        self.user_role_combo.setCurrentIndex(0)
+        self.user_access_combo.setCurrentIndex(0)
+        self.user_icon_input.clear()
+
+    def _clear_role_form(self) -> None:
+        self._selected_role_name = ""
+        self.role_name_input.clear()
+        self.role_behavior_combo.setCurrentIndex(0)
+
+    def _clear_qa_flag_form(self) -> None:
+        self.qa_flag_name_input.clear()
+        self.qa_flag_severity_combo.setCurrentIndex(1 if self.qa_flag_severity_combo.count() > 1 else 0)
+        self.qa_flag_icon_input.clear()
+
+    def _load_user_into_form(self, user_id: str) -> bool:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return False
+        data = self._users_cache.get(normalized)
+        if not data:
+            return False
+        self.user_id_input.setText(normalized)
+        self.user_name_input.setText(str(data.get("name", "")))
+        self.user_location_input.setText(str(data.get("location", "")))
+        role_name = str(data.get("role_name", "") or "").strip()
+        role_index = self.user_role_combo.findData(role_name)
+        if role_index < 0:
+            role_index = self.user_role_combo.findText(role_name)
+        self.user_role_combo.setCurrentIndex(role_index if role_index >= 0 else 0)
+        access_level = DepotRules.normalize_admin_access_level(
+            data.get("access_level", ""),
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+        access_index = self.user_access_combo.findData(access_level)
+        self.user_access_combo.setCurrentIndex(access_index if access_index >= 0 else 0)
+        self.user_icon_input.setText(str(data.get("icon_path", "")))
+        return True
+
+    def _load_role_into_form(self, role_name: str) -> bool:
+        normalized_name = str(role_name or "").strip()
+        if not normalized_name:
+            return False
+        details = self._roles_cache.get(normalized_name)
+        if not details:
+            return False
+        self._selected_role_name = normalized_name
+        self.role_name_input.setText(normalized_name)
+        role_slot = DepotRules.normalize_role_slot(
+            details.get("role_slot", ""),
+            default=DepotRules.ROLE_SLOT_NONE,
+        )
+        role_index = self.role_behavior_combo.findData(role_slot)
+        self.role_behavior_combo.setCurrentIndex(role_index if role_index >= 0 else 0)
+        return True
+
+    def _select_role_item(self, role_name: str) -> None:
+        normalized_name = str(role_name or "").strip()
+        if not normalized_name:
+            return
+        for idx in range(self.roles_table.rowCount()):
+            item = self.roles_table.item(idx, 0)
+            if item is None:
+                continue
+            if str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip().casefold() == normalized_name.casefold():
+                self.roles_table.selectRow(idx)
+                return
+
+    def _select_user_item(self, user_id: str) -> None:
+        normalized = DepotRules.normalize_user_id(user_id)
+        if not normalized:
+            return
+        for idx in range(self.users_table.rowCount()):
+            item = self.users_table.item(idx, 0)
+            if item is None:
+                continue
+            row_user = DepotRules.normalize_user_id(str(item.data(Qt.ItemDataRole.UserRole) or item.text() or ""))
+            if row_user == normalized:
+                self.users_table.selectRow(idx)
+                return
+
+    def _on_user_selected(self) -> None:
+        row = self.users_table.currentRow()
+        if row < 0:
+            return
+        item = self.users_table.item(row, 0)
+        if item is None:
+            return
+        user_id = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "")
+        if not self._load_user_into_form(user_id):
+            return
+
+    def _on_user_double_clicked_row(self, row: int, _column: int) -> None:
+        if row < 0:
+            return
+        item = self.users_table.item(row, 0)
+        if item is None:
+            return
+        user_id = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "")
+        if not self._load_user_into_form(user_id):
+            return
+        self.user_name_input.setFocus()
+        self.user_name_input.selectAll()
+
+    def _on_role_selected(self) -> None:
+        row = self.roles_table.currentRow()
+        if row < 0:
+            return
+        item = self.roles_table.item(row, 0)
+        if item is None:
+            return
+        role_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+        self._load_role_into_form(role_name)
+
+    def _on_role_double_clicked_row(self, row: int, _column: int) -> None:
+        if row < 0:
+            return
+        item = self.roles_table.item(row, 0)
+        if item is None:
+            return
+        role_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+        if not self._load_role_into_form(role_name):
+            return
+        self.role_name_input.setFocus()
+        self.role_name_input.selectAll()
+
+    def _on_qa_flag_selected(self) -> None:
+        row = self.qa_flags_table.currentRow()
+        if row < 0:
+            return
+        item = self.qa_flags_table.item(row, 0)
+        if item is None:
+            return
+        flag_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+        if not flag_name:
+            return
+        details = self._qa_flag_cache.get(flag_name, {})
+        self.qa_flag_name_input.setText(flag_name)
+        severity = str(details.get("severity", "Medium") or "Medium")
+        idx = self.qa_flag_severity_combo.findText(severity)
+        self.qa_flag_severity_combo.setCurrentIndex(idx if idx >= 0 else 1)
+        self.qa_flag_icon_input.setText(str(details.get("icon_path", "") or ""))
+
+    def _on_qa_flag_double_clicked_row(self, row: int, _column: int) -> None:
+        if row < 0:
+            return
+        self.qa_flags_table.selectRow(row)
+        self._on_qa_flag_selected()
+
+    @staticmethod
+    def _image_file_dialog_filter() -> str:
+        patterns: list[str] = []
+        for fmt in QImageReader.supportedImageFormats():
+            try:
+                ext = bytes(fmt).decode("ascii", errors="ignore").strip().lower()
+            except Exception:
+                ext = ""
+            if ext:
+                patterns.append(f"*.{ext}")
+        if patterns:
+            deduped = " ".join(sorted(set(patterns)))
+            return f"Images ({deduped});;All Files (*.*)"
+        return "All Files (*.*)"
+
+    @staticmethod
+    def _read_icon_image(path: str) -> tuple[QImage, str]:
+        reader = QImageReader(path)
+        reader.setAutoTransform(True)
+        image = reader.read()
+        if not image.isNull():
+            return image, ""
+        error_text = str(reader.errorString() or "").strip()
+        fallback_pixmap = QPixmap(path)
+        if not fallback_pixmap.isNull():
+            return fallback_pixmap.toImage(), ""
+        if not error_text:
+            error_text = "Unsupported or corrupted image format."
+        return QImage(), error_text
+
+    @staticmethod
+    def _initial_image_browse_dir(current_path: str = "") -> str:
+        raw_path = str(current_path or "").strip()
+        if raw_path:
+            candidate = Path(raw_path)
+            if candidate.exists():
+                if candidate.is_file():
+                    return str(candidate.parent)
+                if candidate.is_dir():
+                    return str(candidate)
+            parent_dir = candidate.parent if str(candidate.parent) else Path.home()
+            if parent_dir.exists():
+                return str(parent_dir)
+        return str(Path.home())
+
+    def _select_native_image_file(self, dialog_title: str, current_path: str = "") -> str:
+        selected_path, _ = QFileDialog.getOpenFileName(
+            self,
+            str(dialog_title or "").strip() or "Select Image",
+            self._initial_image_browse_dir(current_path),
+            self._image_file_dialog_filter(),
+        )
+        return str(selected_path or "").strip()
+
+    def _accept_dropped_icon_path(
+        self,
+        icon_path: str,
+        *,
+        role_key: str,
+        failure_event_key: str,
+        failure_summary: str,
+    ) -> str:
+        normalized_path = str(icon_path or "").strip()
+        if not normalized_path:
+            return ""
+        return self._edit_icon_with_popup(
+            normalized_path,
+            role_key=role_key,
+            failure_event_key=failure_event_key,
+            failure_summary=failure_summary,
+        )
+
+    def _browse_qa_flag_icon(self) -> None:
+        selected = self._select_icon_path_with_editor(
+            "Select QA Flag Icon",
+            role_key="qa_flag",
+            failure_event_key="ui.admin_qa_flag_icon_open_failed",
+            failure_summary="Action flag icon selection failed because the image could not be decoded.",
+            current_path=str(self.qa_flag_icon_input.text() or ""),
+        )
+        if selected:
+            self.qa_flag_icon_input.setText(selected)
+
+    def _write_cropped_temp_icon(self, image: QImage, role_key: str = "agent") -> str:
+        if image.isNull():
+            return ""
+        safe_key = re.sub(r"[^A-Za-z0-9_-]+", "_", str(role_key or "agent")).strip("_") or "agent"
+        temp_dir = self.tracker.db.db_path.parent / ASSETS_DIR_NAME / "_icon_tmp" / safe_key
+        try:
+            temp_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.admin_crop_temp_dir_create_failed",
+                severity="warning",
+                summary="Failed creating temporary crop icon directory.",
+                exc=exc,
+                context={"temp_dir": str(temp_dir)},
+            )
+            return ""
+        stamp = int(time.time() * 1000)
+        temp_path = temp_dir / f"crop_{stamp}.png"
+        try:
+            if image.save(str(temp_path), "PNG"):
+                return str(temp_path)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.admin_crop_temp_write_failed",
+                severity="warning",
+                summary="Failed writing cropped icon temp file.",
+                exc=exc,
+                context={"temp_path": str(temp_path)},
+            )
+            return ""
+        return ""
+
+    def _edit_icon_with_popup(
+        self,
+        icon_path: str,
+        *,
+        role_key: str,
+        failure_event_key: str,
+        failure_summary: str,
+    ) -> str:
+        image, load_error = self._read_icon_image(icon_path)
+        if image.isNull():
+            _runtime_log_event(
+                failure_event_key,
+                severity="warning",
+                summary=failure_summary,
+                context={
+                    "icon_path": str(icon_path),
+                    "error": load_error,
+                },
+            )
+            details = f"\n\nDetails: {load_error}" if load_error else ""
+            self._show_themed_message(QMessageBox.Icon.Warning, "Invalid Image", f"Could not open that image file.{details}")
+            return ""
+        dialog = IconCropDialog(image, app_window=self.app_window, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return ""
+        result_image = dialog.result_image()
+        if result_image.isNull():
+            return ""
+        written = self._write_cropped_temp_icon(result_image, role_key=role_key)
+        if not written:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Save Failed", "Failed to prepare cropped icon.")
+        return written
+
+    def _select_icon_path_with_editor(
+        self,
+        dialog_title: str,
+        *,
+        role_key: str,
+        failure_event_key: str,
+        failure_summary: str,
+        current_path: str = "",
+    ) -> str:
+        icon_path = self._select_native_image_file(dialog_title, current_path=current_path)
+        if not icon_path:
+            return ""
+        return self._edit_icon_with_popup(
+            icon_path,
+            role_key=role_key,
+            failure_event_key=failure_event_key,
+            failure_summary=failure_summary,
+        )
+
+    def _browse_user_icon(self) -> None:
+        selected = self._select_icon_path_with_editor(
+            "Select User Icon",
+            role_key="user",
+            failure_event_key="ui.user_setup_user_icon_open_failed",
+            failure_summary="User icon selection failed because the image could not be decoded.",
+            current_path=str(self.user_icon_input.text() or ""),
+        )
+        if selected:
+            self.user_icon_input.setText(selected)
+
+    def _save_user(self) -> None:
+        user_id = DepotRules.normalize_user_id(self.user_id_input.text())
+        name = str(self.user_name_input.text() or "").strip()
+        location = str(self.user_location_input.text() or "").strip()
+        role_name = str(self.user_role_combo.currentData() or self.user_role_combo.currentText() or "").strip()
+        access_level = DepotRules.normalize_admin_access_level(
+            self.user_access_combo.currentData(),
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+        icon_path = str(self.user_icon_input.text() or "").strip()
+        if not user_id or not name:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "User ID and Name are required.")
+            return
+        if not role_name:
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Validation",
+                "Role is required.",
+            )
+            return
+        existing_row = self._users_cache.get(user_id, {})
+        existing_access = DepotRules.normalize_admin_access_level(
+            existing_row.get("access_level", ""),
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+        if user_id == self.current_user and existing_access == DepotRules.ADMIN_ACCESS_ADMIN and access_level != DepotRules.ADMIN_ACCESS_ADMIN:
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Validation",
+                "Cannot remove your own admin access from User Setup.",
+            )
+            return
+        if icon_path and not Path(icon_path).exists():
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Icon path does not exist. Browse and select a valid icon.")
+            return
+        repository = getattr(self.tracker, "user_repository", None)
+        try:
+            saved = (
+                repository.upsert_setup_user(user_id, name, role_name, location, access_level, icon_path)
+                if repository is not None
+                else self.tracker.upsert_setup_user(user_id, name, role_name, location, access_level, icon_path)
+            )
+        except ValueError as exc:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", str(exc))
+            return
+        self.user_icon_input.setText(str(saved.get("icon_path", "") or ""))
+        self.refresh_users()
+        self._select_user_item(user_id)
+        self._load_user_into_form(user_id)
+        self._notify_user_list_changed()
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"User {user_id} updated.")
+
+    def _remove_selected_user(self) -> None:
+        row = self.users_table.currentRow()
+        if row < 0:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a user to remove.")
+            return
+        item = self.users_table.item(row, 0)
+        if item is None:
+            return
+        user_id = DepotRules.normalize_user_id(str(item.data(Qt.ItemDataRole.UserRole) or item.text() or ""))
+        if not user_id:
+            return
+        row_data = self._users_cache.get(user_id, {})
+        access_level = DepotRules.normalize_admin_access_level(
+            row_data.get("access_level", ""),
+            default=DepotRules.ADMIN_ACCESS_NONE,
+        )
+        if user_id == self.current_user and access_level == DepotRules.ADMIN_ACCESS_ADMIN:
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Validation",
+                "Cannot remove your own admin access from User Setup.",
+            )
+            return
+        repository = getattr(self.tracker, "user_repository", None)
+        if repository is not None:
+            repository.delete_setup_user(user_id)
+        else:
+            self.tracker.delete_setup_user(user_id)
+        self.refresh_users()
+        self._clear_user_form()
+        self._notify_user_list_changed()
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"User {user_id} removed.")
+
+    def _save_role(self) -> None:
+        role_name = str(self.role_name_input.text() or "").strip()
+        role_slot = DepotRules.normalize_role_slot(
+            self.role_behavior_combo.currentData(),
+            default=DepotRules.ROLE_SLOT_NONE,
+        )
+        if not role_name:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Role name is required.")
+            return
+        repository = getattr(self.tracker, "user_repository", None)
+        try:
+            saved = (
+                repository.upsert_role_definition(role_name, role_slot, original_role_name=self._selected_role_name)
+                if repository is not None
+                else self.tracker.upsert_role_definition(role_name, role_slot, original_role_name=self._selected_role_name)
+            )
+        except ValueError as exc:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", str(exc))
+            return
+        self.refresh_roles()
+        self.refresh_users()
+        self._select_role_item(str(saved.get("role_name", "") or role_name))
+        self._notify_user_list_changed()
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"Role {role_name} updated.")
+
+    def _remove_selected_role(self) -> None:
+        row = self.roles_table.currentRow()
+        if row < 0:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a role to remove.")
+            return
+        item = self.roles_table.item(row, 0)
+        if item is None:
+            return
+        role_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+        if not role_name:
+            return
+        repository = getattr(self.tracker, "user_repository", None)
+        try:
+            if repository is not None:
+                repository.delete_role_definition(role_name)
+            else:
+                self.tracker.delete_role_definition(role_name)
+        except ValueError as exc:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", str(exc))
+            return
+        self.refresh_roles()
+        self.refresh_users()
+        self._clear_role_form()
+        self._notify_user_list_changed()
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"Role {role_name} removed.")
+
+    def _save_qa_flag(self) -> None:
+        flag_name = str(self.qa_flag_name_input.text() or "").strip()
+        severity = str(self.qa_flag_severity_combo.currentText() or "Medium").strip()
+        icon_path = str(self.qa_flag_icon_input.text() or "").strip()
+        if not flag_name:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Flag name is required.")
+            return
+        if icon_path and not Path(icon_path).exists():
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Flag icon path does not exist.")
+            return
+        selected_row = self.qa_flags_table.currentRow()
+        selected_name = ""
+        if selected_row >= 0:
+            selected_item = self.qa_flags_table.item(selected_row, 0)
+            if selected_item is not None:
+                selected_name = str(selected_item.data(Qt.ItemDataRole.UserRole) or selected_item.text() or "").strip()
+        if selected_name and selected_name != flag_name and flag_name in self._qa_flag_cache:
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Validation",
+                "A QA flag with that name already exists.",
+            )
+            return
+        self.tracker.upsert_qa_flag(flag_name, severity, icon_path)
+        if selected_name and selected_name != flag_name:
+            self.tracker.delete_qa_flag(selected_name)
+        self.refresh_qa_flags()
+        for row_idx in range(self.qa_flags_table.rowCount()):
+            cell = self.qa_flags_table.item(row_idx, 0)
+            if cell is None:
+                continue
+            name = str(cell.data(Qt.ItemDataRole.UserRole) or cell.text() or "").strip()
+            if name == flag_name:
+                self.qa_flags_table.selectRow(row_idx)
+                break
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"QA flag '{flag_name}' updated.")
+
+    def _remove_selected_qa_flag(self) -> None:
+        row = self.qa_flags_table.currentRow()
+        if row < 0:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a QA flag to remove.")
+            return
+        item = self.qa_flags_table.item(row, 0)
+        if item is None:
+            return
+        flag_name = str(item.data(Qt.ItemDataRole.UserRole) or item.text() or "").strip()
+        if not flag_name:
+            return
+        self.tracker.delete_qa_flag(flag_name)
+        self.refresh_qa_flags()
+        self._clear_qa_flag_form()
+        self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"QA flag '{flag_name}' removed.")
+
+
+class TouchDistributionBar(QWidget):
+    """Simple stacked bar showing filtered submission touch counts by color."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._segments: list[tuple[str, int, str]] = []
+        self._total = 0
+        self.setMinimumHeight(24)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_segments(self, segments: list[tuple[str, int, str]]) -> None:
+        cleaned: list[tuple[str, int, str]] = []
+        total = 0
+        for label, count, color in segments:
+            safe_count = int(max(0, int(count)))
+            if safe_count <= 0:
+                continue
+            safe_color = normalize_hex(str(color or "#7BDAEA"), "#7BDAEA")
+            cleaned.append((str(label), safe_count, safe_color))
+            total += safe_count
+        self._segments = cleaned
+        self._total = total
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = self.rect().adjusted(0, 0, -1, -1)
+        if bounds.width() <= 2 or bounds.height() <= 2:
+            return
+
+        bar_path = QPainterPath()
+        bar_path.addRoundedRect(QRectF(bounds), 6.0, 6.0)
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(12, 18, 24, 110))
+        painter.drawPath(bar_path)
+
+        if self._total > 0 and self._segments:
+            painter.save()
+            painter.setClipPath(bar_path)
+            full_width = float(bounds.width())
+            x = float(bounds.left())
+            remaining_width = full_width
+            remaining_total = int(self._total)
+            for idx, (_label, count, color_hex) in enumerate(self._segments):
+                if idx == len(self._segments) - 1:
+                    segment_width = remaining_width
+                else:
+                    ratio = float(count) / max(1.0, float(remaining_total))
+                    segment_width = max(1.0, round(remaining_width * ratio, 2))
+                segment_rect = QRectF(x, float(bounds.top()), segment_width, float(bounds.height()))
+                painter.setBrush(QColor(color_hex))
+                painter.drawRect(segment_rect)
+                x += segment_width
+                remaining_width -= segment_width
+                remaining_total -= count
+            painter.restore()
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 72), 1))
+        painter.drawPath(bar_path)
+
+
+class DashboardTrendChart(QWidget):
+    """Stacked daily chart for submission touch rows with distinct-unit markers."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._rows: list[dict[str, Any]] = []
+        self._series_colors: dict[str, str] = {
+            "complete": "#21B46D",
+            "junk": "#D95A5A",
+            "part_order": "#D3A327",
+            "rtv": "#4F86D9",
+            "triaged": "#20AFA8",
+            "other": "#5B708A",
+        }
+        self.setMinimumHeight(250)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def clear_series(self) -> None:
+        self._rows = []
+        self.update()
+
+    def set_series(self, rows: list[dict[str, Any]]) -> None:
+        cleaned: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry_date = str(row.get("entry_date", "") or "").strip()
+            if not entry_date:
+                continue
+            cleaned.append(
+                {
+                    "entry_date": entry_date,
+                    "total_rows": int(max(0, safe_int(row.get("total_rows", 0), 0))),
+                    "units": int(max(0, safe_int(row.get("units", 0), 0))),
+                    "complete": int(max(0, safe_int(row.get("complete", 0), 0))),
+                    "junk": int(max(0, safe_int(row.get("junk", 0), 0))),
+                    "part_order": int(max(0, safe_int(row.get("part_order", 0), 0))),
+                    "rtv": int(max(0, safe_int(row.get("rtv", 0), 0))),
+                    "triaged": int(max(0, safe_int(row.get("triaged", 0), 0))),
+                    "other": int(max(0, safe_int(row.get("other", 0), 0))),
+                }
+            )
+        self._rows = cleaned
+        self.update()
+
+    @staticmethod
+    def _label_for_date(raw_value: str) -> str:
+        text = str(raw_value or "").strip()
+        if len(text) >= 10:
+            try:
+                parsed = datetime.strptime(text[:10], "%Y-%m-%d")
+                return parsed.strftime("%m-%d")
+            except Exception:
+                return text[:10]
+        return text
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bounds = self.rect().adjusted(0, 0, -1, -1)
+        if bounds.width() <= 8 or bounds.height() <= 8:
+            return
+
+        panel_path = QPainterPath()
+        panel_path.addRoundedRect(QRectF(bounds), 8.0, 8.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(12, 18, 24, 110))
+        painter.drawPath(panel_path)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 72), 1))
+        painter.drawPath(panel_path)
+
+        if not self._rows:
+            painter.setPen(QColor(210, 220, 230, 170))
+            painter.drawText(bounds, Qt.AlignmentFlag.AlignCenter, "No submission activity for the selected range.")
+            return
+
+        left_pad = 46
+        right_pad = 12
+        top_pad = 24
+        bottom_pad = 44
+        chart_rect = QRectF(
+            float(bounds.left() + left_pad),
+            float(bounds.top() + top_pad),
+            float(max(10, bounds.width() - left_pad - right_pad)),
+            float(max(10, bounds.height() - top_pad - bottom_pad)),
+        )
+        if chart_rect.width() <= 12 or chart_rect.height() <= 12:
+            return
+
+        max_value = 0
+        for row in self._rows:
+            max_value = max(
+                max_value,
+                int(row.get("total_rows", 0)),
+                int(row.get("complete", 0)),
+                int(row.get("junk", 0)),
+                int(row.get("part_order", 0)),
+                int(row.get("rtv", 0)),
+                int(row.get("triaged", 0)),
+                int(row.get("other", 0)),
+            )
+        max_value = max(1, max_value)
+
+        guide_steps = 4
+        painter.setPen(QPen(QColor(255, 255, 255, 42), 1))
+        for idx in range(guide_steps + 1):
+            ratio = float(idx) / float(guide_steps)
+            y = chart_rect.bottom() - (chart_rect.height() * ratio)
+            painter.drawLine(QPointF(chart_rect.left(), y), QPointF(chart_rect.right(), y))
+            label_value = int(round(max_value * ratio))
+            painter.setPen(QColor(225, 232, 240, 150))
+            painter.drawText(
+                QRectF(float(bounds.left() + 4), y - 10.0, float(left_pad - 8), 20.0),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                str(label_value),
+            )
+            painter.setPen(QPen(QColor(255, 255, 255, 42), 1))
+
+        row_count = len(self._rows)
+        slot_width = chart_rect.width() / max(1, row_count)
+        bar_width = max(6.0, min(22.0, slot_width * 0.62))
+        complete_color = QColor(self._series_colors["complete"])
+        junk_color = QColor(self._series_colors["junk"])
+        part_order_color = QColor(self._series_colors["part_order"])
+        rtv_color = QColor(self._series_colors["rtv"])
+        triaged_color = QColor(self._series_colors["triaged"])
+        other_color = QColor(self._series_colors["other"])
+        label_step = max(1, math.ceil(row_count / 14.0))
+
+        for idx, row in enumerate(self._rows):
+            center_x = chart_rect.left() + (slot_width * idx) + (slot_width / 2.0)
+            total_rows_value = int(row.get("total_rows", 0))
+            units_value = int(row.get("units", 0))
+            complete_value = int(row.get("complete", 0))
+            junk_value = int(row.get("junk", 0))
+            part_order_value = int(row.get("part_order", 0))
+            rtv_value = int(row.get("rtv", 0))
+            triaged_value = int(row.get("triaged", 0))
+            other_value = int(row.get("other", 0))
+            if total_rows_value <= 0:
+                continue
+
+            bar_left = center_x - (bar_width / 2.0)
+            current_bottom = chart_rect.bottom()
+            segments = (
+                ("complete", complete_value, complete_color),
+                ("junk", junk_value, junk_color),
+                ("part_order", part_order_value, part_order_color),
+                ("rtv", rtv_value, rtv_color),
+                ("triaged", triaged_value, triaged_color),
+                ("other", other_value, other_color),
+            )
+            positive_segment_indexes = [seg_idx for seg_idx, (_label, value, _color) in enumerate(segments) if int(max(0, value)) > 0]
+            last_positive_index = positive_segment_indexes[-1] if positive_segment_indexes else -1
+            painter.setPen(Qt.PenStyle.NoPen)
+            for seg_idx, (_label, value, color) in enumerate(segments):
+                safe_value = int(max(0, value))
+                if safe_value <= 0:
+                    continue
+                seg_height = (float(safe_value) / float(max_value)) * chart_rect.height()
+                segment_rect = QRectF(
+                    bar_left,
+                    current_bottom - seg_height,
+                    bar_width,
+                    seg_height,
+                )
+                painter.setBrush(color)
+                if seg_idx == last_positive_index:
+                    painter.drawRoundedRect(segment_rect, 3.0, 3.0)
+                else:
+                    painter.drawRect(segment_rect)
+                current_bottom -= seg_height
+
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255, 38), 1))
+            total_height = (float(total_rows_value) / float(max_value)) * chart_rect.height()
+            total_rect = QRectF(
+                bar_left,
+                chart_rect.bottom() - total_height,
+                bar_width,
+                total_height,
+            )
+            painter.drawRoundedRect(total_rect, 3.0, 3.0)
+
+            painter.setPen(QColor(230, 236, 243, 190))
+            units_text_rect = QRectF(center_x - max(26.0, slot_width / 2.0), total_rect.top() - 18.0, max(52.0, slot_width), 14.0)
+            painter.drawText(units_text_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, f"U:{units_value}")
+
+            if idx % label_step == 0 or idx == row_count - 1:
+                painter.setPen(QColor(225, 232, 240, 165))
+                label_rect = QRectF(center_x - max(22.0, slot_width / 2.0), chart_rect.bottom() + 6.0, max(44.0, slot_width), 18.0)
+                painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, self._label_for_date(str(row.get("entry_date", ""))))
+
+        legend_items = (
+            ("Complete", complete_color),
+            ("JO", junk_color),
+            ("PO", part_order_color),
+            ("RTV", rtv_color),
+            ("Tri", triaged_color),
+            ("Other", other_color),
+        )
+        legend_x = chart_rect.left()
+        legend_y = float(bounds.top() + 4)
+        for label, color in legend_items:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(legend_x, legend_y, 12.0, 12.0), 2.0, 2.0)
+            painter.setPen(QColor(230, 236, 243, 190))
+            text_width = 58.0 if label in ("PO", "RTV", "Tri") else 76.0
+            if label == "Other":
+                text_width = 70.0
+            painter.drawText(QRectF(legend_x + 16.0, legend_y - 2.0, text_width, 18.0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+            legend_x += text_width + 18.0
+
+
+class DepotDashboardDialog(DepotFramelessToolWindow):
+    """Tracker data viewer using shared frameless chrome plus filtered submissions metrics."""
+
+    TIMEFRAME_OPTIONS: tuple[tuple[str, str], ...] = (
+        ("current_week", "Current Week"),
+        ("today", "Today"),
+        ("yesterday", "Yesterday"),
+        ("last_7_days", "Last 7 Days"),
+        ("last_30_days", "Last 30 Days"),
+        ("this_month", "This Month"),
+        ("all_time", "All Time"),
+        ("custom", "Custom"),
+    )
+
+    TOUCH_ORDER: tuple[str, ...] = (
+        DepotRules.TOUCH_COMPLETE,
+        DepotRules.TOUCH_JUNK,
+        DepotRules.TOUCH_PART_ORDER,
+        DepotRules.TOUCH_RTV,
+        "Triaged",
+        DepotRules.TOUCH_OTHER,
+    )
+
+    TOUCH_COLORS: dict[str, str] = {
+        DepotRules.TOUCH_COMPLETE: "#21B46D",
+        DepotRules.TOUCH_JUNK: "#D95A5A",
+        DepotRules.TOUCH_PART_ORDER: "#D3A327",
+        DepotRules.TOUCH_RTV: "#4F86D9",
+        "Triaged": "#20AFA8",
+        DepotRules.TOUCH_OTHER: "#8E97A8",
+    }
+
+    def __init__(self, app_window: "QuickInputsWindow") -> None:
+        super().__init__(
+            app_window,
+            window_title="Data Dashboard",
+            theme_kind="dashboard",
+            size=(1040, 620),
+            minimum_size=(860, 500),
+        )
+        self.app_window = app_window
+        permission_service = getattr(getattr(self.app_window, "app_context", None), "permission_service", None)
+        if permission_service is not None:
+            permission_service.require_dashboard_access(getattr(self.app_window, "current_user", ""))
+        elif not self.app_window.depot_tracker.can_access_dashboard(getattr(self.app_window, "current_user", "")):
+            raise PermissionDeniedError(PermissionService.DASHBOARD_ACCESS_DENIED_MESSAGE)
+        self._always_on_top_config_key = "dashboard_window_always_on_top"
+        self._window_always_on_top = self._load_window_always_on_top_preference(self._always_on_top_config_key, default=False)
+        self.set_window_always_on_top(self._window_always_on_top)
+        self._date_sync_in_progress = False
+        body = QWidget(self)
+        self.root_layout.addWidget(body, 1)
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(UI_SPACING_FRAMELESS_TOOL)
+
+        subtitle = QLabel("Live table view from Tracker Hub data.")
+        subtitle.setProperty("muted", True)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
+        controls.addWidget(QLabel("Table:"), 0)
+        self.table_combo = QComboBox()
+        for table_name, label_text in TRACKER_DASHBOARD_TABLES:
+            self.table_combo.addItem(label_text, table_name)
+        self.table_combo.setMaxVisibleItems(max(8, len(TRACKER_DASHBOARD_TABLES)))
+        self.table_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
+        self.table_combo.setMinimumWidth(220)
+        self.table_combo.setMaximumWidth(340)
+        controls.addWidget(self.table_combo, 0)
+        controls.addSpacing(8)
+        controls.addWidget(QLabel("Rows:"), 0)
+        self.limit_spin = QSpinBox()
+        self.limit_spin.setRange(50, 5000)
+        self.limit_spin.setSingleStep(50)
+        self.limit_spin.setValue(300)
+        self.limit_spin.setMinimumWidth(110)
+        controls.addWidget(self.limit_spin, 0)
+        controls.addStretch(1)
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setProperty("actionRole", "pick")
+        self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setProperty("actionRole", "save")
+        controls.addWidget(self.refresh_btn, 0)
+        controls.addWidget(self.export_btn, 0)
+        layout.addLayout(controls)
+
+        self.dashboard_filters_wrap = QWidget(self)
+        dashboard_filters = QHBoxLayout(self.dashboard_filters_wrap)
+        dashboard_filters.setContentsMargins(0, 0, 0, 0)
+        dashboard_filters.setSpacing(6)
+        dashboard_filters.addWidget(QLabel("Category:"), 0)
+        self.category_filter_combo = QComboBox()
+        self.category_filter_combo.addItem("All Categories", "")
+        self.category_filter_combo.setMinimumWidth(180)
+        dashboard_filters.addWidget(self.category_filter_combo, 0)
+        dashboard_filters.addStretch(1)
+        layout.addWidget(self.dashboard_filters_wrap)
+
+        self.submission_filters_wrap = QWidget(self)
+        submission_filters = QHBoxLayout(self.submission_filters_wrap)
+        submission_filters.setContentsMargins(0, 0, 0, 0)
+        submission_filters.setSpacing(6)
+        submission_filters.addWidget(QLabel("Range:"), 0)
+        self.timeframe_combo = QComboBox()
+        for key, label in self.TIMEFRAME_OPTIONS:
+            self.timeframe_combo.addItem(label, key)
+        submission_filters.addWidget(self.timeframe_combo, 0)
+        submission_filters.addWidget(QLabel("From:"), 0)
+        self.start_date_edit = QDateEdit()
+        self.start_date_edit.setCalendarPopup(True)
+        self.start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        submission_filters.addWidget(self.start_date_edit, 0)
+        submission_filters.addWidget(QLabel("To:"), 0)
+        self.end_date_edit = QDateEdit()
+        self.end_date_edit.setCalendarPopup(True)
+        self.end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        submission_filters.addWidget(self.end_date_edit, 0)
+        submission_filters.addWidget(QLabel("User:"), 0)
+        self.user_filter_combo = QComboBox()
+        self.user_filter_combo.addItem("All Users", "")
+        self.user_filter_combo.setMinimumWidth(160)
+        submission_filters.addWidget(self.user_filter_combo, 0)
+        submission_filters.addStretch(1)
+        layout.addWidget(self.submission_filters_wrap)
+
+        self.touch_summary_label = QLabel("")
+        self.touch_summary_label.setProperty("muted", True)
+        self.touch_summary_label.setWordWrap(True)
+        layout.addWidget(self.touch_summary_label)
+
+        self.touch_bar = TouchDistributionBar(self)
+        layout.addWidget(self.touch_bar)
+
+        self.touch_legend_label = QLabel("")
+        self.touch_legend_label.setWordWrap(True)
+        layout.addWidget(self.touch_legend_label)
+
+        self.empty_hint = QLabel("")
+        self.empty_hint.setProperty("muted", True)
+        self.empty_hint.setWordWrap(True)
+        self.empty_hint.hide()
+        layout.addWidget(self.empty_hint)
+
+        self.results_tabs = QTabWidget(self)
+        self.list_tab = QWidget(self.results_tabs)
+        self.table_tab = QWidget(self.results_tabs)
+        self.completed_tab = QWidget(self.results_tabs)
+        self.notes_tab = QWidget(self.results_tabs)
+        self.results_tabs.addTab(self.list_tab, "List")
+        self.results_tabs.addTab(self.table_tab, "Table")
+        self.results_tabs.addTab(self.completed_tab, "Completed")
+        self.results_tabs.addTab(self.notes_tab, "Notes")
+        layout.addWidget(self.results_tabs, 1)
+
+        list_layout = QVBoxLayout(self.list_tab)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(4)
+        self.table = QTableWidget()
+        configure_standard_table(self.table, [])
+        list_layout.addWidget(self.table, 1)
+
+        table_layout = QVBoxLayout(self.table_tab)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(4)
+        self.table_trend_chart = DashboardTrendChart(self.table_tab)
+        table_layout.addWidget(self.table_trend_chart, 1)
+        self.table_placeholder_label = QLabel("Chart view is currently reserved for Submissions.")
+        self.table_placeholder_label.setWordWrap(True)
+        self.table_placeholder_label.setProperty("muted", True)
+        self.table_placeholder_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        table_layout.addWidget(self.table_placeholder_label, 0)
+
+        self._build_completed_tab()
+
+        notes_layout = QVBoxLayout(self.notes_tab)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(4)
+
+        notes_intro = QLabel("Testing utility: edit note fields on existing rows.")
+        notes_intro.setWordWrap(True)
+        notes_intro.setProperty("muted", True)
+        notes_layout.addWidget(notes_intro)
+
+        notes_controls = QHBoxLayout()
+        notes_controls.setContentsMargins(0, 0, 0, 0)
+        notes_controls.setSpacing(6)
+        notes_controls.addWidget(QLabel("Field:"), 0)
+        self.notes_target_combo = QComboBox()
+        self.notes_target_combo.setMinimumWidth(240)
+        notes_controls.addWidget(self.notes_target_combo, 0)
+        notes_controls.addWidget(QLabel("Rows:"), 0)
+        self.notes_limit_spin = QSpinBox()
+        self.notes_limit_spin.setRange(25, 5000)
+        self.notes_limit_spin.setSingleStep(25)
+        self.notes_limit_spin.setValue(200)
+        self.notes_limit_spin.setMinimumWidth(100)
+        notes_controls.addWidget(self.notes_limit_spin, 0)
+        notes_controls.addWidget(QLabel("Work Order:"), 0)
+        self.notes_work_order_filter = QLineEdit()
+        self.notes_work_order_filter.setPlaceholderText("Optional filter")
+        self.notes_work_order_filter.setMinimumWidth(180)
+        notes_controls.addWidget(self.notes_work_order_filter, 0)
+        self.notes_refresh_btn = QPushButton("Load")
+        self.notes_refresh_btn.setProperty("actionRole", "pick")
+        notes_controls.addWidget(self.notes_refresh_btn, 0)
+        notes_controls.addStretch(1)
+        notes_layout.addLayout(notes_controls)
+
+        self.notes_table = QTableWidget()
+        notes_headers = ["id", "created_at", "user_id", "work_order", "note_preview"]
+        note_resize_modes = {
+            0: QHeaderView.ResizeMode.ResizeToContents,
+            1: QHeaderView.ResizeMode.ResizeToContents,
+            2: QHeaderView.ResizeMode.ResizeToContents,
+            3: QHeaderView.ResizeMode.ResizeToContents,
+            4: QHeaderView.ResizeMode.Stretch,
+        }
+        configure_standard_table(self.notes_table, notes_headers, resize_modes=note_resize_modes, stretch_last=True)
+        notes_layout.addWidget(self.notes_table, 1)
+
+        self.notes_selected_label = QLabel("Select a row to edit.")
+        self.notes_selected_label.setWordWrap(True)
+        self.notes_selected_label.setProperty("muted", True)
+        notes_layout.addWidget(self.notes_selected_label)
+
+        self.notes_editor = QTextEdit()
+        self.notes_editor.setPlaceholderText("Selected note text...")
+        self.notes_editor.setMinimumHeight(110)
+        self.notes_editor.setEnabled(False)
+        notes_layout.addWidget(self.notes_editor)
+
+        notes_actions = QHBoxLayout()
+        notes_actions.setContentsMargins(0, 0, 0, 0)
+        notes_actions.setSpacing(6)
+        self.notes_save_btn = QPushButton("Save Note")
+        self.notes_save_btn.setProperty("actionRole", "save")
+        self.notes_save_btn.setEnabled(False)
+        notes_actions.addWidget(self.notes_save_btn, 0)
+        self.notes_status_label = QLabel("")
+        self.notes_status_label.setWordWrap(True)
+        self.notes_status_label.setProperty("muted", True)
+        notes_actions.addWidget(self.notes_status_label, 1)
+        notes_layout.addLayout(notes_actions)
+
+        self._notes_selected_row_id: int | None = None
+
+        self.table_combo.currentIndexChanged.connect(self._on_table_changed)
+        self.limit_spin.valueChanged.connect(self.refresh_dashboard)
+        self.refresh_btn.clicked.connect(self.refresh_dashboard)
+        self.export_btn.clicked.connect(self.export_csv)
+        self.timeframe_combo.currentIndexChanged.connect(self._on_timeframe_changed)
+        self.start_date_edit.dateChanged.connect(self._on_custom_date_changed)
+        self.end_date_edit.dateChanged.connect(self._on_custom_date_changed)
+        self.user_filter_combo.currentIndexChanged.connect(self.refresh_dashboard)
+        self.category_filter_combo.currentIndexChanged.connect(self._on_dashboard_category_changed)
+        self.notes_target_combo.currentIndexChanged.connect(self.refresh_notes_rows)
+        self.notes_limit_spin.valueChanged.connect(self.refresh_notes_rows)
+        self.notes_work_order_filter.returnPressed.connect(self.refresh_notes_rows)
+        self.notes_refresh_btn.clicked.connect(self.refresh_notes_rows)
+        self.notes_table.itemSelectionChanged.connect(self._on_notes_selection_changed)
+        self.notes_save_btn.clicked.connect(self._save_selected_note)
+
+        self._set_timeframe_key("current_week")
+        self._populate_submission_user_filter()
+        self._populate_dashboard_category_filter()
+        self._populate_notes_targets()
+        self.apply_theme_styles()
+        self.refresh_combo_popup_width()
+        self.refresh_dashboard()
+        self.refresh_notes_rows()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.app_window.config.setdefault("popup_positions", {})["depot_dashboard"] = {
+            "x": int(self.x()),
+            "y": int(self.y()),
+        }
+        self.app_window.queue_save_config()
+        super().closeEvent(event)
+        if event.isAccepted() and _visible_flowgrid_shell_window() is None:
+            _ensure_shell_window_available(self.app_window)
+
+    def apply_theme_styles(self) -> None:
+        if self.app_window is None:
+            return
+        super().apply_theme_styles()
+        muted = rgba_css(self.app_window.palette_data["label_text"], 0.80)
+        self.setStyleSheet(
+            self.styleSheet()
+            + (
+                "QLabel[muted='true'] {"
+                f"color: {muted};"
+                "font-weight: 700;"
+                "}"
+                "QLabel[section='true'] {"
+                "font-size: 14px;"
+                "font-weight: 800;"
+                "}"
+            )
+        )
+
+    def _on_table_changed(self) -> None:
+        self.refresh_combo_popup_width()
+        self.refresh_dashboard()
+
+    def _on_dashboard_category_changed(self) -> None:
+        self.refresh_combo_popup_width()
+        self.refresh_dashboard()
+        self.refresh_notes_rows()
+
+    def _on_timeframe_changed(self) -> None:
+        key = str(self.timeframe_combo.currentData() or "").strip()
+        if key:
+            self._set_timeframe_key(key)
+        self.refresh_dashboard()
+
+    def _on_custom_date_changed(self) -> None:
+        if self._date_sync_in_progress:
+            return
+        self._date_sync_in_progress = True
+        try:
+            if self.start_date_edit.date() > self.end_date_edit.date():
+                self.end_date_edit.setDate(self.start_date_edit.date())
+            if str(self.timeframe_combo.currentData() or "") != "custom":
+                idx = self.timeframe_combo.findData("custom")
+                if idx >= 0:
+                    self.timeframe_combo.setCurrentIndex(idx)
+        finally:
+            self._date_sync_in_progress = False
+        self.refresh_dashboard()
+
+    def _set_timeframe_key(self, key: str) -> None:
+        today = QDate.currentDate()
+        start = today
+        end = today
+        if key == "current_week":
+            start = today.addDays(1 - int(today.dayOfWeek()))
+            end = start.addDays(6)
+        elif key == "today":
+            start = today
+            end = today
+        elif key == "yesterday":
+            start = today.addDays(-1)
+            end = start
+        elif key == "last_7_days":
+            end = today
+            start = today.addDays(-6)
+        elif key == "last_30_days":
+            end = today
+            start = today.addDays(-29)
+        elif key == "this_month":
+            start = QDate(today.year(), today.month(), 1)
+            end = start.addMonths(1).addDays(-1)
+        elif key == "all_time":
+            start = today.addDays(-3650)
+            end = today
+        elif key == "custom":
+            return
+        self._date_sync_in_progress = True
+        try:
+            self.start_date_edit.setDate(start)
+            self.end_date_edit.setDate(end)
+        finally:
+            self._date_sync_in_progress = False
+
+    def _current_submission_filters(self) -> tuple[str | None, str | None, str | None]:
+        key = str(self.timeframe_combo.currentData() or "current_week").strip()
+        start_date: str | None = None
+        end_date: str | None = None
+        if key != "all_time":
+            start_qdate = self.start_date_edit.date()
+            end_qdate = self.end_date_edit.date()
+            if start_qdate > end_qdate:
+                start_qdate, end_qdate = end_qdate, start_qdate
+            start_date = start_qdate.toString("yyyy-MM-dd")
+            end_date = end_qdate.toString("yyyy-MM-dd")
+        selected_user = str(self.user_filter_combo.currentData() or "").strip()
+        return start_date, end_date, (selected_user if selected_user else None)
+
+    def _current_dashboard_category_filter(self) -> str | None:
+        selected_category = str(self.category_filter_combo.currentData() or "").strip()
+        return selected_category if selected_category else None
+
+    def _populate_dashboard_category_filter(self) -> None:
+        selected_category = str(self.category_filter_combo.currentData() or "").strip()
+        categories: list[str] = []
+        try:
+            categories = self.app_window.depot_tracker.dashboard_category_options()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_category_filter_query_failed",
+                severity="warning",
+                summary="Dashboard could not refresh category filter options.",
+                exc=exc,
+            )
+            categories = list(DepotRules.CATEGORY_OPTIONS)
+
+        self.category_filter_combo.blockSignals(True)
+        self.category_filter_combo.clear()
+        self.category_filter_combo.addItem("All Categories", "")
+        seen = {""}
+        for category_text in categories:
+            normalized_text = str(category_text or "").strip()
+            if not normalized_text:
+                continue
+            key = normalized_text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            self.category_filter_combo.addItem(normalized_text, normalized_text)
+        if selected_category:
+            selected_index = self.category_filter_combo.findData(selected_category)
+            if selected_index < 0:
+                self.category_filter_combo.addItem(selected_category, selected_category)
+                selected_index = self.category_filter_combo.findData(selected_category)
+            if selected_index >= 0:
+                self.category_filter_combo.setCurrentIndex(selected_index)
+        self.category_filter_combo.blockSignals(False)
+
+    def _populate_submission_user_filter(self) -> None:
+        selected_user = str(self.user_filter_combo.currentData() or "").strip()
+        users: list[str] = []
+        try:
+            rows = self.app_window.depot_db.fetchall(
+                "SELECT DISTINCT user_id FROM submissions WHERE COALESCE(user_id, '') <> '' ORDER BY user_id ASC"
+            )
+            users = [str(row["user_id"]).strip() for row in rows if str(row["user_id"]).strip()]
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_user_filter_query_failed",
+                severity="warning",
+                summary="Dashboard could not refresh submission user filter options.",
+                exc=exc,
+            )
+
+        self.user_filter_combo.blockSignals(True)
+        self.user_filter_combo.clear()
+        self.user_filter_combo.addItem("All Users", "")
+        for user_id in users:
+            self.user_filter_combo.addItem(user_id, user_id)
+        if selected_user:
+            idx = self.user_filter_combo.findData(selected_user)
+            if idx >= 0:
+                self.user_filter_combo.setCurrentIndex(idx)
+        self.user_filter_combo.blockSignals(False)
+
+    @staticmethod
+    def _note_preview_text(value: str, max_len: int = 120) -> str:
+        compact = " ".join(str(value or "").replace("\r", "\n").splitlines()).strip()
+        if len(compact) <= int(max_len):
+            return compact
+        safe_max = max(8, int(max_len))
+        return compact[: safe_max - 3].rstrip() + "..."
+
+    def _populate_notes_targets(self) -> None:
+        selected_key = str(self.notes_target_combo.currentData() or "").strip()
+        options: list[tuple[str, str]] = []
+        try:
+            options = self.app_window.depot_tracker.dashboard_note_target_options()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_notes_target_load_failed",
+                severity="warning",
+                summary="Dashboard notes editor failed loading editable target list.",
+                exc=exc,
+            )
+
+        self.notes_target_combo.blockSignals(True)
+        self.notes_target_combo.clear()
+        for key, label in options:
+            self.notes_target_combo.addItem(str(label), str(key))
+        if selected_key:
+            idx = self.notes_target_combo.findData(selected_key)
+            if idx >= 0:
+                self.notes_target_combo.setCurrentIndex(idx)
+        self.notes_target_combo.blockSignals(False)
+        self.notes_refresh_btn.setEnabled(bool(options))
+        self.notes_limit_spin.setEnabled(bool(options))
+        self.notes_work_order_filter.setEnabled(bool(options))
+        self.notes_save_btn.setEnabled(False)
+
+    def _build_completed_tab(self) -> None:
+        layout = QVBoxLayout(self.completed_tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        summary = QLabel("Completed parts queue moved from QA. Shows closed work orders with part history.")
+        summary.setWordWrap(True)
+        summary.setProperty("muted", True)
+        layout.addWidget(summary)
+
+        controls = QHBoxLayout()
+        controls.setContentsMargins(0, 0, 0, 0)
+        controls.setSpacing(6)
+        controls.addWidget(QLabel("Work Order:"), 0)
+        self.completed_workorder_search = QLineEdit()
+        self.completed_workorder_search.setPlaceholderText("Search work order...")
+        self.completed_workorder_search.setClearButtonEnabled(True)
+        controls.addWidget(self.completed_workorder_search, 1)
+        self.completed_refresh_btn = QPushButton("Refresh")
+        self.completed_refresh_btn.setProperty("actionRole", "pick")
+        self.completed_open_notes_btn = QPushButton("Open Notes / Flag")
+        self.completed_open_notes_btn.setProperty("actionRole", "pick")
+        controls.addWidget(self.completed_refresh_btn, 0)
+        controls.addWidget(self.completed_open_notes_btn, 0)
+        layout.addLayout(controls)
+
+        self.completed_table = QTableWidget()
+        configure_standard_table(
+            self.completed_table,
+            ["Client", "Flag", "Age", "Working", "Work Order", "Repair Owner", "Category", "Outcome", "Closed At", "QA Note", "Agent Note"],
+            resize_modes={
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.ResizeToContents,
+                7: QHeaderView.ResizeMode.ResizeToContents,
+                8: QHeaderView.ResizeMode.ResizeToContents,
+                9: QHeaderView.ResizeMode.ResizeToContents,
+                10: QHeaderView.ResizeMode.Stretch,
+            },
+            stretch_last=True,
+        )
+        self.completed_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
+        self.completed_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.completed_table.customContextMenuRequested.connect(self._open_completed_notes_from_context)
+        layout.addWidget(self.completed_table, 1)
+
+        self.completed_workorder_search.textChanged.connect(self.refresh_completed_parts)
+        self.completed_refresh_btn.clicked.connect(self.refresh_completed_parts)
+        self.completed_open_notes_btn.clicked.connect(self._open_selected_completed_notes)
+        self.refresh_completed_parts()
+
+    def _open_completed_notes_from_context(self, pos: QPoint) -> None:
+        if not _select_table_row_by_context_pos(self.completed_table, pos):
+            return
+        self._open_selected_completed_notes()
+
+    def _open_selected_completed_notes(self) -> None:
+        saved, _part_id = _edit_part_notes(
+            self,
+            self.app_window.depot_tracker,
+            role="qa",
+            table=self.completed_table,
+        )
+        if not saved:
+            return
+        self.app_window._refresh_shared_linked_views("dashboard_completed", reason="dashboard_completed_note")
+
+    def refresh_completed_parts(self) -> None:
+        if not hasattr(self, "completed_table"):
+            return
+
+        search_text = ""
+        if hasattr(self, "completed_workorder_search"):
+            search_text = str(self.completed_workorder_search.text() or "").strip()
+        category_filter = self._current_dashboard_category_filter()
+        try:
+            rows = self.app_window.depot_tracker.list_completed_parts(search_text, category_filter=category_filter)
+            agent_meta = self.app_window.depot_tracker.agent_display_map()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_completed_query_failed",
+                severity="warning",
+                summary="Dashboard completed queue query failed.",
+                exc=exc,
+                context={"search_text": search_text, "category_filter": category_filter or ""},
+            )
+            self.completed_table.setRowCount(0)
+            return
+
+        self.completed_table.setRowCount(0)
+        for row_idx, r in enumerate(rows):
+            self.completed_table.insertRow(row_idx)
+            part_id = int(r["id"])
+            work_order = str(r["work_order"] or "").strip()
+            assigned = DepotRules.normalize_user_id(str(r["assigned_user_id"] or ""))
+            category = self.app_window.depot_tracker.resolve_work_order_category(work_order, str(r["category"] or "").strip()) or "Other"
+            age_text = DepotAgentWindow._part_age_label(str(r["created_at"] or ""))
+            qa_comment = str(r["qa_comment"] or r["comments"] or "").strip()
+            agent_comment = str(r["agent_comment"] or "").strip()
+            flag = str(r["qa_flag"] or "").strip()
+            working_user = DepotRules.normalize_user_id(str(r["working_user_id"] or ""))
+            working_stamp = str(r["working_updated_at"] or "").strip()
+            outcome_text = str(r["latest_touch"] or "").strip()
+            closed_at_raw = str(r["latest_touch_at"] or "").strip()
+            closed_at_text = self._normalize_dashboard_datetime(closed_at_raw) if closed_at_raw else "-"
+
+            image_abs = self.app_window.depot_tracker.resolve_qa_flag_icon(
+                str(r["qa_flag"] or "").strip(),
+                str(r["qa_flag_image_path"] or ""),
+            )
+            assigned_name, assigned_icon = agent_meta.get(assigned, ("", ""))
+
+            client_item = QTableWidgetItem("")
+            client_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            if int(r["client_unit"] or 0):
+                client_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
+
+            flag_item = QTableWidgetItem("" if image_abs else (flag if flag else ""))
+            flag_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            flag_item.setToolTip(DepotAgentWindow._flag_tooltip(flag, qa_comment, agent_comment, bool(image_abs)))
+            if image_abs:
+                flag_item.setIcon(QIcon(image_abs))
+
+            working_item = QTableWidgetItem("\U0001F527" if working_user else "")
+            working_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            if working_user:
+                working_tip = f"Agent working this unit: {working_user}"
+                friendly_stamp = DepotAgentWindow._format_working_updated_stamp(working_stamp)
+                if friendly_stamp:
+                    working_tip += f"\nUpdated: {friendly_stamp}"
+                working_item.setToolTip(working_tip)
+            else:
+                working_item.setToolTip("No agent is marked as working this unit.")
+
+            assigned_text = "-"
+            if assigned:
+                assigned_text = f"{assigned} - {assigned_name}" if assigned_name else assigned
+            assigned_item = QTableWidgetItem(assigned_text)
+            if assigned_icon and Path(assigned_icon).exists():
+                assigned_item.setIcon(QIcon(assigned_icon))
+
+            work_item = QTableWidgetItem(work_order)
+            work_item.setData(Qt.ItemDataRole.UserRole, part_id)
+            qa_note_item = QTableWidgetItem(DepotAgentWindow._note_preview(qa_comment))
+            qa_note_item.setToolTip(f"QA Note: {qa_comment if qa_comment else '(none)'}")
+            agent_note_item = QTableWidgetItem(DepotAgentWindow._note_preview(agent_comment))
+            agent_note_item.setToolTip(f"Agent Note: {agent_comment if agent_comment else '(none)'}")
+
+            self.completed_table.setItem(row_idx, 0, _center_table_item(client_item))
+            self.completed_table.setItem(row_idx, 1, _center_table_item(flag_item))
+            self.completed_table.setItem(row_idx, 2, _center_table_item(QTableWidgetItem(age_text)))
+            self.completed_table.setItem(row_idx, 3, _center_table_item(working_item))
+            self.completed_table.setItem(row_idx, 4, _center_table_item(work_item))
+            self.completed_table.setItem(row_idx, 5, _center_table_item(assigned_item))
+            self.completed_table.setItem(row_idx, 6, _center_table_item(QTableWidgetItem(category)))
+            self.completed_table.setItem(row_idx, 7, _center_table_item(QTableWidgetItem(outcome_text)))
+            self.completed_table.setItem(row_idx, 8, _center_table_item(QTableWidgetItem(closed_at_text)))
+            self.completed_table.setItem(row_idx, 9, _center_table_item(qa_note_item))
+            self.completed_table.setItem(row_idx, 10, _center_table_item(agent_note_item))
+
+    def refresh_notes_rows(self) -> None:
+        headers = ["id", "created_at", "user_id", "work_order", "note_preview"]
+        resize_modes = {
+            0: QHeaderView.ResizeMode.ResizeToContents,
+            1: QHeaderView.ResizeMode.ResizeToContents,
+            2: QHeaderView.ResizeMode.ResizeToContents,
+            3: QHeaderView.ResizeMode.ResizeToContents,
+            4: QHeaderView.ResizeMode.Stretch,
+        }
+        configure_standard_table(self.notes_table, headers, resize_modes=resize_modes, stretch_last=True)
+
+        target_key = str(self.notes_target_combo.currentData() or "").strip()
+        if not target_key:
+            self.notes_table.setRowCount(0)
+            self._notes_selected_row_id = None
+            self.notes_editor.clear()
+            self.notes_editor.setEnabled(False)
+            self.notes_save_btn.setEnabled(False)
+            self.notes_selected_label.setText("No editable note fields are currently available.")
+            self.notes_status_label.setText("")
+            return
+
+        rows_limit = int(self.notes_limit_spin.value())
+        work_order_filter = str(self.notes_work_order_filter.text() or "").strip()
+        category_filter = self._current_dashboard_category_filter()
+        app = QApplication.instance()
+        if app is not None:
+            app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            try:
+                rows = self.app_window.depot_tracker.fetch_dashboard_note_rows(
+                    target_key,
+                    limit=rows_limit,
+                    work_order_filter=work_order_filter,
+                    category_filter=category_filter,
+                )
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.depot_dashboard_notes_query_failed",
+                    severity="error",
+                    summary="Dashboard notes editor query failed.",
+                    exc=exc,
+                    context={
+                        "target_key": target_key,
+                        "limit": rows_limit,
+                        "work_order_filter": work_order_filter,
+                        "category_filter": category_filter or "",
+                    },
+                )
+                self._show_themed_message(
+                    QMessageBox.Icon.Warning,
+                    "Notes load failed",
+                    f"Could not load note rows:\n{type(exc).__name__}: {exc}",
+                )
+                self.notes_table.setRowCount(0)
+                self._notes_selected_row_id = None
+                self.notes_editor.clear()
+                self.notes_editor.setEnabled(False)
+                self.notes_save_btn.setEnabled(False)
+                self.notes_selected_label.setText("Could not load note rows. Details were logged for support.")
+                self.notes_status_label.setText("")
+                return
+        finally:
+            if app is not None:
+                app.restoreOverrideCursor()
+
+        self.notes_table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            row_id = int(max(0, safe_int(row.get("id"), 0)))
+            created_text = self._normalize_dashboard_datetime(str(row.get("created_at", "") or ""))
+            user_text = str(row.get("user_id", "") or "").strip()
+            work_order_text = str(row.get("work_order", "") or "").strip()
+            note_text = str(row.get("note_text", "") or "").strip()
+            preview_text = self._note_preview_text(note_text)
+
+            id_item = QTableWidgetItem(str(row_id))
+            id_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            id_item.setData(Qt.ItemDataRole.UserRole, note_text)
+            self.notes_table.setItem(row_idx, 0, id_item)
+
+            created_item = QTableWidgetItem(created_text)
+            created_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            self.notes_table.setItem(row_idx, 1, created_item)
+
+            user_item = QTableWidgetItem(user_text)
+            user_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            self.notes_table.setItem(row_idx, 2, user_item)
+
+            work_order_item = QTableWidgetItem(work_order_text)
+            work_order_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            self.notes_table.setItem(row_idx, 3, work_order_item)
+
+            preview_item = QTableWidgetItem(preview_text)
+            preview_item.setToolTip(note_text if note_text else "(empty)")
+            self.notes_table.setItem(row_idx, 4, preview_item)
+
+        self.notes_table.clearSelection()
+        self._notes_selected_row_id = None
+        self.notes_editor.clear()
+        self.notes_editor.setEnabled(False)
+        self.notes_save_btn.setEnabled(False)
+        self.notes_selected_label.setText("Select a row to edit.")
+        self.notes_status_label.setText(f"Loaded {len(rows)} row(s).")
+
+    def _on_notes_selection_changed(self) -> None:
+        selected_rows = self.notes_table.selectionModel().selectedRows() if self.notes_table.selectionModel() is not None else []
+        if not selected_rows:
+            self._notes_selected_row_id = None
+            self.notes_editor.clear()
+            self.notes_editor.setEnabled(False)
+            self.notes_save_btn.setEnabled(False)
+            self.notes_selected_label.setText("Select a row to edit.")
+            return
+
+        row_idx = int(selected_rows[0].row())
+        id_item = self.notes_table.item(row_idx, 0)
+        if id_item is None:
+            self._notes_selected_row_id = None
+            self.notes_editor.clear()
+            self.notes_editor.setEnabled(False)
+            self.notes_save_btn.setEnabled(False)
+            self.notes_selected_label.setText("Select a row to edit.")
+            return
+
+        row_id = int(max(0, safe_int(id_item.text(), 0)))
+        note_text = str(id_item.data(Qt.ItemDataRole.UserRole) or "")
+        work_order_item = self.notes_table.item(row_idx, 3)
+        user_item = self.notes_table.item(row_idx, 2)
+        work_order_text = work_order_item.text().strip() if work_order_item is not None else ""
+        user_text = user_item.text().strip() if user_item is not None else ""
+
+        self._notes_selected_row_id = row_id if row_id > 0 else None
+        self.notes_editor.setEnabled(self._notes_selected_row_id is not None)
+        self.notes_editor.setPlainText(note_text)
+        self.notes_save_btn.setEnabled(self._notes_selected_row_id is not None)
+        if self._notes_selected_row_id is not None:
+            self.notes_selected_label.setText(
+                f"Editing row #{self._notes_selected_row_id} | Work Order: {work_order_text or '(none)'} | User: {user_text or '(none)'}"
+            )
+        else:
+            self.notes_selected_label.setText("Select a row to edit.")
+        self.notes_status_label.setText("")
+
+    def _save_selected_note(self) -> None:
+        target_key = str(self.notes_target_combo.currentData() or "").strip()
+        row_id = self._notes_selected_row_id
+        if not target_key or row_id is None:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a note row first.")
+            return
+
+        note_text = str(self.notes_editor.toPlainText() or "").strip()
+        try:
+            self.app_window.depot_tracker.update_dashboard_note_value(target_key, row_id, note_text)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_notes_save_failed",
+                severity="error",
+                summary="Dashboard notes editor failed saving a note field.",
+                exc=exc,
+                context={"target_key": target_key, "row_id": row_id},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Save failed",
+                f"Could not save note:\n{type(exc).__name__}: {exc}",
+            )
+            return
+
+        selected_row = self.notes_table.currentRow()
+        if selected_row >= 0:
+            id_item = self.notes_table.item(selected_row, 0)
+            preview_item = self.notes_table.item(selected_row, 4)
+            if id_item is not None:
+                id_item.setData(Qt.ItemDataRole.UserRole, note_text)
+            if preview_item is not None:
+                preview_item.setText(self._note_preview_text(note_text))
+                preview_item.setToolTip(note_text if note_text else "(empty)")
+        self.notes_status_label.setText(f"Saved row #{row_id} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.")
+        self.refresh_completed_parts()
+
+    def _touch_color(self, touch: str) -> str:
+        normalized = str(touch or "").strip()
+        return normalize_hex(self.TOUCH_COLORS.get(normalized, "#6F7C91"), "#6F7C91")
+
+    @staticmethod
+    def _format_dashboard_average(value: Any) -> str:
+        return f"{float(value or 0.0):.2f}"
+
+    def _refresh_touch_distribution(
+        self,
+        start_date: str | None,
+        end_date: str | None,
+        user_id: str | None,
+        category_filter: str | None = None,
+    ) -> None:
+        try:
+            metrics = self.app_window.depot_tracker.get_dashboard_metrics(
+                start_date=start_date,
+                end_date=end_date,
+                user_id=user_id,
+                category=category_filter,
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_metrics_query_failed",
+                severity="error",
+                summary="Dashboard metrics query failed.",
+                exc=exc,
+                context={
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "user_id": user_id,
+                    "category_filter": category_filter or "",
+                },
+            )
+            self.touch_bar.set_segments([])
+            self.touch_summary_label.setText("Touch metrics unavailable. Details were logged for support.")
+            self.touch_legend_label.setText("")
+            return
+
+        by_touch_raw = metrics.get("by_touch", {})
+        by_touch: dict[str, int] = {}
+        if isinstance(by_touch_raw, dict):
+            for key, value in by_touch_raw.items():
+                touch_name = str(key or "").strip()
+                if not touch_name:
+                    continue
+                by_touch[touch_name] = int(max(0, safe_int(value, 0)))
+
+        ordered_keys: list[str] = []
+        for key in self.TOUCH_ORDER:
+            if key in by_touch:
+                ordered_keys.append(key)
+        for key in sorted(by_touch.keys()):
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+
+        segments = [
+            (touch, int(by_touch.get(touch, 0)), self._touch_color(touch))
+            for touch in ordered_keys
+            if int(by_touch.get(touch, 0)) > 0
+        ]
+        self.touch_bar.set_segments(segments)
+
+        total_submissions = int(max(0, safe_int(metrics.get("total_submissions", 0), 0)))
+        total_units = int(max(0, safe_int(metrics.get("total_units", 0), 0)))
+        complete_count = int(max(0, safe_int(metrics.get("complete_count", 0), 0)))
+        junk_count = int(max(0, safe_int(metrics.get("junk_count", 0), 0)))
+        part_order_count = int(max(0, safe_int(metrics.get("part_order_count", 0), 0)))
+        rtv_count = int(max(0, safe_int(metrics.get("rtv_count", 0), 0)))
+        triaged_count = int(max(0, safe_int(metrics.get("triaged_count", 0), 0)))
+        other_touch_count = int(max(0, safe_int(metrics.get("other_touch_count", 0), 0)))
+        day_span = int(max(1, safe_int(metrics.get("day_span", 1), 1)))
+        avg_submission_rows = self._format_dashboard_average(metrics.get("avg_submission_rows_per_day", 0.0))
+        avg_units = self._format_dashboard_average(metrics.get("avg_units_per_day", 0.0))
+        avg_complete = self._format_dashboard_average(metrics.get("avg_complete_per_day", 0.0))
+        avg_junk = self._format_dashboard_average(metrics.get("avg_junk_per_day", 0.0))
+        date_label = "All Time" if start_date is None or end_date is None else f"{start_date} to {end_date}"
+        user_label = user_id if user_id else "All Users"
+        category_label = category_filter if category_filter else "All Categories"
+        self.touch_summary_label.setText(
+            f"Range touch mix for submission rows. Units touched distinct: {total_units} ({avg_units}/day) | "
+            f"Submission rows: {total_submissions} ({avg_submission_rows}/day) | "
+            f"Complete rows: {complete_count} ({avg_complete}/day) | "
+            f"JO rows: {junk_count} ({avg_junk}/day) | "
+            f"PO rows: {part_order_count} | RTV rows: {rtv_count} | Triaged rows: {triaged_count} | Other rows: {other_touch_count} | "
+            f"Range: {date_label} | User: {user_label} | Category: {category_label} | Days: {day_span}"
+        )
+        if segments:
+            legend_chunks = [
+                f"<span style='color:{color}; font-weight:700'>{DepotRules.chart_touch_label(touch)}</span>: {count}"
+                for touch, count, color in segments
+            ]
+            self.touch_legend_label.setText(" | ".join(legend_chunks))
+            self.touch_legend_label.setTextFormat(Qt.TextFormat.RichText)
+        else:
+            self.touch_legend_label.setText("No touch activity in the selected filter range.")
+            self.touch_legend_label.setTextFormat(Qt.TextFormat.PlainText)
+
+    @staticmethod
+    def _normalize_dashboard_datetime(raw_value: Any) -> str:
+        text = str(raw_value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is not None:
+                try:
+                    parsed = parsed.astimezone()
+                except Exception:
+                    pass
+            return parsed.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+        return text.replace("T", " ")
+
+    def _format_dashboard_cell_text(self, col_name: str, raw_value: Any) -> str:
+        if raw_value is None:
+            return ""
+        text = str(raw_value).strip()
+        if not text:
+            return ""
+        normalized_name = str(col_name or "").strip().lower()
+        if normalized_name.endswith("_at"):
+            return self._normalize_dashboard_datetime(text)
+        if normalized_name.endswith("_date") and "T" in text:
+            normalized = self._normalize_dashboard_datetime(text)
+            return normalized[:10] if normalized else text
+        return text
+
+    def _refresh_table_placeholder(
+        self,
+        table_name: str,
+        row_count: int,
+        start_date: str | None,
+        end_date: str | None,
+        user_id: str | None,
+        category_filter: str | None = None,
+    ) -> None:
+        if not hasattr(self, "table_placeholder_label"):
+            return
+        category_label = category_filter if category_filter else "All Categories"
+        if table_name != "submissions":
+            if hasattr(self, "table_trend_chart"):
+                self.table_trend_chart.clear_series()
+                self.table_trend_chart.setVisible(False)
+            self.table_placeholder_label.setText(
+                f"Chart view is currently reserved for Submissions.\n"
+                f"Current source: {table_name} | Category: {category_label} | Rows loaded: {int(row_count)}"
+            )
+            return
+        range_label = "All Time" if start_date is None or end_date is None else f"{start_date} to {end_date}"
+        user_label = user_id if user_id else "All Users"
+        try:
+            metrics = self.app_window.depot_tracker.get_dashboard_metrics(
+                start_date=start_date,
+                end_date=end_date,
+                user_id=user_id,
+                category=category_filter,
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_placeholder_metrics_query_failed",
+                severity="warning",
+                summary="Dashboard placeholder metrics query failed.",
+                exc=exc,
+                context={
+                    "table_name": table_name,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "user_id": user_id,
+                    "category_filter": category_filter or "",
+                },
+            )
+            metrics = {}
+        total_units = int(max(0, safe_int(metrics.get("total_units", 0), 0)))
+        total_submissions = int(max(0, safe_int(metrics.get("total_submissions", 0), 0)))
+        complete_count = int(max(0, safe_int(metrics.get("complete_count", 0), 0)))
+        junk_count = int(max(0, safe_int(metrics.get("junk_count", 0), 0)))
+        part_order_count = int(max(0, safe_int(metrics.get("part_order_count", 0), 0)))
+        rtv_count = int(max(0, safe_int(metrics.get("rtv_count", 0), 0)))
+        triaged_count = int(max(0, safe_int(metrics.get("triaged_count", 0), 0)))
+        other_touch_count = int(max(0, safe_int(metrics.get("other_touch_count", 0), 0)))
+        avg_complete = self._format_dashboard_average(metrics.get("avg_complete_per_day", 0.0))
+        avg_junk = self._format_dashboard_average(metrics.get("avg_junk_per_day", 0.0))
+        trend_daily_raw = metrics.get("trend_daily", [])
+        trend_daily = trend_daily_raw if isinstance(trend_daily_raw, list) else []
+        if hasattr(self, "table_trend_chart"):
+            self.table_trend_chart.set_series(trend_daily)
+            self.table_trend_chart.setVisible(True)
+        self.table_placeholder_label.setText(
+            "Daily submission touch trend. Bar height = submission rows. Top label = distinct units touched.\n"
+            f"Range: {range_label} | User: {user_label} | Category: {category_label} | Rows loaded: {int(row_count)}\n"
+            f"Units touched distinct: {total_units} | Submission rows: {total_submissions} | "
+            f"Complete rows: {complete_count} ({avg_complete}/day) | JO rows: {junk_count} ({avg_junk}/day) | "
+            f"PO rows: {part_order_count} | RTV rows: {rtv_count} | Triaged rows: {triaged_count} | Other rows: {other_touch_count}"
+        )
+
+    def refresh_combo_popup_width(self) -> None:
+        combos: list[QComboBox] = [self.table_combo, self.timeframe_combo, self.user_filter_combo, self.category_filter_combo]
+        if hasattr(self, "notes_target_combo"):
+            combos.append(self.notes_target_combo)
+        for combo in combos:
+            item_count = int(combo.count())
+            if item_count <= 0:
+                continue
+            fm = combo.fontMetrics()
+            widest_text = 0
+            for idx in range(item_count):
+                widest_text = max(widest_text, fm.horizontalAdvance(combo.itemText(idx)))
+            popup_width = int(max(220, widest_text + 56))
+            view = combo.view()
+            if view is None:
+                continue
+            view.setMinimumWidth(popup_width)
+            view.setTextElideMode(Qt.TextElideMode.ElideNone)
+            view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+    def refresh_dashboard(self) -> None:
+        table_name = str(self.table_combo.currentData() or "").strip()
+        if not table_name:
+            return
+
+        allowed_tables = {name for name, _label in TRACKER_DASHBOARD_TABLES}
+        if table_name not in allowed_tables:
+            return
+
+        submissions_mode = table_name == "submissions"
+        self.submission_filters_wrap.setVisible(submissions_mode)
+        self.touch_summary_label.setVisible(submissions_mode)
+        self.touch_bar.setVisible(submissions_mode)
+        self.touch_legend_label.setVisible(submissions_mode)
+        self._populate_dashboard_category_filter()
+        if submissions_mode:
+            self._populate_submission_user_filter()
+        self.refresh_combo_popup_width()
+
+        limit = int(self.limit_spin.value())
+        start_date: str | None = None
+        end_date: str | None = None
+        user_id: str | None = None
+        category_filter = self._current_dashboard_category_filter()
+        load_failed = False
+
+        if submissions_mode:
+            start_date, end_date, user_id = self._current_submission_filters()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            try:
+                rows = self.app_window.depot_tracker.fetch_dashboard_table_rows(
+                    table_name,
+                    limit=limit,
+                    start_date=start_date,
+                    end_date=end_date,
+                    user_id=user_id,
+                    category_filter=category_filter,
+                )
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.depot_dashboard_query_failed",
+                    severity="error",
+                    summary="Dashboard table query failed.",
+                    exc=exc,
+                    context={
+                        "table": table_name,
+                        "limit": limit,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "user_id": user_id,
+                        "category_filter": category_filter or "",
+                    },
+                )
+                self._show_themed_message(
+                    QMessageBox.Icon.Critical,
+                    "Data load failed",
+                    f"Could not load table data:\n{type(exc).__name__}: {exc}",
+                )
+                self.empty_hint.setText("Could not load data. Details were logged for support.")
+                self.empty_hint.show()
+                configure_standard_table(self.table, [], stretch_last=True)
+                self.table.setRowCount(0)
+                self._refresh_table_placeholder(table_name, 0, start_date, end_date, user_id, category_filter)
+                load_failed = True
+
+            if not load_failed:
+                headers: list[str]
+                if rows:
+                    headers = [str(name) for name in rows[0].keys()]
+                else:
+                    if table_name == "submissions":
+                        headers = [
+                            "id",
+                            "created_at",
+                            "user_id",
+                            "work_order",
+                            "touch",
+                            "client_unit",
+                            "entry_date",
+                            "part_order_count",
+                        ]
+                    else:
+                        try:
+                            info_rows = self.app_window.depot_db.fetchall(f"PRAGMA table_info({table_name})")
+                        except Exception as exc:
+                            _runtime_log_event(
+                                "ui.depot_dashboard_schema_introspect_failed",
+                                severity="warning",
+                                summary="Dashboard could not read table schema for empty result set.",
+                                exc=exc,
+                                context={"table": table_name},
+                            )
+                            info_rows = []
+                        headers = [str(r["name"]) for r in info_rows] if info_rows else []
+
+                resize_modes: dict[int, QHeaderView.ResizeMode] = {}
+                if headers:
+                    for idx in range(len(headers)):
+                        resize_modes[idx] = QHeaderView.ResizeMode.ResizeToContents
+                    resize_modes[len(headers) - 1] = QHeaderView.ResizeMode.Stretch
+                configure_standard_table(self.table, headers, resize_modes=resize_modes, stretch_last=True)
+
+                self.table.setRowCount(len(rows))
+                for row_idx, row in enumerate(rows):
+                    for col_idx, col_name in enumerate(headers):
+                        raw_value = row[col_name]
+                        text = self._format_dashboard_cell_text(col_name, raw_value)
+                        item = QTableWidgetItem(text)
+                        item.setToolTip(text)
+                        self.table.setItem(row_idx, col_idx, item)
+                self._refresh_table_placeholder(table_name, len(rows), start_date, end_date, user_id, category_filter)
+
+                if not rows:
+                    self.empty_hint.setText("No rows in this table for the current row limit/filter.")
+                    self.empty_hint.show()
+                else:
+                    self.empty_hint.hide()
+        finally:
+            if app is not None:
+                app.restoreOverrideCursor()
+
+        if submissions_mode and not load_failed:
+            self._refresh_touch_distribution(start_date, end_date, user_id, category_filter)
+        else:
+            self.touch_bar.set_segments([])
+            self.touch_summary_label.setText("")
+            self.touch_legend_label.setText("")
+        self.refresh_completed_parts()
+
+    def export_csv(self) -> None:
+        table = self.table
+        if table.columnCount() <= 0:
+            self._show_themed_message(QMessageBox.Icon.Information, "Export CSV", "No data to export.")
+            return
+
+        table_name = str(self.table_combo.currentData() or "table").strip()
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{table_name}_{stamp}.csv"
+        start_dir = self.app_window.config_path.parent if self.app_window.config_path.parent.exists() else Path.home()
+        out_path, _ = show_flowgrid_themed_save_file_name(
+            self,
+            self.app_window,
+            "dashboard",
+            "Export Dashboard Table",
+            str(start_dir / default_name),
+            "CSV Files (*.csv);;All Files (*.*)",
+        )
+        if not out_path:
+            return
+
+        headers: list[str] = []
+        for col in range(table.columnCount()):
+            hdr = table.horizontalHeaderItem(col)
+            headers.append(hdr.text() if hdr is not None else f"col_{col}")
+
+        try:
+            with open(out_path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(headers)
+                for row in range(table.rowCount()):
+                    values: list[str] = []
+                    for col in range(table.columnCount()):
+                        item = table.item(row, col)
+                        values.append(item.text() if item is not None else "")
+                    writer.writerow(values)
+            self._show_themed_message(QMessageBox.Icon.Information, "Export CSV", f"Exported:\n{out_path}")
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_export_csv_failed",
+                severity="error",
+                summary="Dashboard CSV export failed.",
+                exc=exc,
+                context={"path": str(out_path), "table": table_name},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Export CSV",
+                f"Failed to export CSV:\n{type(exc).__name__}: {exc}\n\nDetails were logged for support.",
+            )
+
+
+# Depot specific page will be added into QuickInputsWindow nav
+class QuickInputsWindow(QMainWindow):
+
+    def __init__(self) -> None:
+        super().__init__()
+        mark_flowgrid_shell_window(self)
+        configure_flowgrid_shell_factory(lambda: QuickInputsWindow())
+        self.config_path = _data_file_path(CONFIG_FILENAME)
+        self.config: dict[str, Any] = self.load_config()
+        self.current_user = DepotRules.normalize_user_id(self.config.get("current_user", detect_current_user_id()))
+        self.config["current_user"] = self.current_user
+        self._ensure_ui_icon_assets()
+
+        self.palette_data = compute_palette(self.config.get("theme", {}))
+        self._pixmap_cache: dict[str, QPixmap] = {}
+        self._background_dirty = True
+        self._background_cache: dict[tuple[int, int], QPixmap] = {}
+        self.image_dialog: ImageLayersDialog | None = None
+        self.quick_layout_dialog: QuickLayoutDialog | None = None
+        self.quick_radial_menu: QuickRadialMenu | None = None
+        self.quick_tabs_widget: QTabWidget | None = None
+        self.quick_tab_scrolls: list[QScrollArea] = []
+        self.quick_tab_canvases: list[QuickButtonCanvas] = []
+        self.active_agent_window: DepotAgentWindow | None = None
+        self.active_qa_window: DepotQAWindow | None = None
+        self.admin_dialog: DepotAdminDialog | None = None
+        self.depot_dashboard_dialog: DepotDashboardDialog | None = None
+        self.last_external_hwnd: int | None = None
+        self._saving_timer = QTimer(self)
+        self._saving_timer.setInterval(220)
+        self._saving_timer.setSingleShot(True)
+        self._saving_timer.timeout.connect(self.save_config)
+        self._hover_inside = False
+        self._hover_revealed = False
+        self._hover_delay_timer = QTimer(self)
+        self._hover_delay_timer.setSingleShot(True)
+        self._hover_delay_timer.timeout.connect(self._on_hover_delay_elapsed)
+        self._popup_leave_timer = QTimer(self)
+        self._popup_leave_timer.setSingleShot(True)
+        self._popup_leave_timer.timeout.connect(self._on_popup_leave_check)
+        self._ui_opacity_current = 1.0
+        self._ui_opacity_anim = QVariantAnimation(self)
+        self._ui_opacity_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._ui_opacity_anim.valueChanged.connect(lambda value: self._set_ui_opacity(float(value)))
+        self._ui_opacity_effects: list[tuple[QGraphicsOpacityEffect, float, float]] = []
+        self._corner_radius = 14
+        self._drag_offset: QPoint | None = None
+
+        self.setWindowTitle(APP_TITLE)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.setWindowFlag(Qt.WindowType.Window, True)
+        self.setFixedSize(LAUNCH_WIDTH, LAUNCH_HEIGHT)
+        self._apply_window_mask()
+
+        self.surface = BackgroundCanvas(self)
+        self.setCentralWidget(self.surface)
+
+        self.main_layout = QVBoxLayout(self.surface)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
+
+        self.titlebar = TitleBar(self)
+        self.main_layout.addWidget(self.titlebar)
+
+        self.body = QWidget()
+        self.body_layout = QHBoxLayout(self.body)
+        self.body_layout.setContentsMargins(6, 6, 6, 6)
+        self.body_layout.setSpacing(6)
+        self.main_layout.addWidget(self.body, 1)
+
+        self.sidebar = QWidget()
+        self.sidebar.setFixedWidth(SIDEBAR_WIDTH)
+        self.sidebar_layout = QVBoxLayout(self.sidebar)
+        self.sidebar_layout.setContentsMargins(4, 4, 4, 4)
+        self.sidebar_layout.setSpacing(4)
+
+        self.nav_buttons: dict[str, QToolButton] = {}
+        self.nav_buttons["quick"] = self._make_nav_button(
+            standard_icon_name="SP_MediaPlay",
+            icon_filename="grid.png",
+            icon_px=30,
+        )
+        self.nav_buttons["depot"] = self._make_nav_button(standard_icon_name="SP_DirHomeIcon", icon_px=30)
+
+        self.nav_buttons["quick"].clicked.connect(lambda: self.switch_page("quick"))
+        self.nav_buttons["depot"].clicked.connect(lambda: self.switch_page("depot"))
+        self.nav_buttons["quick"].setToolTip("Input Grid")
+        self.nav_buttons["depot"].setToolTip("Tracker Hub")
+
+        self.sidebar_layout.addWidget(self.nav_buttons["quick"])
+        self.sidebar_layout.addWidget(self.nav_buttons["depot"])
+        self.sidebar_layout.addStretch(1)
+
+        self.settings_button = self._make_nav_button(
+            standard_icon_name="SP_FileDialogDetailedView",
+            icon_filename="settings.webp",
+            icon_px=31,
+        )
+        self.settings_button.clicked.connect(lambda: self.switch_page("settings"))
+        self.settings_button.setToolTip("Settings")
+        self.sidebar_layout.addWidget(self.settings_button)
+
+        self.pages = QStackedWidget()
+
+        try:
+            self.depot_db = DepotDB(_shared_workflow_db_path())
+        except Exception as exc:
+            db_path = _shared_workflow_db_path()
+            _runtime_log_event(
+                "depot.db.open_failed",
+                severity="error",
+                summary="Failed opening authoritative shared workflow database.",
+                exc=exc,
+                context={"db_path": str(db_path)},
+            )
+            raise RuntimeError(f"Unable to open shared workflow database: {db_path}") from exc
+        _migrate_legacy_agent_icons(self.depot_db.db_path)
+        self.depot_tracker = DepotTracker(self.depot_db)
+        self.depot_refresh_coordinator = DepotRefreshCoordinator()
+        self.user_repository = UserRepository(self.depot_tracker, DepotRules)
+        self.permission_service = PermissionService(self.user_repository)
+        self.depot_tracker.user_repository = self.user_repository
+        self.depot_tracker.permission_service = self.permission_service
+        self.app_context = AppContext(
+            current_user=self.current_user,
+            config=self.config,
+            db=self.depot_db,
+            tracker=self.depot_tracker,
+            user_repository=self.user_repository,
+            permission_service=self.permission_service,
+            shell=self,
+        )
+        self.window_manager = WindowManager(self)
+        _ensure_depot_window_classes_loaded()
+        self._shared_editable_icon_snapshot: tuple[tuple[str, str, int, int], ...] = ()
+        self._refresh_shared_editable_icons(force=True)
+
+        self.quick_page = self._build_quick_page()
+        self.depot_page = self._build_depot_page()
+        self.settings_page = self._build_settings_page()
+
+        self.pages.addWidget(self.quick_page)
+        self.pages.addWidget(self.depot_page)
+        self.pages.addWidget(self.settings_page)
+
+        self.page_index = {"quick": 0, "depot": 1, "settings": 2}
+        self._apply_sidebar_position()
+        self.switch_page("quick")
+
+        self._foreground_timer = QTimer(self)
+        self._foreground_timer.setInterval(260)
+        self._foreground_timer.timeout.connect(self._capture_external_target)
+        self._foreground_timer.start()
+
+        self._shared_sync_timer = QTimer(self)
+        self._shared_sync_timer.setInterval(SHARED_SYNC_REFRESH_INTERVAL_MS)
+        self._shared_sync_timer.timeout.connect(self._refresh_shared_data)
+        self._shared_sync_timer.start()
+
+        self._restore_window_position()
+        self._apply_window_flags()
+        self._init_ui_opacity_effects()
+        self.apply_theme_styles()
+        self.refresh_quick_grid()
+        self.refresh_theme_controls()
+        self.refresh_settings_controls()
+        self.apply_window_icon()
+        _sync_desktop_shortcut(self.config, create_if_missing=False)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+
+    # ---------------------------- Config ---------------------------- #
+    def load_config(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        if self.config_path.exists():
+            try:
+                data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                context = {"config_path": str(self.config_path)}
+                _runtime_log_event(
+                    "runtime.config_load_parse_failed",
+                    severity="critical",
+                    summary="Config parse failed; loading defaults and continuing.",
+                    exc=exc,
+                    context=context,
+                )
+                _escalate_runtime_issue_once(
+                    "runtime.config_load_parse_failed",
+                    "Flowgrid could not parse its config file and loaded defaults for this session.",
+                    details=f"{type(exc).__name__}: {exc}",
+                    context=context,
+                )
+                data = {}
+
+        merged = deep_merge(DEFAULT_CONFIG, data)
+
+        if not merged.get("theme_image_layers"):
+            old_path = data.get("theme_image_path")
+            if old_path:
+                merged["theme_image_layers"] = [
+                    safe_layer_defaults(
+                        {
+                            "image_path": old_path,
+                            "image_x": data.get("theme_image_x", 0),
+                            "image_y": data.get("theme_image_y", 0),
+                            "image_scale_mode": data.get("theme_image_scale_mode", "Fill"),
+                            "image_anchor": data.get("theme_image_anchor", "Center"),
+                            "image_scale_percent": data.get("theme_image_scale_percent", 100),
+                        }
+                    )
+                ]
+
+        cleaned_layers = []
+        for layer in merged.get("theme_image_layers", []):
+            cleaned_layers.append(safe_layer_defaults(layer if isinstance(layer, dict) else {}))
+        merged["theme_image_layers"] = cleaned_layers
+
+        merged["theme"] = {
+            "primary": normalize_hex(merged["theme"].get("primary", DEFAULT_THEME_PRIMARY), DEFAULT_THEME_PRIMARY),
+            "accent": normalize_hex(merged["theme"].get("accent", DEFAULT_THEME_ACCENT), DEFAULT_THEME_ACCENT),
+            "surface": normalize_hex(merged["theme"].get("surface", DEFAULT_THEME_SURFACE), DEFAULT_THEME_SURFACE),
+        }
+
+        merged["theme_presets"] = merged.get("theme_presets") or deep_clone(DEFAULT_THEME_PRESETS)
+        for preset_name, preset in list(merged["theme_presets"].items()):
+            if str(preset_name or "").strip() == "Legacy Blue":
+                merged["theme_presets"].pop(preset_name, None)
+                continue
+            if not isinstance(preset, dict):
+                merged["theme_presets"].pop(preset_name, None)
+                continue
+            merged["theme_presets"][preset_name] = {
+                "primary": normalize_hex(preset.get("primary", DEFAULT_THEME_PRIMARY), DEFAULT_THEME_PRIMARY),
+                "accent": normalize_hex(preset.get("accent", DEFAULT_THEME_ACCENT), DEFAULT_THEME_ACCENT),
+                "surface": normalize_hex(preset.get("surface", DEFAULT_THEME_SURFACE), DEFAULT_THEME_SURFACE),
+            }
+
+        if not merged["theme_presets"]:
+            merged["theme_presets"] = deep_clone(DEFAULT_THEME_PRESETS)
+
+        legacy_default_theme = {
+            "primary": LEGACY_DEFAULT_THEME_PRIMARY,
+            "accent": LEGACY_DEFAULT_THEME_ACCENT,
+            "surface": LEGACY_DEFAULT_THEME_SURFACE,
+        }
+        configured_default = merged["theme_presets"].get("Default")
+        if isinstance(configured_default, dict):
+            normalized_default = {
+                "primary": normalize_hex(configured_default.get("primary", DEFAULT_THEME_PRIMARY), DEFAULT_THEME_PRIMARY),
+                "accent": normalize_hex(configured_default.get("accent", DEFAULT_THEME_ACCENT), DEFAULT_THEME_ACCENT),
+                "surface": normalize_hex(configured_default.get("surface", DEFAULT_THEME_SURFACE), DEFAULT_THEME_SURFACE),
+            }
+            if normalized_default == legacy_default_theme:
+                merged["theme_presets"]["Default"] = deep_clone(DEFAULT_THEME_PRESETS["Default"])
+
+        selected_preset = str(merged.get("selected_theme_preset", "") or "").strip()
+        if selected_preset == "Legacy Blue":
+            merged["selected_theme_preset"] = "Default"
+            selected_preset = "Default"
+        if selected_preset == "Default" and merged.get("theme", {}) == legacy_default_theme:
+            merged["theme"] = deep_clone(DEFAULT_THEME_PRESETS["Default"])
+
+        if merged.get("selected_theme_preset") not in merged["theme_presets"]:
+            merged["selected_theme_preset"] = next(iter(merged["theme_presets"].keys()))
+
+        for kind in ("agent", "qa", "admin", "dashboard"):
+            preset_key = f"{kind}_selected_theme_preset"
+            if str(merged.get(preset_key, "") or "").strip() == "Legacy Blue":
+                merged[preset_key] = str(merged.get("selected_theme_preset", "Default") or "Default")
+
+        legacy_fade_enabled = bool(merged.get("popup_control_fade_enabled", True))
+        merged["popup_control_fade_strength"] = int(clamp(int(merged.get("popup_control_fade_strength", 65)), 0, 100))
+        merged["popup_control_opacity"] = int(clamp(int(merged.get("popup_control_opacity", 82)), 0, 100))
+        merged["popup_control_tail_opacity"] = int(clamp(int(merged.get("popup_control_tail_opacity", 0)), 0, 100))
+
+        style = str(merged.get("popup_control_style", "") or "").strip()
+        valid_styles = {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}
+        if style not in valid_styles:
+            style = "Fade Left to Right" if legacy_fade_enabled else "Solid"
+        merged["popup_control_style"] = style
+        merged["popup_control_fade_enabled"] = style != "Solid"
+        merged["popup_auto_reinherit_enabled"] = bool(merged.get("popup_auto_reinherit_enabled", True))
+        auto_reinherit_enabled = bool(merged.get("popup_auto_reinherit_enabled", True))
+
+        popup_valid_styles = {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}
+        for popup_key in ("agent_theme", "qa_theme", "admin_theme", "dashboard_theme"):
+            popup_theme = merged.get(popup_key, {})
+            if not isinstance(popup_theme, dict):
+                popup_theme = {}
+
+            popup_theme["background"] = normalize_hex(popup_theme.get("background", "#FFFFFF"), "#FFFFFF")
+            popup_theme["text"] = normalize_hex(popup_theme.get("text", "#000000"), "#000000")
+            popup_theme["field_bg"] = normalize_hex(popup_theme.get("field_bg", "#FFFFFF"), "#FFFFFF")
+            popup_theme["transparent"] = bool(popup_theme.get("transparent", False))
+            style_value = str(popup_theme.get("control_style", "Fade Left to Right") or "").strip()
+            popup_theme["control_style"] = (
+                style_value if style_value in popup_valid_styles else "Fade Left to Right"
+            )
+            popup_theme["control_opacity"] = int(clamp(safe_int(popup_theme.get("control_opacity", 82), 82), 0, 100))
+            popup_theme["control_tail_opacity"] = int(
+                clamp(safe_int(popup_theme.get("control_tail_opacity", 0), 0), 0, 100)
+            )
+            popup_theme["control_fade_strength"] = int(
+                clamp(safe_int(popup_theme.get("control_fade_strength", 65), 65), 0, 100)
+            )
+            popup_theme["header_color"] = normalize_hex(popup_theme.get("header_color", ""), "")
+            popup_theme["row_hover_color"] = normalize_hex(popup_theme.get("row_hover_color", ""), "")
+            popup_theme["row_selected_color"] = normalize_hex(popup_theme.get("row_selected_color", ""), "")
+
+            cleaned_popup_layers: list[dict[str, Any]] = []
+            raw_layers = popup_theme.get("image_layers", [])
+            if isinstance(raw_layers, list):
+                for layer in raw_layers:
+                    cleaned_popup_layers.append(safe_layer_defaults(layer if isinstance(layer, dict) else {}))
+            popup_theme["image_layers"] = cleaned_popup_layers
+            inherit_value = popup_theme.get("inherit_main_theme")
+            if isinstance(inherit_value, bool):
+                popup_theme["inherit_main_theme"] = inherit_value
+            else:
+                # Legacy configs that never customized popup colors/images should inherit Flowgrid theme.
+                popup_theme["inherit_main_theme"] = bool(
+                    popup_theme["background"] == "#FFFFFF"
+                    and popup_theme["text"] == "#000000"
+                    and popup_theme["field_bg"] == "#FFFFFF"
+                    and not popup_theme["transparent"]
+                    and not cleaned_popup_layers
+                )
+            has_assigned_popup_theme = bool(
+                popup_theme["background"] != "#FFFFFF"
+                or popup_theme["text"] != "#000000"
+                or popup_theme["field_bg"] != "#FFFFFF"
+                or popup_theme["transparent"]
+                or cleaned_popup_layers
+                or popup_theme["control_style"] != "Fade Left to Right"
+                or int(popup_theme["control_opacity"]) != 82
+                or int(popup_theme["control_tail_opacity"]) != 0
+                or int(popup_theme["control_fade_strength"]) != 65
+                or bool(popup_theme["header_color"])
+                or bool(popup_theme["row_hover_color"])
+                or bool(popup_theme["row_selected_color"])
+            )
+            # Assigned popup theme data always wins over inherited main theme.
+            if has_assigned_popup_theme:
+                popup_theme["inherit_main_theme"] = False
+            elif auto_reinherit_enabled and self._popup_theme_needs_auto_reinherit(popup_theme):
+                # Recovery path for legacy/broken configs that were forced out of inherit mode
+                # while still holding untouched default values (white/empty fields).
+                popup_theme["inherit_main_theme"] = True
+            merged[popup_key] = popup_theme
+
+        def normalize_quick_items(raw_items: Any) -> list[dict[str, Any]]:
+            cleaned_items: list[dict[str, Any]] = []
+            if not isinstance(raw_items, list):
+                return cleaned_items
+            for idx, item in enumerate(raw_items):
+                if not isinstance(item, dict):
+                    continue
+                action = str(item.get("action", "paste_text")).strip().lower()
+                open_target = str(item.get("open_target", "")).strip()
+                app_targets = str(item.get("app_targets", "")).strip()
+                urls_text = str(item.get("urls", "")).strip()
+                browser_path = str(item.get("browser_path", "")).strip()
+                text_payload = str(item.get("text", ""))
+
+                # Migrate older macro mode into supported action types.
+                if action == "macro":
+                    if not app_targets and open_target:
+                        app_targets = open_target
+                    if app_targets:
+                        action = "open_app"
+                    elif urls_text or text_payload.strip():
+                        action = "open_url"
+                    else:
+                        action = "paste_text"
+                elif action == "macro_sequence":
+                    action = "input_sequence"
+                elif action not in {"paste_text", "open_url", "open_app", "input_sequence"}:
+                    action = "paste_text"
+
+                # Backward compatibility for entries saved before URL list/browser fields existed.
+                if action == "open_url" and not urls_text:
+                    fallback = open_target or text_payload.strip()
+                    urls_text = fallback
+                if action == "open_app" and not app_targets and open_target:
+                    app_targets = open_target
+                normalized_item: dict[str, Any] = {
+                    "title": str(item.get("title", f"Item {idx + 1}"))[:64],
+                    "tooltip": str(item.get("tooltip", "")),
+                    "text": text_payload,
+                    "action": action,
+                    "open_target": open_target,
+                    "app_targets": app_targets,
+                    "urls": urls_text,
+                    "browser_path": browser_path,
+                }
+                if isinstance(item.get("x"), (int, float)) and isinstance(item.get("y"), (int, float)):
+                    normalized_item["x"] = int(item.get("x", 0))
+                    normalized_item["y"] = int(item.get("y", 0))
+                cleaned_items.append(normalized_item)
+            return cleaned_items
+
+        cleaned_quick_texts = normalize_quick_items(merged.get("quick_texts", []))
+        merged["quick_texts"] = cleaned_quick_texts
+
+        cleaned_quick_tabs: list[dict[str, Any]] = []
+        raw_quick_tabs = merged.get("quick_tabs", [])
+        if isinstance(raw_quick_tabs, list):
+            for tab_idx, tab in enumerate(raw_quick_tabs):
+                if not isinstance(tab, dict):
+                    continue
+                tab_name = str(tab.get("name", "")).strip()[:32]
+                if not tab_name:
+                    tab_name = "Main" if tab_idx == 0 else f"Task {tab_idx + 1}"
+                tab_quick_texts = normalize_quick_items(tab.get("quick_texts", []))
+                cleaned_quick_tabs.append({"name": tab_name, "quick_texts": tab_quick_texts})
+
+        if not cleaned_quick_tabs:
+            cleaned_quick_tabs = [{"name": "Main", "quick_texts": [dict(item) for item in cleaned_quick_texts]}]
+        merged["quick_tabs"] = cleaned_quick_tabs
+
+        active_quick_tab = safe_int(merged.get("active_quick_tab", 0), 0)
+        if active_quick_tab < 0 or active_quick_tab >= len(cleaned_quick_tabs):
+            active_quick_tab = 0
+        merged["active_quick_tab"] = active_quick_tab
+        merged["quick_texts"] = [
+            dict(item) for item in cleaned_quick_tabs[active_quick_tab].get("quick_texts", []) if isinstance(item, dict)
+        ]
+
+        family = str(merged.get("quick_button_font_family", "Segoe UI")).strip()
+        merged["quick_button_font_family"] = family or "Segoe UI"
+        loaded_opacity = float(clamp(float(merged.get("window_opacity", 1.0)), 0.0, 1.0))
+        # Prevent a saved 0.00 opacity from making the app appear like it failed to launch.
+        if loaded_opacity <= 0.01:
+            loaded_opacity = 0.20
+        merged["window_opacity"] = loaded_opacity
+        current_user = str(merged.get("current_user", "")).strip()
+        merged["current_user"] = DepotRules.normalize_user_id(current_user or detect_current_user_id())
+        legacy_theme_transparent = data.get("theme_page_transparent_primary_bg")
+        if "background_tint_enabled" in data:
+            merged["background_tint_enabled"] = bool(merged.get("background_tint_enabled", True))
+        elif isinstance(legacy_theme_transparent, bool):
+            merged["background_tint_enabled"] = not legacy_theme_transparent
+        else:
+            merged["background_tint_enabled"] = bool(merged.get("background_tint_enabled", True))
+
+        return merged
+
+    def save_config(self) -> None:
+        payload = json.dumps(self.config, indent=2, ensure_ascii=False)
+        target = self.config_path
+        temp_path = target.with_name(f"{target.name}.tmp")
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, target)
+        except Exception as exc:
+            try:
+                if temp_path.exists():
+                    temp_path.unlink()
+            except Exception as cleanup_exc:
+                _runtime_log_event(
+                    "runtime.config_temp_cleanup_failed",
+                    severity="warning",
+                    summary="Config save failed and temporary config cleanup also failed.",
+                    exc=cleanup_exc,
+                    context={"config_path": str(target), "temp_path": str(temp_path)},
+                )
+            context = {"config_path": str(target)}
+            _runtime_log_event(
+                "runtime.config_save_failed",
+                severity="critical",
+                summary="Config save failed; settings may not persist.",
+                exc=exc,
+                context=context,
+            )
+            _escalate_runtime_issue_once(
+                "runtime.config_save_failed",
+                "Flowgrid could not save its config file. Recent settings may not persist.",
+                details=f"{type(exc).__name__}: {exc}",
+                context=context,
+            )
+
+    def queue_save_config(self) -> None:
+        self._saving_timer.start()
+
+    # ------------------------- Background --------------------------- #
+    def mark_background_dirty(self) -> None:
+        self._background_dirty = True
+        self._background_cache.clear()
+        self.surface.update()
+
+    def load_layer_pixmap(self, path: str) -> QPixmap:
+        if path in self._pixmap_cache:
+            return self._pixmap_cache[path]
+
+        pixmap = QPixmap()
+        if path and Path(path).exists():
+            reader = QImageReader(path)
+            reader.setAutoTransform(True)
+            image = reader.read()
+            if not image.isNull():
+                pixmap = QPixmap.fromImage(image)
+
+        self._pixmap_cache[path] = pixmap
+        return pixmap
+
+    def compute_layer_render(self, layer: dict[str, Any], size: QSize) -> LayerRenderInfo | None:
+        if not layer.get("visible", True):
+            return None
+
+        path = layer.get("image_path", "")
+        pixmap = self.load_layer_pixmap(path)
+        if pixmap.isNull() or size.width() <= 0 or size.height() <= 0:
+            return None
+
+        target_rect = QRectF(0, 0, float(size.width()), float(size.height()))
+        mode = str(layer.get("image_scale_mode", "Fill"))
+        anchor = str(layer.get("image_anchor", "Center"))
+        scale_percent = int(clamp(int(layer.get("image_scale_percent", 100)), 10, 400)) / 100.0
+        img_w = float(pixmap.width())
+        img_h = float(pixmap.height())
+
+        if mode == "Stretch":
+            draw_w = target_rect.width() * scale_percent
+            draw_h = target_rect.height() * scale_percent
+        elif mode == "Fit":
+            ratio = min(target_rect.width() / img_w, target_rect.height() / img_h)
+            ratio *= scale_percent
+            draw_w = img_w * ratio
+            draw_h = img_h * ratio
+        elif mode == "Place":
+            draw_w = img_w * scale_percent
+            draw_h = img_h * scale_percent
+        else:
+            ratio = max(target_rect.width() / img_w, target_rect.height() / img_h)
+            ratio *= scale_percent
+            draw_w = img_w * ratio
+            draw_h = img_h * ratio
+
+        x = target_rect.left()
+        y = target_rect.top()
+
+        if "Right" in anchor:
+            x = target_rect.right() - draw_w
+        elif anchor in {"Top", "Center", "Bottom"}:
+            x = target_rect.left() + (target_rect.width() - draw_w) / 2
+
+        if "Bottom" in anchor:
+            y = target_rect.bottom() - draw_h
+        elif anchor in {"Left", "Center", "Right"}:
+            y = target_rect.top() + (target_rect.height() - draw_h) / 2
+
+        x += int(layer.get("image_x", 0))
+        y += int(layer.get("image_y", 0))
+
+        rect = QRectF(x, y, draw_w, draw_h)
+        return LayerRenderInfo(layer=layer, rect=rect, pixmap=pixmap)
+
+    @staticmethod
+    def _popup_theme_needs_auto_reinherit(theme: dict[str, Any]) -> bool:
+        """True when a popup theme is custom-mode but still carries untouched default values."""
+        if not isinstance(theme, dict):
+            return False
+        if bool(theme.get("inherit_main_theme", False)):
+            return False
+
+        background = normalize_hex(theme.get("background", "#FFFFFF"), "#FFFFFF")
+        text = normalize_hex(theme.get("text", "#000000"), "#000000")
+        field_bg = normalize_hex(theme.get("field_bg", "#FFFFFF"), "#FFFFFF")
+        transparent = bool(theme.get("transparent", False))
+        control_style = str(theme.get("control_style", "Fade Left to Right") or "").strip()
+        control_opacity = int(clamp(safe_int(theme.get("control_opacity", 82), 82), 0, 100))
+        control_tail_opacity = int(clamp(safe_int(theme.get("control_tail_opacity", 0), 0), 0, 100))
+        control_fade_strength = int(clamp(safe_int(theme.get("control_fade_strength", 65), 65), 0, 100))
+        header_color = normalize_hex(theme.get("header_color", ""), "")
+        row_hover_color = normalize_hex(theme.get("row_hover_color", ""), "")
+        row_selected_color = normalize_hex(theme.get("row_selected_color", ""), "")
+        raw_layers = theme.get("image_layers", [])
+        has_layers = isinstance(raw_layers, list) and any(isinstance(layer, dict) for layer in raw_layers)
+
+        has_custom_data = bool(
+            background != "#FFFFFF"
+            or text != "#000000"
+            or field_bg != "#FFFFFF"
+            or transparent
+            or has_layers
+            or control_style != "Fade Left to Right"
+            or control_opacity != 82
+            or control_tail_opacity != 0
+            or control_fade_strength != 65
+            or bool(header_color)
+            or bool(row_hover_color)
+            or bool(row_selected_color)
+        )
+        return not has_custom_data
+
+    @staticmethod
+    def _looks_like_unconfigured_popup_theme(theme: dict[str, Any]) -> bool:
+        background = normalize_hex(theme.get("background", "#FFFFFF"), "#FFFFFF")
+        text = normalize_hex(theme.get("text", "#000000"), "#000000")
+        field_bg = normalize_hex(theme.get("field_bg", "#FFFFFF"), "#FFFFFF")
+        transparent = bool(theme.get("transparent", False))
+        control_style = str(theme.get("control_style", "Fade Left to Right") or "").strip()
+        control_opacity = int(clamp(safe_int(theme.get("control_opacity", 82), 82), 0, 100))
+        control_tail_opacity = int(clamp(safe_int(theme.get("control_tail_opacity", 0), 0), 0, 100))
+        control_fade_strength = int(clamp(safe_int(theme.get("control_fade_strength", 65), 65), 0, 100))
+        header_color = normalize_hex(theme.get("header_color", ""), "")
+        row_hover_color = normalize_hex(theme.get("row_hover_color", ""), "")
+        row_selected_color = normalize_hex(theme.get("row_selected_color", ""), "")
+        raw_layers = theme.get("image_layers", [])
+        has_layers = isinstance(raw_layers, list) and any(isinstance(layer, dict) for layer in raw_layers)
+        has_assigned_data = bool(
+            background != "#FFFFFF"
+            or text != "#000000"
+            or field_bg != "#FFFFFF"
+            or transparent
+            or has_layers
+            or control_style != "Fade Left to Right"
+            or control_opacity != 82
+            or control_tail_opacity != 0
+            or control_fade_strength != 65
+            or bool(header_color)
+            or bool(row_hover_color)
+            or bool(row_selected_color)
+        )
+        if has_assigned_data:
+            return False
+        if "inherit_main_theme" in theme:
+            return bool(theme.get("inherit_main_theme", False))
+        return True
+
+    def _auto_reinherit_popup_defaults(self) -> bool:
+        """Recover popup themes that are custom-mode but still effectively default/unconfigured."""
+        if not bool(self.config.get("popup_auto_reinherit_enabled", True)):
+            return False
+        changed = False
+        for kind in ("agent", "qa", "admin", "dashboard"):
+            key = f"{kind}_theme"
+            theme = self.config.get(key, {})
+            if not isinstance(theme, dict):
+                theme = {}
+                self.config[key] = theme
+            if self._popup_theme_needs_auto_reinherit(theme):
+                theme["inherit_main_theme"] = True
+                changed = True
+        return changed
+
+    def _default_popup_theme_from_main(self) -> dict[str, Any]:
+        layers: list[dict[str, Any]] = []
+        for layer in self.config.get("theme_image_layers", []):
+            if isinstance(layer, dict):
+                layers.append(safe_layer_defaults(layer))
+        return {
+            "background": normalize_hex(
+                self.palette_data.get("control_bg", self.palette_data.get("surface", DEFAULT_THEME_SURFACE)),
+                DEFAULT_THEME_SURFACE,
+            ),
+            "text": normalize_hex(self.palette_data.get("label_text", "#000000"), "#000000"),
+            "field_bg": normalize_hex(self.palette_data.get("input_bg", "#FFFFFF"), "#FFFFFF"),
+            "transparent": False,
+            "inherit_main_theme": True,
+            "image_layers": layers,
+            "control_style": str(self.config.get("popup_control_style", "Fade Left to Right") or "Fade Left to Right"),
+            "control_opacity": int(clamp(safe_int(self.config.get("popup_control_opacity", 82), 82), 0, 100)),
+            "control_tail_opacity": int(
+                clamp(safe_int(self.config.get("popup_control_tail_opacity", 0), 0), 0, 100)
+            ),
+            "control_fade_strength": int(
+                clamp(safe_int(self.config.get("popup_control_fade_strength", 65), 65), 0, 100)
+            ),
+            "header_color": normalize_hex(self.config.get("popup_header_color", ""), ""),
+            "row_hover_color": normalize_hex(self.config.get("popup_row_hover_color", ""), ""),
+            "row_selected_color": normalize_hex(self.config.get("popup_row_selected_color", ""), ""),
+        }
+
+    def _resolved_popup_theme(self, kind: str) -> dict[str, Any]:
+        base = self._default_popup_theme_from_main()
+        raw_theme = self.config.get(f"{kind}_theme", {})
+        if not isinstance(raw_theme, dict) or self._looks_like_unconfigured_popup_theme(raw_theme):
+            return base
+
+        resolved: dict[str, Any] = {
+            "background": normalize_hex(raw_theme.get("background", base["background"]), base["background"]),
+            "text": normalize_hex(raw_theme.get("text", base["text"]), base["text"]),
+            "field_bg": normalize_hex(raw_theme.get("field_bg", base["field_bg"]), base["field_bg"]),
+            "transparent": bool(raw_theme.get("transparent", False)),
+            "inherit_main_theme": False,
+            "image_layers": [],
+            "control_style": str(raw_theme.get("control_style", base["control_style"]) or base["control_style"]),
+            "control_opacity": int(
+                clamp(safe_int(raw_theme.get("control_opacity", base["control_opacity"]), base["control_opacity"]), 0, 100)
+            ),
+            "control_tail_opacity": int(
+                clamp(
+                    safe_int(raw_theme.get("control_tail_opacity", base["control_tail_opacity"]), base["control_tail_opacity"]),
+                    0,
+                    100,
+                )
+            ),
+            "control_fade_strength": int(
+                clamp(
+                    safe_int(raw_theme.get("control_fade_strength", base["control_fade_strength"]), base["control_fade_strength"]),
+                    0,
+                    100,
+                )
+            ),
+            "header_color": normalize_hex(raw_theme.get("header_color", base["header_color"]), base["header_color"]),
+            "row_hover_color": normalize_hex(
+                raw_theme.get("row_hover_color", base["row_hover_color"]), base["row_hover_color"]
+            ),
+            "row_selected_color": normalize_hex(
+                raw_theme.get("row_selected_color", base["row_selected_color"]), base["row_selected_color"]
+            ),
+        }
+        valid_styles = {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}
+        if resolved["control_style"] not in valid_styles:
+            resolved["control_style"] = base["control_style"] if base["control_style"] in valid_styles else "Fade Left to Right"
+        raw_layers = raw_theme.get("image_layers", [])
+        if isinstance(raw_layers, list):
+            cleaned: list[dict[str, Any]] = []
+            for layer in raw_layers:
+                if isinstance(layer, dict):
+                    cleaned.append(safe_layer_defaults(layer))
+            resolved["image_layers"] = cleaned
+        return resolved
+
+    def render_background_pixmap(self, size: QSize, kind: str = "main") -> QPixmap:
+        key = (kind, size.width(), size.height())
+        cached = self._background_cache.get(key)
+        if cached is not None and not self._background_dirty:
+            return cached
+
+        pixmap = QPixmap(size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+        if kind == "main":
+            layers = self.config.get("theme_image_layers", [])
+        else:
+            layers = self._resolved_popup_theme(kind).get("image_layers", [])
+
+        for layer in layers:
+            info = self.compute_layer_render(layer, size)
+            if not info:
+                continue
+            opacity = float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0))
+            painter.setOpacity(opacity)
+            painter.drawPixmap(info.rect.toRect(), info.pixmap)
+            painter.setOpacity(1.0)
+        painter.end()
+
+        self._background_cache[key] = pixmap
+        self._background_dirty = False
+        return pixmap
+
+    def _background_tint_enabled(self) -> bool:
+        return bool(self.config.get("background_tint_enabled", True))
+
+    def _has_visible_background_layers(self) -> bool:
+        for layer in self.config.get("theme_image_layers", []):
+            if not isinstance(layer, dict):
+                continue
+            if not bool(layer.get("visible", True)):
+                continue
+            path = str(layer.get("image_path", "")).strip()
+            if not path or not Path(path).exists():
+                continue
+            if float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)) <= 0.01:
+                continue
+            if path:
+                return True
+        return False
+
+    def _window_has_background_layers(self, kind: str) -> bool:
+        normalized_kind = str(kind or "main").strip().lower() or "main"
+        if normalized_kind == "main":
+            return self._has_visible_background_layers()
+        resolved = self._resolved_popup_theme(normalized_kind)
+        for layer in resolved.get("image_layers", []):
+            if not isinstance(layer, dict):
+                continue
+            if not bool(layer.get("visible", True)):
+                continue
+            path = str(layer.get("image_path", "")).strip()
+            if not path or not Path(path).exists():
+                continue
+            if float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)) <= 0.01:
+                continue
+            return True
+        return False
+
+    def _effective_popup_transparency(self, kind: str) -> bool:
+        normalized_kind = str(kind or "main").strip().lower() or "main"
+        if normalized_kind == "main":
+            return bool(not self._background_tint_enabled() and self._window_has_background_layers("main"))
+        resolved = self._resolved_popup_theme(normalized_kind)
+        return bool(resolved.get("transparent", False) and self._window_has_background_layers(normalized_kind))
+
+    def _effective_shell_idle_opacity(self) -> float:
+        requested = self._base_opacity()
+        if self._window_has_background_layers("main"):
+            return float(clamp(requested, 0.0, 1.0))
+        return float(clamp(requested, 0.05, 1.0))
+
+    def paint_background(self, painter: QPainter, rect: QRect) -> None:
+        shell_opacity = float(clamp(getattr(self, "_ui_opacity_current", 1.0), 0.0, 1.0))
+        tint_enabled = self._background_tint_enabled()
+        if tint_enabled or not self._has_visible_background_layers():
+            surface_color = QColor(self.palette_data["surface"])
+            surface_color.setAlpha(int(255 * shell_opacity))
+            painter.fillRect(rect, surface_color)
+
+        bg = self.render_background_pixmap(rect.size())
+        painter.drawPixmap(rect, bg)
+
+        if tint_enabled:
+            overlay_color = QColor(self.palette_data["shell_overlay"])
+            overlay_color.setAlpha(int(50 * shell_opacity))
+            painter.fillRect(rect, overlay_color)
+
+    # -------------------------- UI Build ---------------------------- #
+    def _resolve_standard_icon(self, icon_name: str, fallback_name: str = "SP_FileIcon") -> QIcon:
+        style = self.style() if self.style() is not None else QApplication.style()
+        if style is None:
+            return QIcon()
+        fallback_enum = getattr(QStyle.StandardPixmap, fallback_name, QStyle.StandardPixmap.SP_FileIcon)
+        icon_enum = getattr(QStyle.StandardPixmap, str(icon_name or "").strip(), fallback_enum)
+        return style.standardIcon(icon_enum)
+
+    def _ui_icon_dir(self) -> Path:
+        icon_dir = _resolve_data_root() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME
+        try:
+            icon_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.main_icon_dir_create_failed",
+                severity="warning",
+                summary="Failed creating local UI icon directory.",
+                exc=exc,
+                context={"icon_dir": str(icon_dir)},
+            )
+        return icon_dir
+
+    def _ensure_ui_icon_assets(self) -> None:
+        # Keep icon handling file-based: migrate legacy icon files into Assets if present.
+        icon_dir = self._ui_icon_dir()
+        legacy_candidates = [
+            _resolve_data_root() / "ui_icons",
+            _resolve_data_root() / ASSETS_DIR_NAME / ASSET_UI_ICON_COMPAT_DIR_NAME,
+        ]
+        for source_dir in legacy_candidates:
+            if not source_dir.exists() or not source_dir.is_dir():
+                continue
+            try:
+                for source_file in source_dir.rglob("*"):
+                    if not source_file.is_file():
+                        continue
+                    target_path = icon_dir / source_file.name
+                    if target_path.exists():
+                        continue
+                    shutil.copy2(source_file, target_path)
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.main_icon_asset_migrate_failed",
+                    severity="warning",
+                    summary="Failed migrating legacy UI icon assets into Assets.",
+                    exc=exc,
+                    context={"source_dir": str(source_dir), "target_dir": str(icon_dir)},
+                )
+
+    def _load_ui_icon(self, filename: str, fallback_standard: str = "SP_FileIcon") -> QIcon:
+        clean = str(filename or "").strip()
+        if clean:
+            search_paths = [
+                self._ui_icon_dir() / clean,
+                _resolve_data_root() / ASSETS_DIR_NAME / ASSET_UI_ICON_COMPAT_DIR_NAME / clean,
+                _resolve_data_root() / "ui_icons" / clean,
+            ]
+            for path in search_paths:
+                if not path.exists() or not path.is_file():
+                    continue
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    return icon
+        return self._resolve_standard_icon(fallback_standard, "SP_FileIcon")
+
+    def _make_nav_button(
+        self,
+        icon_text: str = "",
+        *,
+        standard_icon_name: str = "",
+        icon_filename: str = "",
+        icon_px: int = 30,
+    ) -> QToolButton:
+        btn = QToolButton()
+        btn.setText(str(icon_text or ""))
+        btn.setFixedSize(42, 42)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        font = QFont("Segoe UI Symbol", 15, QFont.Weight.Bold)
+        btn.setFont(font)
+        icon = QIcon()
+        if icon_filename:
+            fallback = standard_icon_name if standard_icon_name else "SP_FileIcon"
+            icon = self._load_ui_icon(icon_filename, fallback)
+        elif standard_icon_name:
+            icon = self._resolve_standard_icon(standard_icon_name, "SP_FileIcon")
+        if not icon.isNull():
+            px = int(clamp(safe_int(icon_px, 30), 16, 40))
+            btn.setIcon(icon)
+            btn.setIconSize(QSize(px, px))
+        return btn
+
+    def _build_quick_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(6)
+
+        head_row = QHBoxLayout()
+        self.quick_actions_button = QPushButton("")
+        self.quick_actions_button.setObjectName("QuickActionsTrigger")
+        self.quick_actions_button.setProperty("actionRole", "add")
+        self.quick_actions_button.setToolTip("Quick actions")
+        self.quick_actions_button.setFixedSize(36, 36)
+        self.quick_actions_button.setIcon(self._resolve_standard_icon("SP_DialogOpenButton", "SP_ArrowRight"))
+        self.quick_actions_button.setIconSize(QSize(20, 20))
+        self.quick_actions_button.clicked.connect(self.toggle_quick_radial_menu)
+        head_row.addWidget(self.quick_actions_button, 0)
+        head_row.addStretch(1)
+        layout.addLayout(head_row)
+
+        self._build_quick_radial_menu()
+
+        self.quick_tabs_widget = QTabWidget()
+        self.quick_tabs_widget.setMovable(False)
+        self.quick_tabs_widget.setTabPosition(QTabWidget.TabPosition.North)
+        self.quick_tabs_widget.currentChanged.connect(self._on_quick_tab_changed)
+        layout.addWidget(self.quick_tabs_widget, 1)
+        self._rebuild_quick_tab_widgets()
+
+        self._build_quick_editor_dialog()
+        return page
+
+    def _build_depot_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        title = QLabel("Tracker Hub")
+        title.setProperty("section", True)
+        subtitle = QLabel("Launch windows and maintenance actions.")
+        subtitle.setProperty("muted", True)
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        self.depot_agent_button = QPushButton("Open Agent")
+        self.depot_agent_button.setProperty("actionRole", "launch")
+        self.depot_agent_button.setIcon(self._load_ui_icon("wrench.png", "SP_ComputerIcon"))
+        self.depot_agent_button.clicked.connect(self._open_depot_agent)
+        self.depot_agent_button.setToolTip("Open the Agent popup window.")
+
+        self.depot_qa_button = QPushButton("Open QA/WCS")
+        self.depot_qa_button.setProperty("actionRole", "launch")
+        self.depot_qa_button.setIcon(self._load_ui_icon("qa.png", "SP_DialogApplyButton"))
+        self.depot_qa_button.clicked.connect(self._open_depot_qa)
+        self.depot_qa_button.setToolTip("Open the QA/WCS popup window.")
+
+        self.depot_import_button = QPushButton("Import Workbook")
+        self.depot_import_button.setProperty("actionRole", "pick")
+        self.depot_import_button.setIcon(self._resolve_standard_icon("SP_DialogOpenButton", "SP_FileIcon"))
+        self.depot_import_button.clicked.connect(self._import_depot_workbook)
+        self.depot_import_button.setToolTip("Import depot workbook data.")
+
+        self.depot_admin_button = QPushButton("User Setup")
+        self.depot_admin_button.setProperty("actionRole", "pick")
+        self.depot_admin_button.setIcon(self._load_ui_icon("user-admin.svg", "SP_FileDialogDetailedView"))
+        self.depot_admin_button.clicked.connect(self._open_depot_admin)
+        self.depot_admin_button.setToolTip("Open the User Setup window.")
+        self.depot_dashboard_button = QPushButton("Open Data Dashboard")
+        self.depot_dashboard_button.setProperty("actionRole", "pick")
+        self.depot_dashboard_button.setIcon(self._load_ui_icon("dash.webp", "SP_FileDialogContentsView"))
+        self.depot_dashboard_button.clicked.connect(self._open_depot_dashboard)
+        self.depot_dashboard_button.setToolTip("Open data dashboard in a separate window.")
+
+        for btn in (
+            self.depot_agent_button,
+            self.depot_qa_button,
+            self.depot_import_button,
+            self.depot_admin_button,
+            self.depot_dashboard_button,
+        ):
+            btn.setMinimumHeight(44)
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.setIconSize(QSize(24, 24))
+
+        actions_grid = QGridLayout()
+        actions_grid.setHorizontalSpacing(8)
+        actions_grid.setVerticalSpacing(8)
+        actions_grid.setColumnStretch(0, 1)
+        actions_grid.setColumnStretch(1, 1)
+        actions_grid.addWidget(self.depot_agent_button, 0, 0)
+        actions_grid.addWidget(self.depot_qa_button, 0, 1)
+        actions_grid.addWidget(self.depot_import_button, 1, 0)
+        actions_grid.addWidget(self.depot_admin_button, 1, 1)
+        actions_grid.addWidget(self.depot_dashboard_button, 2, 0, 1, 2)
+        layout.addLayout(actions_grid)
+        layout.addStretch(1)
+        self._apply_depot_access_controls()
+
+        return page
+
+    def _show_shell_message(
+        self,
+        icon: QMessageBox.Icon,
+        title: str,
+        text: str,
+        *,
+        theme_kind: str = "main",
+    ) -> None:
+        """Non-native QMessageBox from the main window, styled like configured popup themes."""
+        show_flowgrid_themed_message(self, self, theme_kind, icon, title, text)
+
+    def _show_access_denied_message(self, title: str, text: str, *, theme_kind: str) -> None:
+        self._show_shell_message(QMessageBox.Icon.Warning, title, text, theme_kind=theme_kind)
+
+    def _apply_depot_access_controls(self) -> None:
+        permission_service = getattr(self, "permission_service", None)
+        if permission_service is None:
+            return
+        agent_allowed = permission_service.can_open_agent_window(self.current_user)
+        qa_allowed = permission_service.can_access_qa(self.current_user)
+        admin_allowed = permission_service.can_access_admin(self.current_user)
+        dashboard_allowed = permission_service.can_access_dashboard(self.current_user)
+
+        if hasattr(self, "depot_agent_button") and self.depot_agent_button is not None:
+            self.depot_agent_button.setEnabled(agent_allowed)
+            self.depot_agent_button.setToolTip(
+                "Open the Agent popup window." if agent_allowed else PermissionService.AGENT_ACCESS_DENIED_MESSAGE
+            )
+        if hasattr(self, "depot_qa_button") and self.depot_qa_button is not None:
+            self.depot_qa_button.setEnabled(qa_allowed)
+            self.depot_qa_button.setToolTip(
+                "Open the QA/WCS popup window." if qa_allowed else PermissionService.QA_ACCESS_DENIED_MESSAGE
+            )
+        if hasattr(self, "depot_admin_button") and self.depot_admin_button is not None:
+            self.depot_admin_button.setEnabled(admin_allowed)
+            self.depot_admin_button.setToolTip(
+                "Open the User Setup window." if admin_allowed else PermissionService.ADMIN_ACCESS_DENIED_MESSAGE
+            )
+        if hasattr(self, "depot_dashboard_button") and self.depot_dashboard_button is not None:
+            self.depot_dashboard_button.setEnabled(dashboard_allowed)
+            self.depot_dashboard_button.setToolTip(
+                "Open data dashboard in a separate window."
+                if dashboard_allowed
+                else PermissionService.DASHBOARD_ACCESS_DENIED_MESSAGE
+            )
+
+    def _refresh_depot_dashboard_combo_popup_width(self) -> None:
+        dashboard_dialog = self.window_manager.get_window("dashboard")
+        if dashboard_dialog is not None:
+            dashboard_dialog.refresh_combo_popup_width()
+
+    def _refresh_depot_dashboard(self) -> None:
+        dashboard_dialog = self.window_manager.get_window("dashboard")
+        if dashboard_dialog is not None and dashboard_dialog.isVisible():
+            dashboard_dialog.refresh_dashboard()
+
+    @staticmethod
+    def _all_depot_refresh_sections() -> tuple[str, ...]:
+        return (
+            "admin_admins",
+            "admin_agents",
+            "admin_roles",
+            "admin_qa_flags",
+            "agent_category",
+            "agent_client_followup",
+            "agent_missing_po",
+            "agent_parts",
+            "agent_recent",
+            "agent_rtv",
+            "agent_team_client_followup",
+            "agent_work_chart",
+            "dashboard_completed",
+            "dashboard_metrics",
+            "dashboard_notes",
+            "qa_assigned",
+            "qa_category",
+            "qa_client_followup",
+            "qa_client_jo",
+            "qa_delivered",
+            "qa_flags",
+            "qa_missing_po",
+            "qa_owner",
+            "qa_recent",
+            "qa_rtv",
+        )
+
+    def _invalidate_depot_views(self, *sections: str, reason: str = "") -> None:
+        coordinator = getattr(self, "depot_refresh_coordinator", None)
+        if coordinator is None:
+            return
+        coordinator.invalidate_views(*sections, reason=reason)
+
+    def _refresh_visible_depot_views(
+        self,
+        *sections: str,
+        force: bool = False,
+        reason: str = "",
+        ttl_ms: int = DEPOT_VIEW_TTL_MS,
+    ) -> None:
+        requested = {str(section or "").strip() for section in sections if str(section or "").strip()}
+        if not requested:
+            return
+
+        agent_window = getattr(self, "active_agent_window", None)
+        if agent_window is not None and agent_window.isVisible():
+            current_agent_index = int(agent_window.agent_tabs.currentIndex()) if hasattr(agent_window, "agent_tabs") else -1
+            current_agent_key = agent_window._tab_key_for_index(current_agent_index) if current_agent_index >= 0 else ""
+            on_agent_work_tab = current_agent_index == int(agent_window.agent_tabs.indexOf(agent_window.work_tab)) if hasattr(agent_window, "agent_tabs") else False
+            if "agent_recent" in requested and on_agent_work_tab:
+                agent_window._refresh_recent_submissions_label(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_work_chart" in requested and on_agent_work_tab:
+                agent_window._refresh_work_touch_chart(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_client_followup" in requested and current_agent_key == "client":
+                agent_window._refresh_client_followup(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_rtv" in requested and getattr(agent_window, "rtv_tab", None) is not None and current_agent_key == "rtv":
+                agent_window._refresh_rtv_rows(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_team_client_followup" in requested and getattr(agent_window, "team_client_tab", None) is not None and current_agent_key == "team_client":
+                agent_window._refresh_team_client_followup(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_parts" in requested and current_agent_key == "parts":
+                agent_window._refresh_agent_parts(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_category" in requested and current_agent_key == "cat_parts":
+                agent_window._refresh_category_parts(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "agent_missing_po" in requested and current_agent_key == "missing_po":
+                agent_window._refresh_missing_po_followups(force=force, reason=reason, ttl_ms=ttl_ms)
+
+        qa_window = getattr(self, "active_qa_window", None)
+        if qa_window is not None and qa_window.isVisible():
+            current_qa_index = int(qa_window.qa_tabs.currentIndex()) if hasattr(qa_window, "qa_tabs") else -1
+            current_qa_widget = qa_window.qa_tabs.widget(current_qa_index) if current_qa_index >= 0 and hasattr(qa_window, "qa_tabs") else None
+            current_qa_key = qa_window._qa_tab_key_for_index(current_qa_index) if current_qa_index >= 0 else ""
+            if "qa_owner" in requested and current_qa_widget is qa_window.submit_tab:
+                qa_window._refresh_repair_owner_preview(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_flags" in requested:
+                qa_window._populate_flags()
+            if "qa_recent" in requested:
+                qa_window._refresh_recent_submissions_label(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_assigned" in requested and current_qa_widget is qa_window.assigned_tab:
+                qa_window._refresh_assigned_parts(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_category" in requested and current_qa_key == "cat_parts":
+                qa_window._refresh_qa_category_parts(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_client_followup" in requested and current_qa_key == "client":
+                qa_window._refresh_qa_client_followup(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_rtv" in requested and current_qa_key == "rtv":
+                qa_window._refresh_qa_rtv_rows(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_delivered" in requested and current_qa_widget is qa_window.delivered_tab:
+                qa_window._refresh_delivered_parts(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_client_jo" in requested and current_qa_key == "client_jo":
+                qa_window._refresh_qa_client_jo_rows(force=force, reason=reason, ttl_ms=ttl_ms)
+            if "qa_missing_po" in requested and current_qa_key == "missing_po":
+                qa_window._refresh_missing_po_followups(force=force, reason=reason, ttl_ms=ttl_ms)
+
+        dashboard_dialog = getattr(self, "depot_dashboard_dialog", None)
+        if dashboard_dialog is not None and dashboard_dialog.isVisible():
+            if "dashboard_metrics" in requested:
+                dashboard_dialog.refresh_dashboard()
+            if "dashboard_completed" in requested:
+                dashboard_dialog.refresh_completed_parts()
+            if "dashboard_notes" in requested:
+                dashboard_dialog.refresh_notes_rows()
+
+        admin_dialog = getattr(self, "admin_dialog", None)
+        if admin_dialog is not None and admin_dialog.isVisible():
+            if "admin_agents" in requested or "admin_admins" in requested:
+                admin_dialog.refresh_users()
+            if "admin_roles" in requested:
+                admin_dialog.refresh_roles()
+            if "admin_qa_flags" in requested:
+                admin_dialog.refresh_qa_flags()
+
+    def _refresh_shared_editable_icon_views(self) -> None:
+        sections = (
+            "admin_admins",
+            "admin_agents",
+            "admin_roles",
+            "admin_qa_flags",
+            "agent_missing_po",
+            "dashboard_completed",
+            "qa_assigned",
+            "qa_delivered",
+            "qa_flags",
+            "qa_missing_po",
+            "qa_owner",
+        )
+        self._invalidate_depot_views(*sections, reason="shared_editable_icons")
+        self._refresh_visible_depot_views(
+            *sections,
+            force=False,
+            reason="shared_editable_icons",
+        )
+
+    def _refresh_shared_editable_icons(self, force: bool = False) -> None:
+        try:
+            self.depot_tracker.reconcile_shared_editable_icons()
+            latest_snapshot = self.depot_tracker.shared_editable_icon_snapshot()
+        except Exception as exc:
+            _runtime_log_event(
+                "sync.shared_editable_icons_refresh_failed",
+                severity="warning",
+                summary="Shared editable icon refresh failed.",
+                exc=exc,
+            )
+            return
+
+        if not force and latest_snapshot == self._shared_editable_icon_snapshot:
+            return
+
+        self._shared_editable_icon_snapshot = latest_snapshot
+        self._refresh_shared_editable_icon_views()
+
+    def _refresh_shared_linked_views(self, *sections: str, force: bool = False, reason: str = "linked_refresh") -> None:
+        """Invalidate and refresh targeted shared workflow views visible in the current shell."""
+        requested_sections = tuple(str(section or "").strip() for section in sections if str(section or "").strip())
+        if not requested_sections:
+            requested_sections = self._all_depot_refresh_sections()
+        self._invalidate_depot_views(*requested_sections, reason=reason)
+        self._refresh_visible_depot_views(
+            *requested_sections,
+            force=force,
+            reason=reason,
+            ttl_ms=DEPOT_VIEW_TTL_MS,
+        )
+
+    def _export_depot_dashboard(self) -> None:
+        dashboard_dialog = self.window_manager.get_window("dashboard")
+        if dashboard_dialog is None:
+            dashboard_dialog = self._open_depot_dashboard()
+        if dashboard_dialog is not None:
+            dashboard_dialog.export_csv()
+
+    def _open_depot_dashboard(self) -> DepotDashboardDialog | None:
+        self._reveal_immediately()
+        return self.window_manager.show_controlled_window(
+            "dashboard",
+            lambda: DepotDashboardDialog(self),
+            can_open=lambda: self.permission_service.can_access_dashboard(self.current_user),
+            on_denied=lambda: self._show_access_denied_message(
+                "Access Denied",
+                PermissionService.DASHBOARD_ACCESS_DENIED_MESSAGE,
+                theme_kind="dashboard",
+            ),
+            prepare=self._prepare_depot_dashboard_window,
+        )
+
+    def _prepare_depot_dashboard_window(self, dialog: DepotDashboardDialog) -> None:
+        popup_pos = self.config.get("popup_positions", {}).get("depot_dashboard")
+        if isinstance(popup_pos, dict) and "x" in popup_pos and "y" in popup_pos and not dialog.isVisible():
+            dialog.move(int(popup_pos["x"]), int(popup_pos["y"]))
+        dialog.apply_theme_styles()
+        dialog.refresh_combo_popup_width()
+        dialog.refresh_dashboard()
+
+    def _open_depot_agent(self) -> DepotAgentWindow | None:
+        _ensure_depot_window_classes_loaded()
+        self._reveal_immediately()
+        return self.window_manager.show_controlled_window(
+            "agent",
+            lambda: DepotAgentWindow(self.depot_tracker, self.current_user, app_window=self),
+            can_open=lambda: self.permission_service.can_open_agent_window(self.current_user),
+            on_denied=lambda: self._show_access_denied_message(
+                "Access Denied",
+                PermissionService.AGENT_ACCESS_DENIED_MESSAGE,
+                theme_kind="agent",
+            ),
+        )
+
+    def _open_depot_qa(self) -> DepotQAWindow | None:
+        _ensure_depot_window_classes_loaded()
+        self._reveal_immediately()
+        return self.window_manager.show_controlled_window(
+            "qa",
+            lambda: DepotQAWindow(self.depot_tracker, self.current_user, app_window=self),
+            can_open=lambda: self.permission_service.can_access_qa(self.current_user),
+            on_denied=lambda: self._show_access_denied_message(
+                "Access Denied",
+                PermissionService.QA_ACCESS_DENIED_MESSAGE,
+                theme_kind="qa",
+            ),
+        )
+
+    def _open_depot_admin(self) -> DepotAdminDialog | None:
+        self._reveal_immediately()
+        return self.window_manager.show_controlled_window(
+            "admin",
+            lambda: DepotAdminDialog(self.depot_tracker, self.current_user, app_window=self),
+            can_open=lambda: self.permission_service.can_access_admin(self.current_user),
+            on_denied=lambda: self._show_access_denied_message(
+                "Access Denied",
+                PermissionService.ADMIN_ACCESS_DENIED_MESSAGE,
+                theme_kind="admin",
+            ),
+            prepare=self._prepare_depot_admin_window,
+        )
+
+    def _prepare_depot_admin_window(self, dialog: DepotAdminDialog) -> None:
+        dialog.apply_theme_styles()
+        dialog.refresh_roles()
+        dialog.refresh_users()
+        dialog.refresh_qa_flags()
+
+    def _import_depot_workbook(self) -> None:
+        if openpyxl is None:
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Depot Workbook Import",
+                "openpyxl is not installed.",
+                theme_kind="admin",
+            )
+            return
+
+        start_dir = self.config_path.parent if self.config_path.parent.exists() else Path.home()
+        selected_path, _ = show_flowgrid_themed_open_file_name(
+            self,
+            self,
+            "admin",
+            "Select Workbook to Import",
+            str(start_dir),
+            "Excel Workbook (*.xlsm *.xlsx *.xls);;All Files (*.*)",
+        )
+        if not selected_path:
+            return
+
+        import_tables = self._prompt_workbook_import_tables()
+        if import_tables is None:
+            return
+
+        okay, msg = self.depot_tracker.import_workbook(Path(selected_path), import_tables)
+        if okay:
+            self._show_shell_message(
+                QMessageBox.Icon.Information,
+                "Depot Workbook Import",
+                msg,
+                theme_kind="admin",
+            )
+            self._refresh_depot_dashboard()
+            self._refresh_shared_linked_views(
+                *self._all_depot_refresh_sections(),
+                force=True,
+                reason="workbook_import",
+            )
+        else:
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Depot Workbook Import",
+                msg,
+                theme_kind="admin",
+            )
+
+    def _prompt_workbook_import_tables(self) -> set[str] | None:
+        dialog = FlowgridThemedDialog(self, self, "admin")
+        dialog.setWindowTitle("Select Tables to Import")
+        dialog.setModal(True)
+        dialog.resize(420, 420)
+        dialog.apply_theme_styles(force_opaque_root=True)
+        dialog_layout = QVBoxLayout(dialog)
+        dialog_layout.setContentsMargins(10, 10, 10, 10)
+        dialog_layout.setSpacing(8)
+
+        title = QLabel("Choose which workbook tables to import:")
+        title.setProperty("section", True)
+        dialog_layout.addWidget(title)
+
+        checks: dict[str, QCheckBox] = {}
+        for key, sheet, label in WORKBOOK_IMPORT_SPECS:
+            box = QCheckBox(f"{label} ({sheet})")
+            box.setChecked(True)
+            checks[key] = box
+            dialog_layout.addWidget(box)
+
+        action_row = QHBoxLayout()
+        action_row.setContentsMargins(0, 0, 0, 0)
+        action_row.setSpacing(6)
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        select_all_btn.setProperty("actionRole", "pick")
+        select_none_btn.setProperty("actionRole", "pick")
+        action_row.addWidget(select_all_btn, 0)
+        action_row.addWidget(select_none_btn, 0)
+        action_row.addStretch(1)
+        dialog_layout.addLayout(action_row)
+
+        footer = QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        footer.setSpacing(6)
+        import_btn = QPushButton("Import Selected")
+        import_btn.setProperty("actionRole", "save")
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setProperty("actionRole", "reset")
+        footer.addWidget(import_btn, 0)
+        footer.addWidget(cancel_btn, 0)
+        footer.addStretch(1)
+        dialog_layout.addLayout(footer)
+
+        select_all_btn.clicked.connect(lambda: [box.setChecked(True) for box in checks.values()])
+        select_none_btn.clicked.connect(lambda: [box.setChecked(False) for box in checks.values()])
+        import_btn.clicked.connect(dialog.accept)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected = {key for key, box in checks.items() if box.isChecked()}
+        if not selected:
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Depot Workbook Import",
+                "Select at least one table to import.",
+                theme_kind="admin",
+            )
+            return None
+        return selected
+
+    def _build_quick_editor_dialog(self) -> None:
+        self.quick_editor_dialog = FlowgridThemedDialog(self, self, "main")
+        self.quick_editor_dialog.setObjectName("QuickEditorDialog")
+        self.quick_editor_dialog.setWindowTitle("Edit Quick Button")
+        self.quick_editor_dialog.setModal(False)
+        self.quick_editor_dialog.resize(430, 580)
+        self.quick_editor_dialog.apply_theme_styles(force_opaque_root=True)
+
+        editor_layout = QVBoxLayout(self.quick_editor_dialog)
+        editor_layout.setContentsMargins(10, 10, 10, 10)
+        editor_layout.setSpacing(6)
+
+        self.editor_title = QLineEdit()
+        self.editor_tooltip = QLineEdit()
+        self.editor_action_combo = QComboBox()
+        self.editor_action_combo.addItem("Paste Text", "paste_text")
+        self.editor_action_combo.addItem("Open URL(s)", "open_url")
+        self.editor_action_combo.addItem("Open App/File", "open_app")
+        self.editor_action_combo.addItem("Input Sequence", "input_sequence")
+
+        self.editor_text = QTextEdit()
+        self.editor_text.setFixedHeight(82)
+        
+        self.editor_macro = QTextEdit()
+        self.editor_macro.setFixedHeight(82)
+        self.editor_macro.setPlaceholderText("Format: Bin location [enter]")
+        
+        # Macro helper buttons
+        macro_buttons_layout = QHBoxLayout()
+        macro_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        macro_buttons_layout.setSpacing(4)
+        
+        macro_btn_tab = QPushButton("[Tab]")
+        macro_btn_tab.setFixedHeight(28)
+        macro_btn_tab.setMaximumWidth(70)
+        macro_btn_tab.clicked.connect(lambda: self._insert_macro_simple("[tab]"))
+        
+        macro_btn_enter = QPushButton("[Enter]")
+        macro_btn_enter.setFixedHeight(28)
+        macro_btn_enter.setMaximumWidth(70)
+        macro_btn_enter.clicked.connect(lambda: self._insert_macro_simple("[enter]"))
+        
+        macro_btn_delay = QPushButton("Add Delay")
+        macro_btn_delay.setFixedHeight(28)
+        macro_btn_delay.clicked.connect(self._insert_macro_delay)
+
+        macro_buttons_layout.addWidget(macro_btn_tab, 0)
+        macro_buttons_layout.addWidget(macro_btn_enter, 0)
+        macro_buttons_layout.addWidget(macro_btn_delay, 1)
+        
+        self.editor_macro_wrap = QWidget()
+        macro_wrap_layout = QVBoxLayout(self.editor_macro_wrap)
+        macro_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        macro_wrap_layout.setSpacing(4)
+        macro_wrap_layout.addWidget(self.editor_macro)
+        macro_wrap_layout.addLayout(macro_buttons_layout)
+        
+        self.editor_apps = QTextEdit()
+        self.editor_apps.setFixedHeight(82)
+        self.editor_apps_browse = QPushButton("Browse Files/Apps...")
+        self.editor_apps_browse.setToolTip("Open file explorer to select one or more app/file targets.")
+        self.editor_apps_browse.setProperty("actionRole", "pick")
+        self.editor_apps_browse.setFixedHeight(30)
+        self.editor_apps_browse_folder = QPushButton("Browse Folder...")
+        self.editor_apps_browse_folder.setToolTip("Open folder picker and add a folder target.")
+        self.editor_apps_browse_folder.setProperty("actionRole", "pick")
+        self.editor_apps_browse_folder.setFixedHeight(30)
+        apps_action_row = QHBoxLayout()
+        apps_action_row.setContentsMargins(0, 0, 0, 0)
+        apps_action_row.addWidget(self.editor_apps_browse, 0)
+        apps_action_row.addWidget(self.editor_apps_browse_folder, 0)
+        apps_action_row.addStretch(1)
+        self.editor_apps_wrap = QWidget()
+        apps_wrap_layout = QVBoxLayout(self.editor_apps_wrap)
+        apps_wrap_layout.setContentsMargins(0, 0, 0, 0)
+        apps_wrap_layout.setSpacing(4)
+        apps_wrap_layout.addWidget(self.editor_apps)
+        apps_wrap_layout.addLayout(apps_action_row)
+
+        self.editor_urls = QTextEdit()
+        self.editor_urls.setFixedHeight(82)
+
+        self.editor_browser_combo = QComboBox()
+        self.editor_refresh_browsers_button = QPushButton("Detect")
+        self.editor_refresh_browsers_button.setProperty("actionRole", "pick")
+        self.editor_refresh_browsers_button.setFixedHeight(30)
+        browser_row = QHBoxLayout()
+        browser_row.setContentsMargins(0, 0, 0, 0)
+        browser_row.setSpacing(4)
+        browser_row.addWidget(self.editor_browser_combo, 1)
+        browser_row.addWidget(self.editor_refresh_browsers_button, 0)
+        self.editor_browser_wrap = QWidget()
+        self.editor_browser_wrap.setLayout(browser_row)
+
+        form = QFormLayout()
+        form.setSpacing(4)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.addRow("Title", self.editor_title)
+        form.addRow("Context", self.editor_tooltip)
+        form.addRow("Action", self.editor_action_combo)
+        form.addRow("Text", self.editor_text)
+        form.addRow("Input Sequence", self.editor_macro_wrap)
+        form.addRow("Apps/Files", self.editor_apps_wrap)
+        form.addRow("URLs", self.editor_urls)
+        form.addRow("Browser", self.editor_browser_wrap)
+        self.editor_form = form
+        self.editor_text_label = form.labelForField(self.editor_text)
+        self.editor_macro_label = form.labelForField(self.editor_macro_wrap)
+        self.editor_apps_label = form.labelForField(self.editor_apps_wrap)
+        self.editor_urls_label = form.labelForField(self.editor_urls)
+        self.editor_browser_label = form.labelForField(self.editor_browser_wrap)
+        editor_layout.addLayout(form)
+
+        action_row = QHBoxLayout()
+        self.editor_save_btn = QPushButton("Save")
+        self.editor_save_btn.setProperty("actionRole", "save")
+        self.editor_delete_btn = QPushButton("Delete")
+        self.editor_delete_btn.setProperty("actionRole", "reset")
+        self.editor_cancel_btn = QPushButton("Cancel")
+        self.editor_cancel_btn.setProperty("actionRole", "pick")
+        action_row.addWidget(self.editor_save_btn)
+        action_row.addWidget(self.editor_delete_btn)
+        action_row.addWidget(self.editor_cancel_btn)
+        editor_layout.addLayout(action_row)
+
+        self.editor_save_btn.clicked.connect(self.save_quick_editor)
+        self.editor_delete_btn.clicked.connect(self.delete_quick_editor)
+        self.editor_cancel_btn.clicked.connect(self.close_quick_editor)
+        self.editor_action_combo.currentIndexChanged.connect(self._update_quick_editor_action_ui)
+        self.editor_apps_browse.clicked.connect(self.browse_quick_apps)
+        self.editor_apps_browse_folder.clicked.connect(self.browse_quick_app_folder)
+        self.editor_refresh_browsers_button.clicked.connect(self._refresh_available_browsers)
+
+        self._editing_index: int | None = None
+        self._refresh_available_browsers()
+        self._update_quick_editor_action_ui()
+
+    def _build_theme_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.theme_tabs = QTabWidget()
+        self.theme_tabs.setUsesScrollButtons(True)
+        self.theme_tabs.tabBar().setElideMode(Qt.TextElideMode.ElideNone)
+        
+        # Main (Flowgrid) theme tab
+        main_theme_tab = self._build_main_theme_tab()
+        
+        # Agent theme tab
+        agent_theme_tab = self._build_agent_theme_tab()
+        
+        # QA theme tab
+        qa_theme_tab = self._build_qa_theme_tab()
+        
+        # Admin theme tab
+        admin_theme_tab = self._build_admin_theme_tab()
+        
+        # Dashboard theme tab
+        dashboard_theme_tab = self._build_dashboard_theme_tab()
+        
+        self.theme_tabs.addTab(self._wrap_scrollable_page(main_theme_tab), "Flowgrid")
+        self.theme_tabs.addTab(self._wrap_scrollable_page(agent_theme_tab), "Agent")
+        self.theme_tabs.addTab(self._wrap_scrollable_page(qa_theme_tab), "QA")
+        self.theme_tabs.addTab(self._wrap_scrollable_page(admin_theme_tab), "Admin")
+        self.theme_tabs.addTab(self._wrap_scrollable_page(dashboard_theme_tab), "Dashboard")
+        self.theme_tabs.setTabToolTip(0, "Base Flowgrid colors and background layers used as popup defaults.")
+        self.theme_tabs.setTabToolTip(1, "Agent popup theme overrides.")
+        self.theme_tabs.setTabToolTip(2, "QA/WCS popup theme overrides.")
+        self.theme_tabs.setTabToolTip(3, "Admin popup theme overrides.")
+        self.theme_tabs.setTabToolTip(4, "Dashboard popup theme overrides.")
+        
+        layout.addWidget(self.theme_tabs, 1)
+        return page
+
+    @staticmethod
+    def _wrap_scrollable_page(content: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(content)
+        return scroll
+
+    def _build_main_theme_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        colors_title = QLabel("Colors")
+        colors_title.setProperty("section", True)
+        layout.addWidget(colors_title)
+
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        self.theme_preset_combo = QComboBox()
+        self.theme_preset_new = QPushButton("New")
+        self.theme_preset_save = QPushButton("Save")
+        self.theme_preset_combo.setToolTip("Select a saved Flowgrid color preset.")
+        self.theme_preset_new.setToolTip("Create a new preset from the current Flowgrid colors.")
+        self.theme_preset_save.setToolTip("Save current Flowgrid colors into the selected preset.")
+        self.theme_preset_new.setProperty("actionRole", "new")
+        self.theme_preset_save.setProperty("actionRole", "save")
+        self.theme_preset_combo.setFixedHeight(28)
+        self.theme_preset_new.setFixedSize(54, 28)
+        self.theme_preset_save.setFixedSize(54, 28)
+        preset_row.addWidget(QLabel("Preset"))
+        preset_row.addWidget(self.theme_preset_combo, 1)
+        preset_row.addWidget(self.theme_preset_new)
+        preset_row.addWidget(self.theme_preset_save)
+        layout.addLayout(preset_row)
+
+        self.color_swatches: dict[str, QPushButton] = {}
+        colors_grid = QGridLayout()
+        colors_grid.setHorizontalSpacing(8)
+        colors_grid.setVerticalSpacing(8)
+        colors_grid.setColumnStretch(1, 1)
+
+        for row_index, (key, label) in enumerate((("primary", "Primary"), ("accent", "Accent"), ("surface", "Surface"))):
+            text = QLabel(label)
+            text.setFixedWidth(52)
+            swatch = QPushButton()
+            swatch.setProperty("actionRole", "pick")
+            swatch.setFixedSize(180, 32)
+            swatch.setToolTip(f"Pick the {label.lower()} color for the Flowgrid theme.")
+
+            colors_grid.addWidget(text, row_index, 0)
+            colors_grid.addWidget(swatch, row_index, 1)
+
+            self.color_swatches[key] = swatch
+            swatch.clicked.connect(lambda _=False, c=key: self.pick_theme_color(c))
+
+        layout.addLayout(colors_grid)
+
+        color_actions = QHBoxLayout()
+        color_actions.setSpacing(6)
+        self.reset_theme_btn = QPushButton("Reset")
+        self.image_layers_btn = QPushButton("Background Images")
+        self.reset_theme_btn.setToolTip("Reset Flowgrid colors to the selected preset values.")
+        self.image_layers_btn.setToolTip("Edit Flowgrid background image layers (position, scale, blend, visibility).")
+        self.reset_theme_btn.setProperty("actionRole", "reset")
+        self.image_layers_btn.setProperty("actionRole", "pick")
+        for btn in (self.reset_theme_btn, self.image_layers_btn):
+            btn.setFixedHeight(32)
+            color_actions.addWidget(btn, 1)
+        layout.addLayout(color_actions)
+
+        self.theme_transparent_bg_check = QCheckBox("Transparent Background")
+        self.theme_transparent_bg_check.setToolTip(
+            "Disable the Flowgrid tint layer so background images render directly behind controls."
+        )
+        layout.addWidget(self.theme_transparent_bg_check)
+        self.popup_auto_reinherit_check = QCheckBox("Auto-Reinherit Popup Defaults")
+        self.popup_auto_reinherit_check.setToolTip(
+            "When enabled, popups stuck in an unconfigured custom state are automatically repaired to inherit Flowgrid defaults."
+        )
+        layout.addWidget(self.popup_auto_reinherit_check)
+
+        layout.addStretch(1)
+
+        self.theme_preset_combo.currentTextChanged.connect(self.on_theme_preset_selected)
+        self.theme_preset_new.clicked.connect(self.create_theme_preset)
+        self.theme_preset_save.clicked.connect(self.save_theme_preset)
+        self.reset_theme_btn.clicked.connect(self.reset_theme)
+        self.image_layers_btn.clicked.connect(lambda _checked=False: self.open_image_layers_dialog("main"))
+        self.theme_transparent_bg_check.toggled.connect(self.on_theme_page_background_option_changed)
+        self.popup_auto_reinherit_check.toggled.connect(self.on_popup_auto_reinherit_changed)
+        return page
+
+    def _build_agent_theme_tab(self) -> QWidget:
+        return self._build_popup_theme_tab("agent", "Agent Window")
+
+    def _build_qa_theme_tab(self) -> QWidget:
+        return self._build_popup_theme_tab("qa", "QA/WCS Window")
+
+    def _build_admin_theme_tab(self) -> QWidget:
+        return self._build_popup_theme_tab("admin", "Admin Window")
+
+    def _build_dashboard_theme_tab(self) -> QWidget:
+        return self._build_popup_theme_tab("dashboard", "Dashboard Window")
+
+    @staticmethod
+    def _popup_window_on_top_config_key(kind: str) -> str:
+        return {
+            "agent": "agent_window_always_on_top",
+            "qa": "qa_window_always_on_top",
+            "admin": "admin_window_always_on_top",
+            "dashboard": "dashboard_window_always_on_top",
+        }.get(str(kind or "").strip().lower(), "")
+
+    def _popup_window_for_kind(self, kind: str) -> DepotFramelessToolWindow | None:
+        normalized = str(kind or "").strip().lower()
+        manager = getattr(self, "window_manager", None)
+        if manager is not None:
+            window = manager.get_window(normalized)
+            if window is not None:
+                return window
+        if normalized == "agent":
+            return self.active_agent_window
+        if normalized == "qa":
+            return self.active_qa_window
+        if normalized == "admin":
+            return self.admin_dialog
+        if normalized == "dashboard":
+            return self.depot_dashboard_dialog
+        return None
+
+    def _apply_popup_window_on_top_preference(self, kind: str, enabled: bool) -> bool:
+        keep_on_top = bool(enabled)
+        config_key = self._popup_window_on_top_config_key(kind)
+        if not config_key:
+            return keep_on_top
+        self.config[config_key] = keep_on_top
+        dialog = self._popup_window_for_kind(kind)
+        if dialog is not None:
+            dialog._window_always_on_top = keep_on_top
+            if hasattr(dialog, "_always_on_top_config_key"):
+                dialog._always_on_top_config_key = config_key
+            dialog.set_window_always_on_top(keep_on_top)
+        return keep_on_top
+
+    def _build_popup_theme_tab(self, kind: str, label: str) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        title = QLabel(f"{label} Theme")
+        title.setProperty("section", True)
+        layout.addWidget(title)
+
+        preset_combo_key = f"{kind}_theme_preset_combo"
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        preset_row.addWidget(QLabel("Preset"), 0)
+        preset_combo = QComboBox()
+        preset_combo.setToolTip(f"Select a preset to seed {label.lower()} colors.")
+        setattr(self, preset_combo_key, preset_combo)
+        preset_row.addWidget(preset_combo, 1)
+        layout.addLayout(preset_row)
+
+        colors_grid = QGridLayout()
+        colors_grid.setHorizontalSpacing(8)
+        colors_grid.setVerticalSpacing(8)
+        colors_grid.setColumnStretch(1, 1)
+
+        swatches_key = f"{kind}_color_swatches"
+        if not hasattr(self, swatches_key):
+            setattr(self, swatches_key, {})
+        color_swatches = getattr(self, swatches_key)
+
+        for row_index, (fld, fld_label) in enumerate((("background", "Background"), ("text", "Text"), ("field_bg", "Controls"))):
+            text = QLabel(fld_label)
+            text.setMinimumWidth(96)
+            swatch = QPushButton()
+            swatch.setProperty("actionRole", "pick")
+            swatch.setFixedSize(180, 32)
+            swatch.setToolTip(f"Pick the {fld_label.lower()} color for this popup.")
+
+            colors_grid.addWidget(text, row_index, 0)
+            colors_grid.addWidget(swatch, row_index, 1)
+
+            color_swatches[fld] = swatch
+            swatch.clicked.connect(lambda _=False, k=kind, f=fld: self._pick_popup_theme_color(k, f))
+
+        layout.addLayout(colors_grid)
+
+        transparent_check_key = f"{kind}_transparent_bg_check"
+        transparent_check = QCheckBox("Transparent Background")
+        transparent_check.setToolTip("Make container/frame surfaces transparent while keeping controls and lists readable.")
+        setattr(self, transparent_check_key, transparent_check)
+        layout.addWidget(transparent_check)
+
+        transparent_check.toggled.connect(lambda checked: self.on_popup_background_option_changed(kind, checked))
+
+        always_on_top_key = f"{kind}_window_always_on_top_check"
+        always_on_top_check = QCheckBox("Keep this window always on top")
+        always_on_top_check.setToolTip(f"Persist whether the {label.lower()} stays above normal windows when opened.")
+        setattr(self, always_on_top_key, always_on_top_check)
+        layout.addWidget(always_on_top_check)
+
+        always_on_top_check.toggled.connect(lambda checked: self.on_popup_window_always_on_top_changed(kind, checked))
+
+        control_form = QFormLayout()
+        control_form.setContentsMargins(0, 0, 0, 0)
+        control_form.setSpacing(6)
+
+        style_combo_key = f"{kind}_control_style_combo"
+        style_combo = QComboBox()
+        style_combo.addItems(["Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"])
+        style_combo.setToolTip("Choose how input/table control backgrounds are filled.")
+        setattr(self, style_combo_key, style_combo)
+        control_form.addRow("Fill Style", style_combo)
+
+        fade_slider_key = f"{kind}_control_fade_slider"
+        fade_value_key = f"{kind}_control_fade_value"
+        fade_slider = QSlider(Qt.Orientation.Horizontal)
+        fade_slider.setRange(0, 100)
+        fade_slider.setToolTip("How strongly the control fill gradient fades.")
+        fade_value = QLabel("65%")
+        fade_row = QHBoxLayout()
+        fade_row.setContentsMargins(0, 0, 0, 0)
+        fade_row.setSpacing(4)
+        fade_row.addWidget(fade_slider, 1)
+        fade_row.addWidget(fade_value, 0)
+        fade_wrap = QWidget()
+        fade_wrap.setLayout(fade_row)
+        setattr(self, fade_slider_key, fade_slider)
+        setattr(self, fade_value_key, fade_value)
+        control_form.addRow("Fade", fade_wrap)
+
+        opacity_slider_key = f"{kind}_control_opacity_slider"
+        opacity_value_key = f"{kind}_control_opacity_value"
+        opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        opacity_slider.setRange(0, 100)
+        opacity_slider.setToolTip("Primary opacity of controls (inputs, lists, table cells).")
+        opacity_value = QLabel("82%")
+        opacity_row = QHBoxLayout()
+        opacity_row.setContentsMargins(0, 0, 0, 0)
+        opacity_row.setSpacing(4)
+        opacity_row.addWidget(opacity_slider, 1)
+        opacity_row.addWidget(opacity_value, 0)
+        opacity_wrap = QWidget()
+        opacity_wrap.setLayout(opacity_row)
+        setattr(self, opacity_slider_key, opacity_slider)
+        setattr(self, opacity_value_key, opacity_value)
+        control_form.addRow("Opacity", opacity_wrap)
+
+        tail_slider_key = f"{kind}_control_tail_opacity_slider"
+        tail_value_key = f"{kind}_control_tail_opacity_value"
+        tail_slider = QSlider(Qt.Orientation.Horizontal)
+        tail_slider.setRange(0, 100)
+        tail_slider.setToolTip("Opacity at the end of the gradient fill (higher means less fade-out).")
+        tail_value = QLabel("0%")
+        tail_row = QHBoxLayout()
+        tail_row.setContentsMargins(0, 0, 0, 0)
+        tail_row.setSpacing(4)
+        tail_row.addWidget(tail_slider, 1)
+        tail_row.addWidget(tail_value, 0)
+        tail_wrap = QWidget()
+        tail_wrap.setLayout(tail_row)
+        setattr(self, tail_slider_key, tail_slider)
+        setattr(self, tail_value_key, tail_value)
+        control_form.addRow("End Opacity", tail_wrap)
+
+        optional_swatches_key = f"{kind}_optional_color_swatches"
+        setattr(self, optional_swatches_key, {})
+        optional_swatches = getattr(self, optional_swatches_key)
+        for field, row_label in (
+            ("header_color", "List Header"),
+            ("row_hover_color", "Row Hover"),
+            ("row_selected_color", "Row Selected"),
+        ):
+            swatch = QPushButton()
+            swatch.setProperty("actionRole", "pick")
+            swatch.setFixedHeight(28)
+            swatch.setToolTip(f"Override {row_label.lower()} color for this popup.")
+            clear_btn = QPushButton("Auto")
+            clear_btn.setProperty("actionRole", "reset")
+            clear_btn.setFixedHeight(28)
+            clear_btn.setToolTip(f"Use automatic {row_label.lower()} color based on current theme.")
+            color_row = QHBoxLayout()
+            color_row.setContentsMargins(0, 0, 0, 0)
+            color_row.setSpacing(4)
+            color_row.addWidget(swatch, 1)
+            color_row.addWidget(clear_btn, 0)
+            color_wrap = QWidget()
+            color_wrap.setLayout(color_row)
+            control_form.addRow(row_label, color_wrap)
+            optional_swatches[field] = swatch
+            swatch.clicked.connect(lambda _=False, k=kind, f=field: self._pick_popup_optional_color(k, f))
+            clear_btn.clicked.connect(lambda _=False, k=kind, f=field: self._clear_popup_optional_color(k, f))
+
+        layout.addLayout(control_form)
+
+        image_row = QHBoxLayout()
+        image_btn = QPushButton("Background Images")
+        image_btn.setProperty("actionRole", "pick")
+        image_btn.setToolTip(f"Edit background image layers for the {label.lower()}.")
+        image_row.addWidget(image_btn)
+        image_row.addStretch(1)
+        layout.addLayout(image_row)
+
+        image_btn.clicked.connect(lambda: self.open_image_layers_dialog(kind))
+        preset_combo.currentTextChanged.connect(lambda name, k=kind: self.on_popup_theme_preset_selected(k, name))
+        style_combo.currentTextChanged.connect(lambda _value, k=kind: self.on_popup_theme_control_changed(k))
+        fade_slider.valueChanged.connect(lambda _value, k=kind: self.on_popup_theme_control_changed(k))
+        opacity_slider.valueChanged.connect(lambda _value, k=kind: self.on_popup_theme_control_changed(k))
+        tail_slider.valueChanged.connect(lambda _value, k=kind: self.on_popup_theme_control_changed(k))
+        
+        layout.addStretch(1)
+        return page
+
+    def _build_app_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        opacity_tip = "Base opacity for the Flowgrid shell while idle. Lower values make the shell more transparent."
+        self.opacity_slider.setToolTip(opacity_tip)
+        self.opacity_value = QLabel("1.00")
+        self.opacity_value.setToolTip(opacity_tip)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_value)
+        opacity_wrap = QWidget()
+        opacity_wrap.setLayout(opacity_row)
+
+        self.hover_delay_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hover_delay_slider.setRange(0, 10)
+        hover_delay_tip = "Seconds to wait before auto-revealing full opacity when your cursor enters the window."
+        self.hover_delay_slider.setToolTip(hover_delay_tip)
+        self.hover_delay_value = QLabel("5s")
+        self.hover_delay_value.setToolTip(hover_delay_tip)
+        hover_delay_row = QHBoxLayout()
+        hover_delay_row.addWidget(self.hover_delay_slider, 1)
+        hover_delay_row.addWidget(self.hover_delay_value)
+        hover_delay_wrap = QWidget()
+        hover_delay_wrap.setLayout(hover_delay_row)
+
+        self.hover_fade_in_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hover_fade_in_slider.setRange(0, 10)
+        hover_in_tip = "How quickly the shell fades up to full opacity on hover."
+        self.hover_fade_in_slider.setToolTip(hover_in_tip)
+        self.hover_fade_in_value = QLabel("5s")
+        self.hover_fade_in_value.setToolTip(hover_in_tip)
+        hover_fade_in_row = QHBoxLayout()
+        hover_fade_in_row.addWidget(self.hover_fade_in_slider, 1)
+        hover_fade_in_row.addWidget(self.hover_fade_in_value)
+        hover_fade_in_wrap = QWidget()
+        hover_fade_in_wrap.setLayout(hover_fade_in_row)
+
+        self.hover_fade_out_slider = QSlider(Qt.Orientation.Horizontal)
+        self.hover_fade_out_slider.setRange(0, 10)
+        hover_out_tip = "How quickly the shell returns to idle opacity after hover ends."
+        self.hover_fade_out_slider.setToolTip(hover_out_tip)
+        self.hover_fade_out_value = QLabel("5s")
+        self.hover_fade_out_value.setToolTip(hover_out_tip)
+        hover_fade_out_row = QHBoxLayout()
+        hover_fade_out_row.addWidget(self.hover_fade_out_slider, 1)
+        hover_fade_out_row.addWidget(self.hover_fade_out_value)
+        hover_fade_out_wrap = QWidget()
+        hover_fade_out_wrap.setLayout(hover_fade_out_row)
+
+        form.addRow("Idle Opacity", opacity_wrap)
+        form.addRow("Hover Delay", hover_delay_wrap)
+        form.addRow("Fade In", hover_fade_in_wrap)
+        form.addRow("Fade Out", hover_fade_out_wrap)
+        layout.addLayout(form)
+
+        self.always_on_top_check = QCheckBox("Always on top")
+        self.always_on_top_check.setToolTip("Keep the main Flowgrid shell above normal windows.")
+        self.compact_mode_check = QCheckBox("Compact mode")
+        self.compact_mode_check.setToolTip(
+            "Use tighter spacing and smaller control padding across Flowgrid and popup windows."
+        )
+        self.sidebar_right_switch = QCheckBox()
+        self.sidebar_right_switch.setProperty("switch", True)
+        self.sidebar_right_switch.setTristate(False)
+        self.sidebar_right_switch.setToolTip("Move the sidebar to the right side of the main Flowgrid window.")
+        self.sidebar_switch_status = QLabel()
+        self.sidebar_switch_status.setProperty("muted", True)
+        self.sidebar_switch_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.sidebar_switch_status.setMinimumWidth(170)
+        layout.addWidget(self.always_on_top_check)
+        layout.addWidget(self.compact_mode_check)
+        sidebar_row = QHBoxLayout()
+        sidebar_row.setContentsMargins(0, 0, 0, 0)
+        sidebar_row.setSpacing(6)
+        self.sidebar_side_caption = QLabel("Sidebar Side")
+        self.sidebar_side_caption.setMinimumWidth(90)
+        self.sidebar_left_label = QLabel("Left")
+        self.sidebar_left_label.setProperty("muted", True)
+        self.sidebar_right_label = QLabel("Right")
+        self.sidebar_right_label.setProperty("muted", True)
+        self.sidebar_switch_status.setToolTip("Shows the active sidebar side.")
+        sidebar_row.addWidget(self.sidebar_side_caption, 0)
+        sidebar_row.addWidget(self.sidebar_left_label, 0)
+        sidebar_row.addWidget(self.sidebar_right_switch, 0)
+        sidebar_row.addWidget(self.sidebar_right_label, 0)
+        sidebar_row.addStretch(1)
+        layout.addLayout(sidebar_row)
+        layout.addWidget(self.sidebar_switch_status)
+
+        icon_row = QHBoxLayout()
+        self.pick_icon_button = QPushButton("Set Icon")
+        self.clear_icon_button = QPushButton("Clear Icon")
+        self.pick_icon_button.setToolTip("Pick a custom icon for the main Flowgrid title bar and desktop shortcut.")
+        self.clear_icon_button.setToolTip("Reset the Flowgrid title bar and desktop shortcut back to the default wrench icon.")
+        self.pick_icon_button.setProperty("actionRole", "pick")
+        self.clear_icon_button.setProperty("actionRole", "reset")
+        icon_row.addWidget(self.pick_icon_button)
+        icon_row.addWidget(self.clear_icon_button)
+        icon_row.addStretch(1)
+        layout.addLayout(icon_row)
+        layout.addStretch(1)
+
+        self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
+        self.hover_delay_slider.valueChanged.connect(self.on_hover_settings_changed)
+        self.hover_fade_in_slider.valueChanged.connect(self.on_hover_settings_changed)
+        self.hover_fade_out_slider.valueChanged.connect(self.on_hover_settings_changed)
+        self.always_on_top_check.toggled.connect(self.on_settings_changed)
+        self.compact_mode_check.toggled.connect(self.on_settings_changed)
+        self.sidebar_right_switch.toggled.connect(self.on_sidebar_position_changed)
+        self.pick_icon_button.clicked.connect(self.pick_custom_icon)
+        self.clear_icon_button.clicked.connect(self.clear_custom_icon)
+        return tab
+
+    def _build_settings_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setObjectName("SettingsTabs")
+        self.settings_tabs.setUsesScrollButtons(True)
+        main_tab_bar = self.settings_tabs.tabBar()
+        main_tab_bar.setObjectName("SettingsMainTabBar")
+        main_tab_bar.setElideMode(Qt.TextElideMode.ElideNone)
+        self.settings_tabs.addTab(self._build_app_settings_tab(), "App Settings")
+        self.settings_tabs.addTab(self._build_theme_page(), "Themes")
+        self.settings_tabs.setTabIcon(0, self._resolve_standard_icon("SP_FileDialogDetailedView", "SP_FileIcon"))
+        self.settings_tabs.setTabIcon(1, self._resolve_standard_icon("SP_DirOpenIcon", "SP_FileIcon"))
+        self.settings_tabs.setTabToolTip(0, "General app behavior and window controls.")
+        self.settings_tabs.setTabToolTip(1, "Theme colors, backgrounds, and popup styling.")
+        layout.addWidget(self.settings_tabs, 1)
+        return page
+
+    def _quick_button_style_tokens(self, font_size: int, button_opacity: float, shape: str, action_type: str = "paste_text") -> tuple[int, int, str, str, str, str]:
+        font_size = int(clamp(font_size, 8, 20))
+        button_opacity = float(clamp(button_opacity, 0.15, 1.0))
+        palette = self.palette_data
+
+        # Adjust base color based on action type for subtle distinction
+        base_bg = palette["button_bg"]
+        if action_type == "open_url":
+            # Shift toward accent color for web links
+            base_bg = blend(palette['button_bg'], palette['accent'], 0.25)
+        elif action_type == "open_app":
+            # Shift toward primary color for apps
+            base_bg = blend(palette['button_bg'], palette['primary'], 0.25)
+        elif action_type in {"input_sequence", "macro_sequence"}:
+            # Shift toward surface color for input sequences.
+            base_bg = blend(palette['button_bg'], palette['surface'], 0.35)
+
+        radius = 11
+        border = 1
+        bg_hex = base_bg
+        bg_alpha = button_opacity
+        border_color = shift(bg_hex, -0.35)
+        text_color = readable_text(bg_hex)
+        hover_alpha = min(1.0, bg_alpha + 0.08)
+
+        if shape == "Bordered":
+            radius = 4
+            border = 2
+            bg_hex = base_bg
+            bg_alpha = min(1.0, button_opacity * 0.92)
+            border_color = shift(bg_hex, -0.45)
+        elif shape == "Block":
+            radius = 0
+            border = 1
+            bg_hex = shift(base_bg, -0.08)
+            bg_alpha = button_opacity
+            border_color = shift(bg_hex, -0.45)
+        elif shape == "Pill":
+            radius = 999
+            border = 1
+            bg_hex = base_bg
+            bg_alpha = button_opacity
+            border_color = shift(bg_hex, -0.42)
+        elif shape == "Ghost":
+            radius = 10
+            border = 2
+            bg_hex = base_bg
+            bg_alpha = max(0.15, button_opacity * 0.32)
+            border_color = shift(bg_hex, -0.62)
+            hover_alpha = max(0.45, min(1.0, bg_alpha + 0.22))
+        elif shape == "Glass":
+            radius = 12
+            border = 1
+            bg_hex = blend(palette["surface"], palette["button_bg"], 0.48)
+            bg_alpha = max(0.35, button_opacity * 0.75)
+            border_color = shift(bg_hex, -0.45)
+        elif shape == "Outline":
+            radius = 9
+            border = 2
+            bg_hex = palette["surface"]
+            bg_alpha = max(0.10, button_opacity * 0.12)
+            border_color = shift(palette["button_bg"], -0.68)
+            text_color = readable_text(shift(palette["button_bg"], -0.15))
+            hover_alpha = max(0.42, min(1.0, button_opacity * 0.55))
+        elif shape == "Inset":
+            radius = 8
+            border = 2
+            bg_hex = shift(palette["button_bg"], -0.18)
+            bg_alpha = button_opacity
+            border_color = shift(bg_hex, -0.42)
+        elif shape == "Flat":
+            radius = 2
+            border = 0
+            bg_hex = blend(palette["button_bg"], palette["surface"], 0.18)
+            bg_alpha = button_opacity
+            border_color = bg_hex
+            text_color = readable_text(bg_hex)
+        elif shape == "Raised3D":
+            radius = 10
+            border = 2
+            top = shift(base_bg, 0.20)
+            bottom = shift(base_bg, -0.20)
+            bg_hex = base_bg
+            shape_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(top, min(1.0, button_opacity))},"
+                f" stop:1 {rgba_css(bottom, min(1.0, button_opacity))})"
+            )
+            border_color = shift(bottom, -0.35)
+            text_color = readable_text(bottom)
+            hover_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(shift(top, 0.06), min(1.0, button_opacity))},"
+                f" stop:1 {rgba_css(shift(bottom, 0.06), min(1.0, button_opacity))})"
+            )
+            return radius, border, shape_bg, border_color, hover_bg, text_color
+        elif shape == "Bevel3D":
+            radius = 8
+            border = 2
+            top = shift(base_bg, 0.12)
+            bottom = shift(base_bg, -0.30)
+            bg_hex = blend(top, bottom, 0.55)
+            shape_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(top, button_opacity)},"
+                f" stop:0.52 {rgba_css(bg_hex, button_opacity)},"
+                f" stop:1 {rgba_css(bottom, button_opacity)})"
+            )
+            border_color = shift(bottom, -0.40)
+            text_color = readable_text(bg_hex)
+            hover_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(shift(top, 0.06), button_opacity)},"
+                f" stop:0.52 {rgba_css(shift(bg_hex, 0.05), button_opacity)},"
+                f" stop:1 {rgba_css(shift(bottom, 0.05), button_opacity)})"
+            )
+            return radius, border, shape_bg, border_color, hover_bg, text_color
+        elif shape == "Ridge3D":
+            radius = 6
+            border = 2
+            c1 = shift(base_bg, 0.20)
+            c2 = shift(base_bg, -0.08)
+            c3 = shift(base_bg, 0.08)
+            c4 = shift(base_bg, -0.28)
+            bg_hex = c2
+            shape_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(c1, button_opacity)},"
+                f" stop:0.33 {rgba_css(c2, button_opacity)},"
+                f" stop:0.66 {rgba_css(c3, button_opacity)},"
+                f" stop:1 {rgba_css(c4, button_opacity)})"
+            )
+            border_color = shift(c4, -0.35)
+            text_color = readable_text(c2)
+            hover_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(shift(c1, 0.05), button_opacity)},"
+                f" stop:0.33 {rgba_css(shift(c2, 0.05), button_opacity)},"
+                f" stop:0.66 {rgba_css(shift(c3, 0.05), button_opacity)},"
+                f" stop:1 {rgba_css(shift(c4, 0.05), button_opacity)})"
+            )
+            return radius, border, shape_bg, border_color, hover_bg, text_color
+        elif shape == "Neumorph":
+            radius = 14
+            border = 1
+            bg_hex = blend(palette["surface"], palette["button_bg"], 0.30)
+            bg_alpha = max(0.55, button_opacity * 0.85)
+            border_color = shift(bg_hex, -0.22)
+            text_color = readable_text(bg_hex)
+            hover_alpha = min(1.0, bg_alpha + 0.08)
+        elif shape == "Retro3D":
+            radius = 4
+            border = 2
+            top = shift(palette["button_bg"], 0.22)
+            bottom = shift(palette["button_bg"], -0.30)
+            bg_hex = blend(top, bottom, 0.5)
+            shape_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(top, button_opacity)},"
+                f" stop:1 {rgba_css(bottom, button_opacity)})"
+            )
+            border_color = shift(bottom, -0.38)
+            text_color = readable_text(bottom)
+            hover_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(shift(top, 0.06), button_opacity)},"
+                f" stop:1 {rgba_css(shift(bottom, 0.06), button_opacity)})"
+            )
+            return radius, border, shape_bg, border_color, hover_bg, text_color
+        elif shape == "Neon3D":
+            radius = 10
+            border = 2
+            top = blend(palette["accent"], base_bg, 0.30)
+            bottom = blend(palette["primary"], shift(base_bg, -0.14), 0.50)
+            bg_hex = blend(top, bottom, 0.5)
+            shape_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(top, min(1.0, button_opacity * 0.95))},"
+                f" stop:1 {rgba_css(bottom, min(1.0, button_opacity * 0.95))})"
+            )
+            border_color = shift(bottom, -0.45)
+            text_color = readable_text(bottom)
+            hover_bg = (
+                "qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+                f" stop:0 {rgba_css(shift(top, 0.08), min(1.0, button_opacity))},"
+                f" stop:1 {rgba_css(shift(bottom, 0.08), min(1.0, button_opacity))})"
+            )
+            return radius, border, shape_bg, border_color, hover_bg, text_color
+        # Backward compatibility with older saved style names.
+        elif shape in {"Neon", "Ocean"}:
+            shape = "Neon3D"
+            return self._quick_button_style_tokens(font_size, button_opacity, shape)
+        elif shape in {"Retro", "Ember"}:
+            shape = "Retro3D"
+            return self._quick_button_style_tokens(font_size, button_opacity, shape)
+        elif shape in {"Royal", "Slate", "Danger", "Forest", "Candy", "Frost"}:
+            shape = "Raised3D"
+            return self._quick_button_style_tokens(font_size, button_opacity, shape)
+
+        shape_bg = rgba_css(bg_hex, bg_alpha)
+        hover_bg = rgba_css(shift(bg_hex, 0.08), hover_alpha)
+        return radius, border, shape_bg, border_color, hover_bg, text_color
+
+    def _quick_button_stylesheet(
+        self,
+        font_size: int,
+        button_opacity: float,
+        shape: str,
+        font_family: str | None = None,
+        padding: str = "2px 20px 2px 8px",
+        action_type: str = "paste_text",
+    ) -> str:
+        radius, border, shape_bg, border_color, hover_bg, text_color = self._quick_button_style_tokens(font_size, button_opacity, shape, action_type)
+        family_value = str(font_family or self.config.get("quick_button_font_family", "Segoe UI"))
+        family_value = family_value.replace("'", "\\'")
+        return (
+            "QPushButton {"
+            f"background-color: {shape_bg};"
+            f"color: {text_color};"
+            f"border: {border}px solid {border_color};"
+            f"border-radius: {radius}px;"
+            f"font-size: {int(clamp(font_size, 8, 20))}px;"
+            f"font-family: '{family_value}';"
+            "font-weight: 700;"
+            f"padding: {padding};"
+            "text-align: center;"
+            "}"
+            f"QPushButton:hover {{ background-color: {hover_bg}; }}"
+            f"QPushButton:pressed {{ background-color: {hover_bg}; }}"
+        )
+
+    def _refresh_theme_preview_buttons(self) -> None:
+        if not hasattr(self, "theme_preset_new") or not hasattr(self, "theme_preset_save"):
+            return
+        font_size = int(clamp(int(self.config.get("quick_button_font_size", 11)), 8, 14))
+        font_family = str(self.config.get("quick_button_font_family", "Segoe UI"))
+        button_opacity = float(clamp(float(self.config.get("quick_button_opacity", 1.0)), 0.2, 1.0))
+        shape = self.config.get("quick_button_shape", "Soft")
+        css = self._quick_button_stylesheet(font_size, button_opacity, shape, font_family=font_family, padding="2px 8px 2px 8px")
+        for preview_btn in (self.theme_preset_new, self.theme_preset_save):
+            preview_btn.setStyleSheet(css)
+            poly = build_quick_shape_polygon(shape, preview_btn.width(), preview_btn.height())
+            if poly is None:
+                preview_btn.clearMask()
+            else:
+                preview_btn.setMask(QRegion(poly))
+
+    def _apply_sidebar_position(self) -> None:
+        while self.body_layout.count() > 0:
+            item = self.body_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(self.body)
+
+        sidebar_on_right = bool(self.config.get("sidebar_on_right", False))
+        if sidebar_on_right:
+            self.body_layout.addWidget(self.pages, 1)
+            self.body_layout.addWidget(self.sidebar, 0)
+        else:
+            self.body_layout.addWidget(self.sidebar, 0)
+            self.body_layout.addWidget(self.pages, 1)
+
+    # --------------------------- Styling ---------------------------- #
+    def apply_theme_styles(self) -> None:
+        p = self.palette_data
+        compact_mode = bool(self.config.get("compact_mode", True))
+        base_font_px = 12 if compact_mode else 13
+        section_font_px = 13 if compact_mode else 14
+        field_padding = "1px 5px" if compact_mode else "2px 6px"
+        text_edit_padding = "3px 5px" if compact_mode else "4px 6px"
+        checkbox_spacing = 6 if compact_mode else 8
+        checkbox_indicator_px = 12 if compact_mode else 14
+        button_padding = "2px 8px" if compact_mode else "4px 10px"
+        button_min_height = 24 if compact_mode else 28
+        button_font_px = 10 if compact_mode else 11
+        scrollbar_width = 8 if compact_mode else 10
+        scrollbar_handle_min_height = 14 if compact_mode else 18
+        slider_groove_height = 5 if compact_mode else 6
+        slider_handle_width = 10 if compact_mode else 12
+        slider_handle_margin = "-3px 0px" if compact_mode else "-4px 0px"
+        sidebar_color = QColor(p["sidebar_overlay"])
+        sidebar_color.setAlpha(125)
+        shared_button_bg = rgba_css(p["button_bg"], 0.75)  # 25% transparent for non-quick buttons.
+        shared_button_hover = rgba_css(shift(p["button_bg"], 0.08), 0.82)
+        add_base = p["primary"]
+        apply_base = p["accent"]
+        pick_base = blend(p["primary"], p["surface"], 0.45)
+        save_base = blend(p["primary"], p["accent"], 0.22)
+        new_base = blend(p["surface"], p["primary"], 0.35)
+        reset_base = shift(p["surface"], -0.45)
+        title_min_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.20), 0.62)
+        title_min_border = rgba_css(shift(p["accent"], -0.42), 0.84)
+        title_min_hover = rgba_css(shift(blend(p["button_bg"], p["surface"], 0.20), 0.10), 0.76)
+        titlebar_bg = rgba_css(blend(p["shell_overlay"], p["surface"], 0.18), 0.84)
+        title_badge_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.15), 0.74)
+        title_badge_border = rgba_css(shift(p["accent"], -0.42), 0.82)
+        checkbox_fill = rgba_css(blend(p["input_bg"], p["surface"], 0.18), 0.92)
+        checkbox_fill_checked = rgba_css(blend(p["accent"], p["input_bg"], 0.18), 0.96)
+        checkbox_fill_disabled = rgba_css(p["input_bg"], 0.58)
+        checkbox_border = shift(p["input_bg"], -0.46)
+
+        self.surface.setStyleSheet("background: transparent;")
+        self.body.setStyleSheet("background: transparent;")
+        self.pages.setStyleSheet("background: transparent;")
+
+        self.sidebar.setStyleSheet(
+            "QWidget {"
+            f"background: rgba({sidebar_color.red()}, {sidebar_color.green()}, {sidebar_color.blue()}, {sidebar_color.alpha()});"
+            "border-radius: 0px;"
+            "}"
+        )
+
+        self.titlebar.setStyleSheet(
+            "QWidget {"
+            f"background: {titlebar_bg};"
+            f"color: {p['label_text']};"
+            "}"
+            "QLabel#TitleText {"
+            "font-size: 13px;"
+            "font-weight: 700;"
+            f"background: {title_badge_bg};"
+            f"border: 1px solid {title_badge_border};"
+            "border-radius: 11px;"
+            "padding: 2px 10px;"
+            "}"
+            "QToolButton {"
+            "background: transparent;"
+            "border: none;"
+            "font-size: 13px;"
+            "font-weight: 600;"
+            f"color: {p['label_text']};"
+            "}"
+            "QToolButton#TitleMinButton {"
+            f"background: {title_min_bg};"
+            f"border: 1px solid {title_min_border};"
+            "border-radius: 11px;"
+            "font-size: 12px;"
+            "font-weight: 800;"
+            "}"
+            f"QToolButton#TitleMinButton:hover {{ background: {title_min_hover}; }}"
+            "QToolButton#TitleCloseButton {"
+            "background: rgba(225,80,80,110);"
+            "border: 1px solid rgba(255,135,135,175);"
+            "border-radius: 11px;"
+            "font-size: 12px;"
+            "font-weight: 800;"
+            "}"
+            "QToolButton#TitleCloseButton:hover { background: rgba(235,95,95,155); }"
+        )
+
+        global_style = (
+            "QWidget {"
+            f"color: {p['label_text']};"
+            "font-family: 'Segoe UI';"
+            f"font-size: {base_font_px}px;"
+            "background: transparent;"
+            "}"
+            "QLabel {"
+            "font-weight: 700;"
+            "background: transparent;"
+            "}"
+            "QLabel[muted='true'] {"
+            "font-weight: 600;"
+            f"color: {rgba_css(p['label_text'], 0.82)};"
+            "}"
+            "QLabel[section='true'] {"
+            f"font-size: {section_font_px}px;"
+            "font-weight: 700;"
+            "padding-bottom: 2px;"
+            "}"
+            "QLineEdit, QTextEdit, QSpinBox, QComboBox {"
+            f"background: rgba({QColor(p['input_bg']).red()}, {QColor(p['input_bg']).green()}, {QColor(p['input_bg']).blue()}, 228);"
+            f"border: 1px solid {shift(p['input_bg'], -0.38)};"
+            "border-radius: 3px;"
+            f"padding: {field_padding};"
+            f"selection-background-color: {p['primary']};"
+            f"selection-color: {readable_text(p['primary'])};"
+            "}"
+            f"QTextEdit {{ padding: {text_edit_padding}; }}"
+            f"QCheckBox {{ background: transparent; spacing: {checkbox_spacing}px; font-weight: 700; }}"
+            f"QCheckBox::indicator {{ width: {checkbox_indicator_px}px; height: {checkbox_indicator_px}px; border-radius: 3px; background: {checkbox_fill}; border: 1px solid {checkbox_border}; }}"
+            f"QCheckBox::indicator:checked {{ background: {checkbox_fill_checked}; border: 1px solid {shift(p['accent'], -0.45)}; }}"
+            f"QCheckBox::indicator:disabled {{ background: {checkbox_fill_disabled}; border: 1px solid {shift(checkbox_border, 0.08)}; }}"
+            "QCheckBox[switch='true']::indicator {"
+            "width: 44px;"
+            "height: 20px;"
+            "border-radius: 10px;"
+            f"background: {rgba_css(p['button_bg'], 0.55)};"
+            f"border: 1px solid {shift(p['button_bg'], -0.40)};"
+            "}"
+            "QCheckBox[switch='true']::indicator:unchecked {"
+            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {rgba_css(p['accent'], 0.62)}, stop:0.45 {rgba_css(p['button_bg'], 0.35)}, stop:1 {rgba_css(p['button_bg'], 0.25)});"
+            "}"
+            "QCheckBox[switch='true']::indicator:checked {"
+            f"background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 {rgba_css(p['button_bg'], 0.25)}, stop:0.55 {rgba_css(p['button_bg'], 0.35)}, stop:1 {rgba_css(p['accent'], 0.70)});"
+            f"border: 1px solid {shift(p['accent'], -0.45)};"
+            "}"
+            "QTabBar#SettingsMainTabBar::tab {"
+            "font-weight: 800;"
+            "}"
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollArea > QWidget > QWidget { background: transparent; }"
+            "QScrollBar:vertical {"
+            "background: rgba(0,0,0,40);"
+            f"width: {scrollbar_width}px;"
+            "margin: 0px;"
+            "border: none;"
+            "}"
+            "QScrollBar::handle:vertical {"
+            "background: rgba(255,255,255,95);"
+            f"min-height: {scrollbar_handle_min_height}px;"
+            "border-radius: 5px;"
+            "}"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {"
+            "height: 0px;"
+            "}"
+            "QSlider::groove:horizontal {"
+            "background: rgba(0,0,0,90);"
+            f"height: {slider_groove_height}px;"
+            "border-radius: 3px;"
+            "}"
+            "QSlider::handle:horizontal {"
+            f"background: {p['accent']};"
+            f"width: {slider_handle_width}px;"
+            f"margin: {slider_handle_margin};"
+            "border-radius: 3px;"
+            "}"
+            "QPushButton {"
+            f"background-color: {shared_button_bg};"
+            f"color: {p['button_text']};"
+            f"border: 1px solid {shift(p['button_bg'], -0.40)};"
+            "border-radius: 4px;"
+            f"padding: {button_padding};"
+            f"min-height: {button_min_height}px;"
+            f"font-size: {button_font_px}px;"
+            "font-weight: 700;"
+            "}"
+            f"QPushButton:hover {{ background-color: {shared_button_hover}; }}"
+            f"QPushButton:pressed {{ background-color: {shared_button_hover}; }}"
+            f"QPushButton:checked {{ background-color: {rgba_css(p['accent'], 0.78)}; color: {readable_text(p['accent'])}; border: 1px solid {shift(p['accent'], -0.42)}; }}"
+            "QPushButton[actionRole='add'] {"
+            f"background-color: {rgba_css(add_base, 0.75)};"
+            f"color: {readable_text(add_base)};"
+            f"border: 1px solid {shift(add_base, -0.42)};"
+            "}"
+            "QPushButton[actionRole='apply'] {"
+            f"background-color: {rgba_css(apply_base, 0.75)};"
+            f"color: {readable_text(apply_base)};"
+            f"border: 1px solid {shift(apply_base, -0.42)};"
+            "}"
+            "QPushButton[actionRole='pick'] {"
+            f"background-color: {rgba_css(pick_base, 0.75)};"
+            f"color: {readable_text(pick_base)};"
+            f"border: 1px solid {shift(pick_base, -0.42)};"
+            "}"
+            "QPushButton[actionRole='new'] {"
+            f"background-color: {rgba_css(new_base, 0.75)};"
+            f"color: {readable_text(new_base)};"
+            f"border: 1px solid {shift(new_base, -0.42)};"
+            "}"
+            "QPushButton[actionRole='save'] {"
+            f"background-color: {rgba_css(save_base, 0.75)};"
+            f"color: {readable_text(save_base)};"
+            f"border: 1px solid {shift(save_base, -0.42)};"
+            "}"
+            "QPushButton[actionRole='reset'] {"
+            f"background-color: {rgba_css(reset_base, 0.75)};"
+            f"color: {readable_text(reset_base)};"
+            f"border: 1px solid {shift(reset_base, -0.42)};"
+            "}"
+        )
+        self.setStyleSheet(global_style)
+        if hasattr(self, "quick_actions_button"):
+            plus_bg = blend(p["accent"], p["primary"], 0.35)
+            plus_hover = shift(plus_bg, 0.08)
+            plus_pressed = shift(plus_bg, -0.06)
+            plus_border = shift(plus_bg, -0.64)
+            self.quick_actions_button.setStyleSheet(
+                "QPushButton#QuickActionsTrigger {"
+                f"background-color: {rgba_css(plus_bg, 0.94)};"
+                f"color: {readable_text(plus_bg)};"
+                f"border: 2px solid {plus_border};"
+                "border-radius: 18px;"
+                "font-size: 22px;"
+                "font-weight: 900;"
+                "padding: 0px;"
+                "}"
+                "QPushButton#QuickActionsTrigger:hover {"
+                f"background-color: {rgba_css(plus_hover, 0.96)};"
+                f"border: 2px solid {shift(plus_border, -0.08)};"
+                "}"
+                "QPushButton#QuickActionsTrigger:pressed {"
+                f"background-color: {rgba_css(plus_pressed, 0.98)};"
+                f"border: 2px solid {shift(plus_border, -0.12)};"
+                "}"
+            )
+        if self.quick_radial_menu is not None:
+            self.quick_radial_menu.apply_theme_styles(p)
+
+        # Depot tab buttons should be fully opaque (no transparency) as requested
+        if hasattr(self, "depot_page"):
+            opaque_button_bg = rgba_css(p["button_bg"], 1.0)
+            opaque_button_hover = rgba_css(shift(p["button_bg"], 0.08), 1.0)
+            opaque_button_pressed = rgba_css(shift(p["button_bg"], -0.06), 1.0)
+            opaque_border = shift(p["button_bg"], -0.62)
+            depot_button_css = (
+                "QPushButton {"
+                f"background-color: {opaque_button_bg};"
+                f"color: {p['button_text']};"
+                f"border: 2px solid {opaque_border};"
+                "border-radius: 4px;"
+                f"padding: {button_padding};"
+                f"min-height: {button_min_height}px;"
+                f"font-size: {button_font_px}px;"
+                "font-weight: 800;"
+                "}"
+                f"QPushButton:hover {{ background-color: {opaque_button_hover}; border: 2px solid {shift(opaque_border, -0.08)}; }}"
+                f"QPushButton:pressed {{ background-color: {opaque_button_pressed}; border: 2px solid {shift(opaque_border, -0.12)}; }}"
+            )
+            self.depot_page.setStyleSheet(depot_button_css)
+            self._refresh_depot_dashboard_combo_popup_width()
+
+        editor_border = shift(p["control_bg"], -0.30)
+        editor_field_border = shift(p["input_bg"], -0.38)
+        editor_button_border = shift(p["button_bg"], -0.40)
+        editor_button_hover = rgba_css(p["button_bg"], 0.18)
+        if hasattr(self, "quick_editor_dialog"):
+            base_popup_css = self._popup_theme_stylesheet("main", force_opaque_root=True)
+            self.quick_editor_dialog.setStyleSheet(
+                base_popup_css
+                + (
+                    "QDialog#QuickEditorDialog {"
+                    f"background: {rgba_css(p['shell_overlay'], 0.90)};"
+                    f"color: {p['label_text']};"
+                    f"border: 1px solid {editor_border};"
+                    "border-radius: 8px;"
+                    "}"
+                    "QDialog#QuickEditorDialog QLabel {"
+                    f"color: {p['label_text']};"
+                    "background: transparent;"
+                    "font-weight: 700;"
+                    "}"
+                    "QDialog#QuickEditorDialog QLineEdit, QDialog#QuickEditorDialog QTextEdit, QDialog#QuickEditorDialog QComboBox {"
+                    "background: transparent;"
+                    f"border: 1px solid {editor_field_border};"
+                    "border-radius: 3px;"
+                    f"color: {p['label_text']};"
+                    "padding: 2px 6px;"
+                    "}"
+                    "QDialog#QuickEditorDialog QLineEdit:focus, QDialog#QuickEditorDialog QTextEdit:focus, QDialog#QuickEditorDialog QComboBox:focus {"
+                    f"border: 1px solid {editor_border};"
+                    "background: transparent;"
+                    "}"
+                    "QDialog#QuickEditorDialog QPushButton {"
+                    "background: transparent;"
+                    f"border: 1px solid {editor_button_border};"
+                    "border-radius: 6px;"
+                    f"color: {p['label_text']};"
+                    "font-weight: 700;"
+                    "}"
+                    "QDialog#QuickEditorDialog QPushButton:hover {"
+                    f"background: {editor_button_hover};"
+                    "}"
+                )
+            )
+        if self.image_dialog is not None:
+            self.image_dialog.apply_theme_styles()
+        if self.quick_layout_dialog is not None:
+            self.quick_layout_dialog.apply_theme_styles()
+        if self.depot_dashboard_dialog is not None:
+            self.depot_dashboard_dialog.apply_theme_styles()
+            self.depot_dashboard_dialog.refresh_combo_popup_width()
+
+        for key, button in self.nav_buttons.items():
+            active = self.pages.currentIndex() == self.page_index.get(key)
+            self._style_nav_button(button, active)
+        self._style_nav_button(self.settings_button, self.pages.currentIndex() == self.page_index["settings"])
+        self._refresh_theme_preview_buttons()
+        self.refresh_quick_grid()
+
+    def _style_nav_button(self, button: QToolButton, active: bool) -> None:
+        p = self.palette_data
+        if active:
+            bg = rgba_css(p["nav_active"], 0.75)
+            fg = readable_text(p["nav_active"])
+            border = shift(p["nav_active"], -0.45)
+        else:
+            bg = rgba_css(p["button_bg"], 0.75)
+            fg = p["label_text"]
+            border = shift(p["button_bg"], -0.40)
+        hover_bg = rgba_css(blend(p["accent"], p["surface"], 0.25), 0.46)
+
+        button.setStyleSheet(
+            "QToolButton {"
+            f"background: {bg};"
+            f"color: {fg};"
+            f"border: 1px solid {border};"
+            "border-radius: 0px;"
+            "padding: 0px;"
+            "}"
+            f"QToolButton:hover {{ background: {hover_bg}; }}"
+        )
+
+    # ------------------------- Page Actions ------------------------- #
+    def switch_page(self, page: str) -> None:
+        if page != "quick" and self.quick_radial_menu is not None and self.quick_radial_menu.isVisible():
+            self.quick_radial_menu.hide()
+        index = self.page_index.get(page, 0)
+        self.pages.setCurrentIndex(index)
+        for key, btn in self.nav_buttons.items():
+            self._style_nav_button(btn, key == page)
+        self._style_nav_button(self.settings_button, page == "settings")
+        self.refresh_all_views()
+
+    def refresh_all_views(self) -> None:
+        self.surface.update()
+        self.quick_page.update()
+        self.settings_page.update()
+        
+        # Update popup windows if they exist
+        if hasattr(self, "active_agent_window") and self.active_agent_window is not None and self.active_agent_window.isVisible():
+            self.active_agent_window.update()
+        if hasattr(self, "active_qa_window") and self.active_qa_window is not None and self.active_qa_window.isVisible():
+            self.active_qa_window.update()
+        if self.admin_dialog is not None and self.admin_dialog.isVisible():
+            self.admin_dialog.update()
+        
+        # Update image dialogs if they exist
+        if self.image_dialog is not None and self.image_dialog.isVisible():
+            self.image_dialog.update()
+        if hasattr(self, "agent_image_dialog") and self.agent_image_dialog is not None and self.agent_image_dialog.isVisible():
+            self.agent_image_dialog.update()
+        if hasattr(self, "qa_image_dialog") and self.qa_image_dialog is not None and self.qa_image_dialog.isVisible():
+            self.qa_image_dialog.update()
+        if hasattr(self, "admin_image_dialog") and self.admin_image_dialog is not None and self.admin_image_dialog.isVisible():
+            self.admin_image_dialog.update()
+        if hasattr(self, "dashboard_image_dialog") and self.dashboard_image_dialog is not None and self.dashboard_image_dialog.isVisible():
+            self.dashboard_image_dialog.update()
+        if self.depot_dashboard_dialog is not None and self.depot_dashboard_dialog.isVisible():
+            self.depot_dashboard_dialog.update()
+
+    def _init_ui_opacity_effects(self) -> None:
+        self._ui_opacity_effects.clear()
+        targets = [
+            (self.titlebar, 0.05, 0.00),
+            (self.sidebar, 0.05, 0.00),
+            (self.settings_page, 0.05, 0.00),
+            (self.quick_actions_button, 0.05, 0.00),
+        ]
+        for widget, no_bg_floor, with_bg_floor in targets:
+            effect = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(effect)
+            self._ui_opacity_effects.append((effect, float(no_bg_floor), float(with_bg_floor)))
+        self._set_ui_opacity(self._effective_shell_idle_opacity())
+
+    def _set_ui_opacity(self, value: float) -> None:
+        requested_opacity = float(clamp(value, 0.0, 1.0))
+        has_background_layers = self._window_has_background_layers("main")
+        self._ui_opacity_current = requested_opacity if has_background_layers else float(max(requested_opacity, 0.05))
+        for effect, no_bg_floor, with_bg_floor in self._ui_opacity_effects:
+            floor = with_bg_floor if has_background_layers else no_bg_floor
+            effect.setOpacity(float(max(requested_opacity, floor)))
+        self.surface.update()
+
+    def _has_active_popup(self) -> bool:
+        app = QApplication.instance()
+        return bool(app and app.activePopupWidget() is not None)
+
+    def _has_active_internal_dialog(self) -> bool:
+        dialogs = (self.image_dialog, self.quick_layout_dialog, self.depot_dashboard_dialog)
+        for dialog in dialogs:
+            if dialog is not None and dialog.isVisible() and dialog.isActiveWindow():
+                return True
+        return False
+
+    def _cursor_inside_window(self) -> bool:
+        pos = self.mapFromGlobal(QCursor.pos())
+        return self.rect().contains(pos)
+
+    def _begin_fade_out(self) -> None:
+        self._hover_inside = False
+        self._hover_revealed = False
+        self._hover_delay_timer.stop()
+        self._start_opacity_animation(self._effective_shell_idle_opacity(), self._hover_fade_out_ms())
+
+    def _on_popup_leave_check(self) -> None:
+        if self._has_active_popup():
+            self._popup_leave_timer.start(120)
+            return
+        if self._has_active_internal_dialog():
+            return
+        if not self._cursor_inside_window():
+            self._begin_fade_out()
+
+    def _reveal_immediately(self) -> None:
+        self._hover_inside = True
+        self._hover_revealed = True
+        self._hover_delay_timer.stop()
+        self._popup_leave_timer.stop()
+        self._ui_opacity_anim.stop()
+        self._set_ui_opacity(1.0)
+
+    # ----------------------- Quick Text Screen ---------------------- #
+    def _build_quick_radial_menu(self) -> None:
+        self.quick_radial_menu = QuickRadialMenu(self)
+        self.quick_radial_menu.action_requested.connect(self._handle_quick_radial_action)
+        self.quick_radial_menu.apply_theme_styles(self.palette_data)
+        self._sync_quick_tab_actions()
+
+    def toggle_quick_radial_menu(self) -> None:
+        if self.quick_radial_menu is None:
+            self._build_quick_radial_menu()
+        if self.quick_radial_menu is None:
+            return
+        if self.quick_radial_menu.isVisible():
+            self.quick_radial_menu.hide()
+            return
+        self._reveal_immediately()
+        self._sync_quick_tab_actions()
+        self.quick_radial_menu.open_anchored_to(self.quick_actions_button)
+
+    def _handle_quick_radial_action(self, action_key: str) -> None:
+        if action_key == "add":
+            self.open_quick_editor(None)
+        elif action_key == "layout":
+            self.open_quick_layout_dialog()
+        elif action_key == "new_tab":
+            self.add_quick_task_tab()
+        elif action_key == "rename":
+            self.rename_quick_task_tab()
+        elif action_key == "remove":
+            self.remove_quick_task_tab()
+
+    def _quick_tabs(self) -> list[dict[str, Any]]:
+        raw_tabs = self.config.get("quick_tabs")
+        if not isinstance(raw_tabs, list):
+            raw_tabs = []
+            self.config["quick_tabs"] = raw_tabs
+
+        if not raw_tabs:
+            legacy_items = self.config.get("quick_texts", [])
+            if not isinstance(legacy_items, list):
+                legacy_items = []
+            raw_tabs.append({"name": "Main", "quick_texts": legacy_items})
+
+        changed = False
+        for idx, tab in enumerate(raw_tabs):
+            if not isinstance(tab, dict):
+                raw_tabs[idx] = {"name": "Main" if idx == 0 else f"Task {idx + 1}", "quick_texts": []}
+                changed = True
+                continue
+            name = str(tab.get("name", "")).strip()[:32]
+            if not name:
+                name = "Main" if idx == 0 else f"Task {idx + 1}"
+            if str(tab.get("name", "")) != name:
+                tab["name"] = name
+                changed = True
+            if not isinstance(tab.get("quick_texts"), list):
+                tab["quick_texts"] = []
+                changed = True
+
+        if changed:
+            self.queue_save_config()
+        return raw_tabs
+
+    def _active_quick_tab_index(self) -> int:
+        tabs = self._quick_tabs()
+        idx = safe_int(self.config.get("active_quick_tab", 0), 0)
+        if idx < 0 or idx >= len(tabs):
+            idx = 0
+            self.config["active_quick_tab"] = idx
+        return idx
+
+    def _sync_legacy_quick_texts(self, tab_index: int | None = None) -> None:
+        tabs = self._quick_tabs()
+        if not tabs:
+            self.config["quick_texts"] = []
+            return
+        idx = self._active_quick_tab_index() if tab_index is None else safe_int(tab_index, 0)
+        if idx < 0 or idx >= len(tabs):
+            idx = 0
+        tab_items = tabs[idx].get("quick_texts", [])
+        self.config["quick_texts"] = tab_items if isinstance(tab_items, list) else []
+
+    def _active_quick_texts(self) -> list[dict[str, Any]]:
+        tabs = self._quick_tabs()
+        idx = self._active_quick_tab_index()
+        tab = tabs[idx]
+        entries = tab.get("quick_texts", [])
+        if not isinstance(entries, list):
+            entries = []
+            tab["quick_texts"] = entries
+        self.config["active_quick_tab"] = idx
+        self._sync_legacy_quick_texts(idx)
+        return entries
+
+    def _sync_quick_tab_actions(self) -> None:
+        has_tabs = bool(self._quick_tabs())
+        can_remove = len(self._quick_tabs()) > 1
+        if self.quick_radial_menu is not None:
+            self.quick_radial_menu.set_action_enabled("rename", has_tabs)
+            self.quick_radial_menu.set_action_enabled("remove", can_remove)
+
+    def _make_quick_tab_canvas_page(self) -> tuple[QWidget, QScrollArea, QuickButtonCanvas]:
+        page = QWidget()
+        wrapper = QVBoxLayout(page)
+        wrapper.setContentsMargins(0, 0, 0, 0)
+        wrapper.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.viewport().setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        canvas = QuickButtonCanvas()
+        scroll.setWidget(canvas)
+        wrapper.addWidget(scroll, 1)
+        return page, scroll, canvas
+
+    def _rebuild_quick_tab_widgets(self) -> None:
+        if self.quick_tabs_widget is None:
+            return
+
+        active_index = self._active_quick_tab_index()
+        for scroll in self.quick_tab_scrolls:
+            try:
+                scroll.viewport().removeEventFilter(self)
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.quick_tab_event_filter_remove_failed",
+                    severity="warning",
+                    summary="Failed removing viewport event filter while rebuilding quick tab widgets.",
+                    exc=exc,
+                    context={"scroll_object": repr(scroll)},
+                )
+        self.quick_tab_scrolls.clear()
+        self.quick_tab_canvases.clear()
+
+        tabs = self._quick_tabs()
+        self.quick_tabs_widget.blockSignals(True)
+        self.quick_tabs_widget.clear()
+        for idx, tab in enumerate(tabs):
+            page, scroll, canvas = self._make_quick_tab_canvas_page()
+            self.quick_tabs_widget.addTab(page, str(tab.get("name", f"Task {idx + 1}")))
+            self.quick_tab_scrolls.append(scroll)
+            self.quick_tab_canvases.append(canvas)
+            scroll.viewport().installEventFilter(self)
+
+        if self.quick_tab_scrolls:
+            if active_index < 0 or active_index >= len(self.quick_tab_scrolls):
+                active_index = 0
+            self.quick_tabs_widget.setCurrentIndex(active_index)
+            self.quick_scroll = self.quick_tab_scrolls[active_index]
+            self.quick_canvas = self.quick_tab_canvases[active_index]
+            self.config["active_quick_tab"] = active_index
+            self._sync_legacy_quick_texts(active_index)
+        self.quick_tabs_widget.blockSignals(False)
+        self._sync_quick_tab_actions()
+
+    def _on_quick_tab_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.quick_tab_scrolls):
+            return
+        self.quick_scroll = self.quick_tab_scrolls[index]
+        self.quick_canvas = self.quick_tab_canvases[index]
+        self.config["active_quick_tab"] = int(index)
+        self._sync_legacy_quick_texts(index)
+        self.refresh_quick_grid()
+        if self.quick_layout_dialog is not None and self.quick_layout_dialog.isVisible():
+            self.quick_layout_dialog.refresh_cards()
+        self.queue_save_config()
+
+    def add_quick_task_tab(self) -> None:
+        tabs = self._quick_tabs()
+        default_name = f"Task {len(tabs) + 1}"
+        name, ok = show_flowgrid_themed_input_text(
+            self,
+            self,
+            "main",
+            "New Input Grid Tab",
+            "Tab name:",
+            default_name,
+        )
+        if not ok:
+            return
+        tab_name = str(name).strip()[:32] or default_name
+        tabs.append({"name": tab_name, "quick_texts": []})
+        new_index = len(tabs) - 1
+        self.config["active_quick_tab"] = new_index
+        self._sync_legacy_quick_texts(new_index)
+        self._rebuild_quick_tab_widgets()
+        if self.quick_tabs_widget is not None:
+            self.quick_tabs_widget.setCurrentIndex(new_index)
+        self.refresh_quick_grid()
+        if self.quick_layout_dialog is not None and self.quick_layout_dialog.isVisible():
+            self.quick_layout_dialog.refresh_cards()
+        self.queue_save_config()
+
+    def rename_quick_task_tab(self) -> None:
+        tabs = self._quick_tabs()
+        if not tabs:
+            return
+        idx = self._active_quick_tab_index()
+        current_name = str(tabs[idx].get("name", f"Task {idx + 1}"))
+        name, ok = show_flowgrid_themed_input_text(
+            self,
+            self,
+            "main",
+            "Rename Input Grid Tab",
+            "Tab name:",
+            current_name,
+        )
+        if not ok:
+            return
+        updated_name = str(name).strip()[:32] or current_name
+        tabs[idx]["name"] = updated_name
+        if self.quick_tabs_widget is not None and 0 <= idx < self.quick_tabs_widget.count():
+            self.quick_tabs_widget.setTabText(idx, updated_name)
+        self.queue_save_config()
+
+    def remove_quick_task_tab(self) -> None:
+        tabs = self._quick_tabs()
+        if len(tabs) <= 1:
+            self._show_shell_message(
+                QMessageBox.Icon.Information,
+                "Input Grid",
+                "At least one quick-input tab is required.",
+                theme_kind="main",
+            )
+            return
+        idx = self._active_quick_tab_index()
+        tabs.pop(idx)
+        next_index = min(idx, len(tabs) - 1)
+        self.config["active_quick_tab"] = max(0, next_index)
+        self._sync_legacy_quick_texts(self.config["active_quick_tab"])
+        self.close_quick_editor()
+        self._rebuild_quick_tab_widgets()
+        if self.quick_tabs_widget is not None:
+            self.quick_tabs_widget.setCurrentIndex(self.config["active_quick_tab"])
+        self.refresh_quick_grid()
+        if self.quick_layout_dialog is not None and self.quick_layout_dialog.isVisible():
+            self.quick_layout_dialog.refresh_cards()
+        self.queue_save_config()
+
+    def _default_quick_position(self, index: int, width: int, height: int) -> tuple[int, int]:
+        gap_x = 10
+        gap_y = 10
+        if hasattr(self, "quick_scroll"):
+            available_width = max(120, int(self.quick_scroll.viewport().width()))
+        else:
+            available_width = max(120, LAUNCH_WIDTH - SIDEBAR_WIDTH - 24)
+        columns = max(1, available_width // max(1, width + gap_x))
+        col = index % columns
+        row = index // columns
+        return col * (width + gap_x), row * (height + gap_y)
+
+    def _quick_viewport_width(self) -> int:
+        try:
+            return max(0, int(self.quick_scroll.viewport().width()))
+        except Exception:
+            return 0
+
+    def _quick_positions_can_persist(self) -> bool:
+        # Avoid persisting clamped placeholder geometry during early startup before viewport layout settles.
+        return bool(self.isVisible() and self._quick_viewport_width() > 120)
+
+    def refresh_quick_grid(self) -> None:
+        self.quick_canvas.clear_cards()
+        self.quick_canvas.clear_alignment_guides()
+
+        quick_texts = self._active_quick_texts()
+        self.quick_canvas.configure_grid(show_grid=False, snap_enabled=False)
+        self.quick_canvas.set_viewport_width(max(120, self._quick_viewport_width()))
+        can_persist_positions = self._quick_positions_can_persist()
+
+        if not quick_texts:
+            self.quick_canvas.set_placeholder("No quick text buttons yet.", self.palette_data["muted_text"])
+            return
+
+        width = int(self.config.get("quick_button_width", 140))
+        height = int(self.config.get("quick_button_height", 40))
+        font_size = int(self.config.get("quick_button_font_size", 11))
+        font_family = str(self.config.get("quick_button_font_family", "Segoe UI"))
+        shape = self.config.get("quick_button_shape", "Soft")
+        button_opacity = float(clamp(float(self.config.get("quick_button_opacity", 1.0)), 0.15, 1.0))
+        updated_positions = False
+
+        for idx, item in enumerate(quick_texts):
+            card = QuickButtonCard(
+                idx,
+                str(item.get("title", "Untitled"))[:28],
+                str(item.get("tooltip", "")),
+                self.quick_canvas,
+            )
+            action_type = self._quick_action_kind(item)
+            card.apply_visual_style(width, height, font_size, font_family, shape, button_opacity, self.palette_data, action_type)
+            card.set_layout_mode(False)
+            card.insert_requested.connect(self.insert_quick_text)
+            card.edit_requested.connect(self.open_quick_editor)
+
+            raw_x = item.get("x")
+            raw_y = item.get("y")
+            if isinstance(raw_x, (int, float)) and isinstance(raw_y, (int, float)):
+                pos_x, pos_y = int(raw_x), int(raw_y)
+            else:
+                pos_x, pos_y = self._default_quick_position(idx, width, height)
+                if can_persist_positions:
+                    item["x"] = int(pos_x)
+                    item["y"] = int(pos_y)
+                    updated_positions = True
+
+            snapped_x, snapped_y = self.quick_canvas.place_card(card, pos_x, pos_y, snap=False)
+            if (
+                can_persist_positions
+                and (
+                    safe_int(item.get("x", -99999), -99999) != snapped_x
+                    or safe_int(item.get("y", -99999), -99999) != snapped_y
+                )
+            ):
+                item["x"] = int(snapped_x)
+                item["y"] = int(snapped_y)
+                updated_positions = True
+
+        if updated_positions:
+            self.queue_save_config()
+
+    def open_quick_editor(self, index: int | None) -> None:
+        quick_texts = self._active_quick_texts()
+        self._editing_index = index
+        self._refresh_available_browsers()
+
+        if index is None:
+            self.editor_title.setText("")
+            self.editor_tooltip.setText("")
+            self.editor_action_combo.setCurrentIndex(0)
+            self.editor_text.setPlainText("")
+            self.editor_macro.setPlainText("")
+            self.editor_apps.setPlainText("")
+            self.editor_urls.setPlainText("")
+            self.editor_browser_combo.setCurrentIndex(0)
+            self.editor_delete_btn.setEnabled(False)
+        else:
+            if index < 0 or index >= len(quick_texts):
+                return
+            entry = quick_texts[index]
+            self.editor_title.setText(str(entry.get("title", "")))
+            self.editor_tooltip.setText(str(entry.get("tooltip", "")))
+            action = str(entry.get("action", "paste_text")).strip().lower()
+            if action == "macro_sequence":
+                action = "input_sequence"
+            action_index = self.editor_action_combo.findData(action)
+            if action_index < 0:
+                action_index = self.editor_action_combo.findData("paste_text")
+            self.editor_action_combo.setCurrentIndex(max(0, action_index))
+            
+            # Handle input sequence vs regular text.
+            if action == "input_sequence":
+                self.editor_macro.setPlainText(str(entry.get("text", "")))
+                self.editor_text.setPlainText("")
+            else:
+                self.editor_text.setPlainText(str(entry.get("text", "")))
+                self.editor_macro.setPlainText("")
+            
+            app_targets = str(entry.get("app_targets", "")).strip()
+            if not app_targets:
+                app_targets = str(entry.get("open_target", "")).strip()
+            self.editor_apps.setPlainText(app_targets)
+            self.editor_urls.setPlainText(str(entry.get("urls", "")))
+            browser_path = str(entry.get("browser_path", "")).strip()
+            browser_index = self.editor_browser_combo.findData(browser_path)
+            if browser_index < 0:
+                browser_index = 0
+            self.editor_browser_combo.setCurrentIndex(browser_index)
+            self.editor_delete_btn.setEnabled(True)
+
+        # Opening the editor is an explicit interaction; reveal full shell opacity immediately.
+        self._reveal_immediately()
+        if not self.quick_editor_dialog.isVisible():
+            px = int(self.x() + max(8, (self.width() - self.quick_editor_dialog.width()) / 2))
+            py = int(self.y() + max(36, (self.height() - self.quick_editor_dialog.height()) / 2))
+            self.quick_editor_dialog.move(px, py)
+        self.quick_editor_dialog.show()
+        self.quick_editor_dialog.raise_()
+        self.quick_editor_dialog.activateWindow()
+
+    @staticmethod
+    def _input_sequence_contains_blocked_credentials(sequence_text: str) -> bool:
+        text = str(sequence_text or "")
+        if not text.strip():
+            return False
+        lowered = text.lower()
+        if re.search(r"\b(user(name)?|user[_\s-]?id|login|sign[\s-]?in|pass(word)?|passwd|pwd)\b", lowered):
+            return True
+        if re.search(r"\b(user(name)?|user[_\s-]?id|pass(word)?|passwd|pwd)\s*[:=]", lowered):
+            return True
+        # Block common "email/username [tab] password" style sequences.
+        if re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}.*\[(tab|enter)\]", text, re.IGNORECASE):
+            return True
+        return False
+
+    def save_quick_editor(self) -> None:
+        title = self.editor_title.text().strip() or "Untitled"
+        tooltip = self.editor_tooltip.text().strip()
+        action = str(self.editor_action_combo.currentData() or "paste_text")
+        text = self.editor_text.toPlainText()
+        macro = self.editor_macro.toPlainText()
+        app_targets = self.editor_apps.toPlainText().strip()
+        urls = self.editor_urls.toPlainText().strip()
+        browser_path = str(self.editor_browser_combo.currentData() or "").strip()
+
+        if action == "paste_text":
+            macro = ""
+            app_targets = ""
+            urls = ""
+            browser_path = ""
+        elif action == "input_sequence":
+            text = macro
+            app_targets = ""
+            urls = ""
+            browser_path = ""
+            macro = ""
+            if self._input_sequence_contains_blocked_credentials(text):
+                _runtime_log_event(
+                    "ui.quick_input_sequence_sensitive_content_blocked",
+                    severity="warning",
+                    summary="Blocked saving input sequence containing credential-like content.",
+                    context={"title": title, "user_id": str(self.current_user)},
+                )
+                self._show_shell_message(
+                    QMessageBox.Icon.Warning,
+                    "Input Sequence Blocked",
+                    "Input Sequences cannot store username/password or login credentials.\n"
+                    "Please remove sensitive fields and save again.",
+                )
+                return
+        elif action == "open_url":
+            text = ""
+            macro = ""
+            app_targets = ""
+        elif action == "open_app":
+            text = ""
+            macro = ""
+            urls = ""
+            browser_path = ""
+
+        quick_texts = self._active_quick_texts()
+
+        if self._editing_index is None:
+            pos_x, pos_y = self._default_quick_position(
+                len(quick_texts),
+                int(self.config.get("quick_button_width", 140)),
+                int(self.config.get("quick_button_height", 40)),
+            )
+            entry = {
+                "title": title,
+                "tooltip": tooltip,
+                "text": text,
+                "action": action,
+                "open_target": "",
+                "app_targets": app_targets,
+                "urls": urls,
+                "browser_path": browser_path,
+                "x": int(pos_x),
+                "y": int(pos_y),
+            }
+            quick_texts.append(entry)
+        elif 0 <= self._editing_index < len(quick_texts):
+            existing = quick_texts[self._editing_index]
+            entry = {
+                "title": title,
+                "tooltip": tooltip,
+                "text": text,
+                "action": action,
+                "open_target": "",
+                "app_targets": app_targets,
+                "urls": urls,
+                "browser_path": browser_path,
+                "x": safe_int(existing.get("x", 0), 0) if isinstance(existing, dict) else 0,
+                "y": safe_int(existing.get("y", 0), 0) if isinstance(existing, dict) else 0,
+            }
+            quick_texts[self._editing_index] = entry
+
+        self.queue_save_config()
+        self.close_quick_editor()
+        self.refresh_quick_grid()
+        if self.quick_layout_dialog is not None and self.quick_layout_dialog.isVisible():
+            self.quick_layout_dialog.refresh_cards()
+
+    def delete_quick_editor(self) -> None:
+        if self._editing_index is None:
+            return
+
+        quick_texts = self._active_quick_texts()
+        if 0 <= self._editing_index < len(quick_texts):
+            quick_texts.pop(self._editing_index)
+            self.queue_save_config()
+            self.close_quick_editor()
+            self.refresh_quick_grid()
+            if self.quick_layout_dialog is not None and self.quick_layout_dialog.isVisible():
+                self.quick_layout_dialog.refresh_cards()
+
+    def close_quick_editor(self) -> None:
+        self._editing_index = None
+        self.quick_editor_dialog.hide()
+
+    def _capture_external_target(self) -> None:
+        if os.name != "nt":
+            return
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return
+
+        pid = ctypes.c_ulong(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value != os.getpid():
+            self.last_external_hwnd = int(hwnd)
+
+    def _refresh_shared_data(self) -> None:
+        if not self.isVisible():
+            return
+
+        try:
+            self._refresh_shared_editable_icons()
+            self._refresh_visible_depot_views(
+                *self._all_depot_refresh_sections(),
+                force=False,
+                reason="background",
+                ttl_ms=DEPOT_BACKGROUND_AUTO_REFRESH_MS,
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "sync.shared_data_refresh_failed",
+                severity="warning",
+                summary="Periodic shared database refresh failed.",
+                exc=exc,
+            )
+
+    def _is_shift_pressed(self) -> bool:
+        return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+    @staticmethod
+    def _resolve_context_script_path(script_name: str) -> Path | None:
+        candidates = [
+            Path(__file__).with_name(script_name),
+            Path.cwd() / script_name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    @staticmethod
+    def _entry_context_text(entry: dict[str, Any]) -> str:
+        context = str(entry.get("context", "")).strip()
+        if context:
+            return context
+        return str(entry.get("tooltip", "")).strip()
+
+    def _launch_shift_context_script_for_entry(self, entry: dict[str, Any]) -> bool:
+        if not self._is_shift_pressed():
+            return False
+
+        context_text = self._entry_context_text(entry).lower()
+        if not context_text:
+            return False
+
+        for context_keyword, script_name in SHIFT_CONTEXT_SCRIPT_LAUNCHERS.items():
+            if context_keyword.lower() not in context_text:
+                continue
+            script_path = self._resolve_context_script_path(script_name)
+            if script_path is None:
+                return False
+            return self._open_app_target(str(script_path))
+        return False
+
+    def _send_ctrl_v(self) -> None:
+        if os.name != "nt":
+            return
+        user32.keybd_event(VK_CONTROL, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, 0, 0)
+        user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+        user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
+
+    def _send_key(self, key_code: int, shift_held: bool = False, alt_held: bool = False) -> None:
+        """Send a single key press with optional modifiers."""
+        if os.name != "nt":
+            return
+        
+        modifiers: list[int] = []
+        if shift_held:
+            modifiers.append(VK_SHIFT)
+        if alt_held:
+            modifiers.append(VK_ALT)
+        
+        # Press modifiers
+        for mod in modifiers:
+            user32.keybd_event(mod, 0, 0, 0)
+        
+        # If key is return, set as return for consistent behavior
+        if key_code == VK_ENTER:
+            key_code = VK_RETURN
+
+        # Press and release the key
+        user32.keybd_event(key_code, 0, 0, 0)
+        user32.keybd_event(key_code, 0, KEYEVENTF_KEYUP, 0)
+        
+        # Release modifiers
+        for mod in reversed(modifiers):
+            user32.keybd_event(mod, 0, KEYEVENTF_KEYUP, 0)
+
+    def _parse_macro_sequence(self, sequence: str) -> list[dict[str, Any]]:
+        """Parse an input sequence into supported commands.
+
+        Supported syntax:
+        - plain text
+        - [tab]
+        - [enter]
+        - [delay: ms]
+        """
+        import re
+        
+        commands: list[dict[str, Any]] = []
+        
+        # Find all [commands] and plain text segments
+        pattern = r'(\[([^\]]+)\]|[^\[\]]+)'
+        matches = re.finditer(pattern, sequence)
+        
+        for match in matches:
+            part = match.group(0).strip()
+            if not part:
+                continue
+                
+            # Check if this part is a [command]
+            if part.startswith('[') and part.endswith(']'):
+                content = part[1:-1].strip()
+                
+                # Parse the command
+                if ':' in content:
+                    cmd_type, cmd_value = content.split(':', 1)
+                    cmd_type = cmd_type.strip().lower()
+                    cmd_value = cmd_value.strip()
+
+                    if cmd_type == 'delay':
+                        try:
+                            delay_ms = int(cmd_value)
+                            if 0 <= delay_ms <= 60000:  # Max 60 seconds
+                                commands.append({'action': 'delay', 'ms': delay_ms})
+                        except ValueError as exc:
+                            _runtime_log_event(
+                                "runtime.macro_delay_parse_failed",
+                                severity="warning",
+                                summary="Invalid [delay: ms] command value in input sequence; command skipped.",
+                                exc=exc,
+                                context={"raw_value": cmd_value, "sequence_preview": sequence[:240]},
+                            )
+                else:
+                    # Single-word commands: [tab], [enter].
+                    cmd_name = content.lower()
+                    if cmd_name == 'tab':
+                        commands.append({'action': 'key', 'key': 'tab'})
+                    elif cmd_name in {'enter', 'return'}:
+                        commands.append({'action': 'key', 'key': 'enter'})
+            else:
+                # Plain text - treat as type command
+                text = part.strip()
+                if text:
+                    commands.append({'action': 'type', 'text': text})
+        
+        return commands
+
+    def _execute_macro_sequence(self, sequence: str) -> None:
+        """Execute a parsed macro sequence."""
+        if os.name != "nt":
+            return
+        
+        # Restore focus to the external window before executing macro
+        if self.last_external_hwnd:
+            hwnd = int(self.last_external_hwnd)
+            try:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.05)
+            except Exception as exc:
+                _runtime_log_event(
+                    "runtime.macro_restore_foreground_failed",
+                    severity="warning",
+                    summary="Failed restoring foreground window before executing macro sequence.",
+                    exc=exc,
+                    context={"hwnd": hwnd},
+                )
+        
+        commands = self._parse_macro_sequence(sequence)
+        
+        for cmd in commands:
+            action = cmd.get('action', '')
+            
+            if action == 'type':
+                text = cmd.get('text', '')
+                if text:
+                    QGuiApplication.clipboard().setText(text)
+                    time.sleep(0.05)  # Small delay before pasting
+                    self._send_ctrl_v()
+                    time.sleep(0.05)  # Small delay after pasting
+            
+            elif action == 'key':
+                key_name = cmd.get('key', '')
+                shift_held = cmd.get('shift', False)
+                alt_held = cmd.get('alt', False)
+                
+                if key_name in KEY_CODES:
+                    key_code = KEY_CODES[key_name]
+                    self._send_key(key_code, shift_held=shift_held, alt_held=alt_held)
+                    time.sleep(0.06)  # Small delay between keys
+            
+            elif action == 'delay':
+                delay_ms = cmd.get('ms', 0)
+                time.sleep(delay_ms / 1000.0)
+
+    def _quick_action_kind(self, entry: dict[str, Any]) -> str:
+        action = str(entry.get("action", "paste_text")).strip().lower()
+        if action == "macro_sequence":
+            action = "input_sequence"
+        if action not in {"paste_text", "open_url", "open_app", "input_sequence"}:
+            return "paste_text"
+        return action
+
+    def _detect_installed_browsers(self) -> list[tuple[str, str]]:
+        found: list[tuple[str, str]] = []
+        seen: set[str] = set()
+
+        def add_browser(label: str, path: str) -> None:
+            if not path:
+                return
+            path_obj = Path(path)
+            if not path_obj.exists():
+                return
+            key = str(path_obj).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            found.append((label, str(path_obj)))
+
+        checks = [
+            (
+                "Microsoft Edge",
+                ["msedge.exe"],
+                [
+                    ("PROGRAMFILES(X86)", r"Microsoft\Edge\Application\msedge.exe"),
+                    ("PROGRAMFILES", r"Microsoft\Edge\Application\msedge.exe"),
+                ],
+            ),
+            (
+                "Google Chrome",
+                ["chrome.exe"],
+                [
+                    ("PROGRAMFILES", r"Google\Chrome\Application\chrome.exe"),
+                    ("PROGRAMFILES(X86)", r"Google\Chrome\Application\chrome.exe"),
+                    ("LOCALAPPDATA", r"Google\Chrome\Application\chrome.exe"),
+                ],
+            ),
+            (
+                "Mozilla Firefox",
+                ["firefox.exe"],
+                [
+                    ("PROGRAMFILES", r"Mozilla Firefox\firefox.exe"),
+                    ("PROGRAMFILES(X86)", r"Mozilla Firefox\firefox.exe"),
+                ],
+            ),
+            (
+                "Brave",
+                ["brave.exe"],
+                [
+                    ("PROGRAMFILES", r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+                    ("PROGRAMFILES(X86)", r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+                    ("LOCALAPPDATA", r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+                ],
+            ),
+            (
+                "Opera",
+                ["opera.exe", "launcher.exe"],
+                [
+                    ("LOCALAPPDATA", r"Programs\Opera\opera.exe"),
+                    ("PROGRAMFILES", r"Opera\launcher.exe"),
+                    ("PROGRAMFILES(X86)", r"Opera\launcher.exe"),
+                ],
+            ),
+            (
+                "Vivaldi",
+                ["vivaldi.exe"],
+                [
+                    ("LOCALAPPDATA", r"Vivaldi\Application\vivaldi.exe"),
+                    ("PROGRAMFILES", r"Vivaldi\Application\vivaldi.exe"),
+                ],
+            ),
+        ]
+
+        for label, exe_names, rel_paths in checks:
+            for exe_name in exe_names:
+                located = shutil.which(exe_name)
+                if located:
+                    add_browser(label, located)
+            for env_key, rel_path in rel_paths:
+                base = os.environ.get(env_key, "")
+                if not base:
+                    continue
+                add_browser(label, str(Path(base) / rel_path))
+
+        return found
+
+    def _refresh_available_browsers(self, preferred_path: str | None = None) -> None:
+        if not hasattr(self, "editor_browser_combo"):
+            return
+        current_path = preferred_path if preferred_path is not None else str(self.editor_browser_combo.currentData() or "").strip()
+        self.editor_browser_combo.blockSignals(True)
+        self.editor_browser_combo.clear()
+        self.editor_browser_combo.addItem("Default Browser", "")
+        for label, path in self._detect_installed_browsers():
+            self.editor_browser_combo.addItem(label, path)
+        target_index = self.editor_browser_combo.findData(current_path)
+        if target_index < 0:
+            target_index = 0
+        self.editor_browser_combo.setCurrentIndex(target_index)
+        self.editor_browser_combo.blockSignals(False)
+
+    def _set_editor_row_visible(self, label: QWidget | None, field: QWidget, visible: bool) -> None:
+        if label is not None:
+            label.setVisible(visible)
+        field.setVisible(visible)
+
+    def _update_quick_editor_action_ui(self) -> None:
+        action = str(self.editor_action_combo.currentData() or "paste_text")
+        text_mode = action == "paste_text"
+        input_mode = action in {"input_sequence", "macro_sequence"}
+        url_mode = action == "open_url"
+        app_mode = action == "open_app"
+
+        self._set_editor_row_visible(self.editor_text_label, self.editor_text, text_mode)
+        self._set_editor_row_visible(self.editor_macro_label, self.editor_macro_wrap, input_mode)
+        self._set_editor_row_visible(self.editor_apps_label, self.editor_apps_wrap, app_mode)
+        self._set_editor_row_visible(self.editor_urls_label, self.editor_urls, url_mode)
+        self._set_editor_row_visible(self.editor_browser_label, self.editor_browser_wrap, url_mode)
+
+        if action == "paste_text":
+            self.editor_text.setPlaceholderText("Text to copy + paste into the last selected app.")
+            self.editor_macro.setPlaceholderText("")
+            self.editor_macro.setEnabled(False)
+            self.editor_apps.setEnabled(False)
+            self.editor_apps_browse.setEnabled(False)
+            self.editor_apps_browse_folder.setEnabled(False)
+            self.editor_urls.setEnabled(False)
+            self.editor_browser_combo.setEnabled(False)
+            self.editor_refresh_browsers_button.setEnabled(False)
+        elif action in {"input_sequence", "macro_sequence"}:
+            self.editor_macro.setPlaceholderText("Format: Bin location [enter]  (credentials are blocked)")
+            self.editor_macro.setEnabled(True)
+            self.editor_text.setPlaceholderText("")
+            self.editor_text.setEnabled(False)
+            self.editor_apps.setEnabled(False)
+            self.editor_apps_browse.setEnabled(False)
+            self.editor_apps_browse_folder.setEnabled(False)
+            self.editor_urls.setEnabled(False)
+            self.editor_browser_combo.setEnabled(False)
+            self.editor_refresh_browsers_button.setEnabled(False)
+        elif action == "open_url":
+            self.editor_urls.setPlaceholderText("One URL per line.")
+            self.editor_macro.setPlaceholderText("")
+            self.editor_macro.setEnabled(False)
+            self.editor_apps.setEnabled(False)
+            self.editor_apps_browse.setEnabled(False)
+            self.editor_apps_browse_folder.setEnabled(False)
+            self.editor_urls.setEnabled(True)
+            self.editor_browser_combo.setEnabled(True)
+            self.editor_refresh_browsers_button.setEnabled(True)
+        else:
+            self.editor_apps.setPlaceholderText("One app/file/folder path per line. Use Browse buttons to pick targets.")
+            self.editor_macro.setPlaceholderText("")
+            self.editor_macro.setEnabled(False)
+            self.editor_apps.setEnabled(True)
+            self.editor_apps_browse.setEnabled(True)
+            self.editor_apps_browse_folder.setEnabled(True)
+            self.editor_urls.setEnabled(False)
+            self.editor_browser_combo.setEnabled(False)
+            self.editor_refresh_browsers_button.setEnabled(False)
+
+    def browse_quick_apps(self) -> None:
+        action = str(self.editor_action_combo.currentData() or "paste_text")
+        if action != "open_app":
+            return
+        current_lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
+        current = current_lines[-1] if current_lines else ""
+        start_dir = str(Path(current).parent) if current else str(Path.home())
+        if not Path(start_dir).exists():
+            start_dir = str(Path.home())
+        selected_paths, _ = show_flowgrid_themed_open_file_names(
+            self,
+            self,
+            "main",
+            "Select App/File Targets",
+            start_dir,
+            "All Files (*.*);;Programs (*.exe *.lnk *.bat *.cmd *.ps1);;Executables (*.exe *.bat *.cmd);;Shortcuts (*.lnk)",
+        )
+        if not selected_paths:
+            return
+        lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
+        for selected in selected_paths:
+            normalized = str(selected or "").strip()
+            if normalized and normalized not in lines:
+                lines.append(normalized)
+        self.editor_apps.setPlainText("\n".join(lines))
+
+    def browse_quick_app_folder(self) -> None:
+        action = str(self.editor_action_combo.currentData() or "paste_text")
+        if action != "open_app":
+            return
+        current_lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
+        current = current_lines[-1] if current_lines else ""
+        start_dir = str(Path(current).parent) if current else str(Path.home())
+        if not Path(start_dir).exists():
+            start_dir = str(Path.home())
+        selected_dir = show_flowgrid_themed_existing_directory(self, self, "main", "Select Folder Target", start_dir)
+        selected_dir = str(selected_dir or "").strip()
+        if not selected_dir:
+            return
+        lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
+        if selected_dir not in lines:
+            lines.append(selected_dir)
+        self.editor_apps.setPlainText("\n".join(lines))
+
+    def _insert_macro_command(self, command: str) -> None:
+        """Insert an input-sequence token into the sequence text box."""
+        cursor = self.editor_macro.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        text = self.editor_macro.toPlainText()
+        if text and not text[-1].isspace():
+            cursor.insertText(" ")
+        cursor.insertText(command)
+        self.editor_macro.setTextCursor(cursor)
+
+    def _insert_macro_delay(self) -> None:
+        """Open dialog to insert [delay: ms] command."""
+        seconds, ok = show_flowgrid_themed_input_int(
+            self,
+            self,
+            "main",
+            "Insert Delay Command",
+            "Enter delay in seconds (0-60):",
+            1,
+            0,
+            60,
+            1,
+        )
+        if ok:
+            milliseconds = seconds * 1000
+            self._insert_macro_command(f"[delay: {milliseconds}]")
+
+    def _insert_macro_simple(self, command: str) -> None:
+        """Insert a simple predefined command."""
+        self._insert_macro_command(command)
+
+    def _insert_text_payload(self, text: str) -> None:
+        if not text:
+            return
+        QGuiApplication.clipboard().setText(text)
+        if os.name == "nt" and self.last_external_hwnd:
+            hwnd = int(self.last_external_hwnd)
+            try:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                user32.SetForegroundWindow(hwnd)
+                time.sleep(0.05)
+                self._send_ctrl_v()
+            except Exception as exc:
+                _runtime_log_event(
+                    "runtime.insert_text_foreground_restore_failed",
+                    severity="warning",
+                    summary="Failed restoring target window before paste; using direct Ctrl+V fallback.",
+                    exc=exc,
+                    context={"hwnd": hwnd, "text_length": len(text)},
+                )
+                self._send_ctrl_v()
+        else:
+            self._send_ctrl_v()
+
+    def _open_url_target(self, target: str, browser_path: str = "") -> bool:
+        target = target.strip()
+        if not target:
+            return False
+        url = QUrl.fromUserInput(target)
+        if not url.isValid():
+            return False
+        browser_path = browser_path.strip()
+        if browser_path and Path(browser_path).exists():
+            detached = QProcess.startDetached(browser_path, [url.toString()])
+            if isinstance(detached, tuple):
+                return bool(detached[0])
+            return bool(detached)
+        return bool(QDesktopServices.openUrl(url))
+
+    def _parse_urls(self, urls_text: str) -> list[str]:
+        urls: list[str] = []
+        for part in urls_text.replace(";", "\n").splitlines():
+            value = part.strip()
+            if value:
+                urls.append(value)
+        return urls
+
+    def _parse_targets(self, targets_text: str) -> list[str]:
+        targets: list[str] = []
+        for part in targets_text.replace(";", "\n").splitlines():
+            value = part.strip()
+            if value:
+                targets.append(value)
+        return targets
+
+    def _open_url_targets(self, urls_text: str, browser_path: str = "", fallback_target: str = "", fallback_text: str = "") -> bool:
+        urls = self._parse_urls(urls_text)
+        if not urls:
+            if fallback_target.strip():
+                urls = [fallback_target.strip()]
+            elif fallback_text.strip():
+                urls = [fallback_text.strip()]
+        browser_path = browser_path.strip()
+        if browser_path and Path(browser_path).exists() and len(urls) > 1:
+            args: list[str] = []
+            for target in urls:
+                url = QUrl.fromUserInput(target)
+                if url.isValid():
+                    args.append(url.toString())
+            if args:
+                detached = QProcess.startDetached(browser_path, args)
+                if isinstance(detached, tuple):
+                    return bool(detached[0])
+                return bool(detached)
+        opened = False
+        for url in urls:
+            opened = self._open_url_target(url, browser_path=browser_path) or opened
+        return opened
+
+    def _open_app_target(self, target: str) -> bool:
+        target = target.strip()
+        if not target:
+            return False
+        if os.name == "nt":
+            try:
+                os.startfile(target)  # type: ignore[attr-defined]
+                return True
+            except Exception as exc:
+                _runtime_log_event(
+                    "runtime.quick_open_app_startfile_failed",
+                    severity="warning",
+                    summary="os.startfile failed for quick action target; trying alternate open methods.",
+                    exc=exc,
+                    context={"target": target},
+                )
+        if Path(target).exists():
+            return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(target).resolve()))))
+        return bool(QDesktopServices.openUrl(QUrl.fromUserInput(target)))
+
+    def _open_app_targets(self, targets_text: str, fallback_target: str = "", fallback_text: str = "") -> bool:
+        targets = self._parse_targets(targets_text)
+        if not targets:
+            if fallback_target.strip():
+                targets = [fallback_target.strip()]
+            elif fallback_text.strip():
+                targets = [fallback_text.strip()]
+        opened = False
+        for target in targets:
+            opened = self._open_app_target(target) or opened
+        return opened
+
+    def insert_quick_text(self, index: int) -> None:
+        quick_texts = self._active_quick_texts()
+        if index < 0 or index >= len(quick_texts):
+            return
+        entry = quick_texts[index]
+        if not isinstance(entry, dict):
+            return
+
+        if self._launch_shift_context_script_for_entry(entry):
+            return
+
+        action = self._quick_action_kind(entry)
+        text = str(entry.get("text", ""))
+        target = str(entry.get("open_target", "")).strip()
+        app_targets = str(entry.get("app_targets", "")).strip()
+        urls = str(entry.get("urls", ""))
+        browser_path = str(entry.get("browser_path", "")).strip()
+
+        if action == "open_url":
+            opened = self._open_url_targets(urls, browser_path=browser_path, fallback_target=target, fallback_text=text)
+            if not opened:
+                context = {
+                    "index": int(index),
+                    "title": str(entry.get("title", "")),
+                    "urls": urls,
+                    "browser_path": browser_path,
+                    "fallback_target": target,
+                }
+                _runtime_log_event(
+                    "runtime.quick_action_open_url_failed",
+                    severity="critical",
+                    summary="Quick action failed to open any URL target.",
+                    context=context,
+                )
+                _escalate_runtime_issue_once(
+                    "runtime.quick_action_open_url_failed",
+                    "Quick action could not open the configured URL target(s).",
+                    details="Review the URLs and browser path configured for this quick action.",
+                    context=context,
+                )
+        elif action == "open_app":
+            opened = self._open_app_targets(app_targets, fallback_target=target, fallback_text=text)
+            if not opened:
+                context = {
+                    "index": int(index),
+                    "title": str(entry.get("title", "")),
+                    "app_targets": app_targets,
+                    "fallback_target": target,
+                }
+                _runtime_log_event(
+                    "runtime.quick_action_open_app_failed",
+                    severity="critical",
+                    summary="Quick action failed to open any application or file target.",
+                    context=context,
+                )
+                _escalate_runtime_issue_once(
+                    "runtime.quick_action_open_app_failed",
+                    "Quick action could not open the configured app/file target(s).",
+                    details="Verify the path(s) and launch permissions for this quick action.",
+                    context=context,
+                )
+        elif action in {"input_sequence", "macro_sequence"}:
+            self._execute_macro_sequence(text)
+        else:
+            self._insert_text_payload(text)
+
+    # ------------------------- Theme Screen ------------------------- #
+    def refresh_theme_controls(self) -> None:
+        theme = self.config.get("theme", {})
+        for key in ("primary", "accent", "surface"):
+            value = normalize_hex(theme.get(key, "#FFFFFF"), "#FFFFFF")
+            self.color_swatches[key].setText(value)
+            self.color_swatches[key].setStyleSheet(
+                "QPushButton {"
+                f"background-color: {rgba_css(value, 0.75)};"
+                f"color: {readable_text(value)};"
+                f"border: 1px solid {shift(value, -0.45)};"
+                "font-weight: 700;"
+                "}"
+            )
+
+        presets = self.config.get("theme_presets", {})
+        current = self.config.get("selected_theme_preset")
+        self.theme_preset_combo.blockSignals(True)
+        self.theme_preset_combo.clear()
+        self.theme_preset_combo.addItems(list(presets.keys()))
+        if current in presets:
+            self.theme_preset_combo.setCurrentText(current)
+        self.theme_preset_combo.blockSignals(False)
+        self.theme_transparent_bg_check.blockSignals(True)
+        self.theme_transparent_bg_check.setChecked(not bool(self.config.get("background_tint_enabled", True)))
+        self.theme_transparent_bg_check.blockSignals(False)
+        self.popup_auto_reinherit_check.blockSignals(True)
+        self.popup_auto_reinherit_check.setChecked(bool(self.config.get("popup_auto_reinherit_enabled", True)))
+        self.popup_auto_reinherit_check.blockSignals(False)
+
+        self._refresh_popup_theme_tab("agent")
+        self._refresh_popup_theme_tab("qa")
+        self._refresh_popup_theme_tab("admin")
+        self._refresh_popup_theme_tab("dashboard")
+
+        self._refresh_theme_preview_buttons()
+
+    def pick_theme_color(self, key: str) -> None:
+        current = QColor(self.config.get("theme", {}).get(key, "#FFFFFF"))
+        color = show_flowgrid_themed_color(self, self, "main", f"Pick {key.title()} Color", current)
+        if not color.isValid():
+            return
+        self.config["theme"][key] = normalize_hex(color.name().upper(), self.config["theme"].get(key, "#FFFFFF"))
+        self._theme_updated()
+
+    def _theme_updated(self) -> None:
+        self.palette_data = compute_palette(self.config.get("theme", {}))
+        self.mark_background_dirty()
+        self.apply_theme_styles()
+        self.refresh_theme_controls()
+        self.refresh_all_views()
+        self.queue_save_config()
+        self._refresh_popup_themes()
+
+    def _popup_control_fill_css(self, kind: str, popup_theme: dict[str, Any], field_bg: str) -> str:
+        style = str(popup_theme.get("control_style", "Fade Left to Right") or "Fade Left to Right").strip()
+        if style not in {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}:
+            style = "Fade Left to Right"
+        fade_strength = int(clamp(safe_int(popup_theme.get("control_fade_strength", 65), 65), 0, 100))
+        effective_transparent = self._effective_popup_transparency(kind)
+        base_alpha = float(clamp(safe_int(popup_theme.get("control_opacity", 82), 82), 0, 100)) / 100.0
+        tail_alpha = float(clamp(safe_int(popup_theme.get("control_tail_opacity", 0), 0), 0, 100)) / 100.0
+        base_alpha = max(base_alpha, 0.54 if effective_transparent else 0.34)
+        tail_alpha = max(tail_alpha, 0.28 if effective_transparent else 0.14)
+        if style == "Solid" or fade_strength <= 0:
+            return rgba_css(field_bg, base_alpha)
+
+        computed_end = base_alpha * max(0.0, 1.0 - (fade_strength / 100.0))
+        end_alpha = max(tail_alpha, computed_end)
+        mid_alpha = max(end_alpha, min(1.0, (base_alpha + end_alpha) / 2.0 + 0.04))
+        if style == "Fade Right to Left":
+            return (
+                "qlineargradient(x1:1,y1:0,x2:0,y2:0,"
+                f"stop:0 {rgba_css(field_bg, base_alpha)},"
+                f"stop:0.58 {rgba_css(field_bg, mid_alpha)},"
+                f"stop:1 {rgba_css(field_bg, end_alpha)})"
+            )
+        if style == "Fade Center Out":
+            return (
+                "qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                f"stop:0 {rgba_css(field_bg, end_alpha)},"
+                f"stop:0.5 {rgba_css(field_bg, base_alpha)},"
+                f"stop:1 {rgba_css(field_bg, end_alpha)})"
+            )
+        return (
+            "qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f"stop:0 {rgba_css(field_bg, base_alpha)},"
+            f"stop:0.58 {rgba_css(field_bg, mid_alpha)},"
+            f"stop:1 {rgba_css(field_bg, end_alpha)})"
+        )
+
+    def _materialize_popup_theme_for_edit(self, kind: str) -> dict[str, Any]:
+        """Freeze inherited popup theme values into the kind-specific config before first customization."""
+        key = f"{kind}_theme"
+        theme = self.config.setdefault(key, {})
+        if not isinstance(theme, dict):
+            theme = {}
+            self.config[key] = theme
+
+        base = self._resolved_popup_theme(kind)
+        inherited_mode = bool(theme.get("inherit_main_theme", False) or self._looks_like_unconfigured_popup_theme(theme))
+        if inherited_mode:
+            theme["background"] = normalize_hex(base.get("background", "#FFFFFF"), "#FFFFFF")
+            theme["text"] = normalize_hex(base.get("text", "#000000"), "#000000")
+            theme["field_bg"] = normalize_hex(base.get("field_bg", "#FFFFFF"), "#FFFFFF")
+            inherited_layers = base.get("image_layers", [])
+            theme["image_layers"] = [
+                safe_layer_defaults(layer) for layer in inherited_layers if isinstance(layer, dict)
+            ]
+        else:
+            theme["background"] = normalize_hex(theme.get("background", base["background"]), base["background"])
+            theme["text"] = normalize_hex(theme.get("text", base["text"]), base["text"])
+            theme["field_bg"] = normalize_hex(theme.get("field_bg", base["field_bg"]), base["field_bg"])
+
+            raw_layers = theme.get("image_layers")
+            if isinstance(raw_layers, list):
+                cleaned_layers: list[dict[str, Any]] = []
+                for layer in raw_layers:
+                    if isinstance(layer, dict):
+                        cleaned_layers.append(safe_layer_defaults(layer))
+                theme["image_layers"] = cleaned_layers
+            else:
+                inherited_layers = base.get("image_layers", [])
+                theme["image_layers"] = [
+                    safe_layer_defaults(layer) for layer in inherited_layers if isinstance(layer, dict)
+                ]
+        return theme
+
+    def _popup_theme_stylesheet(self, kind: str, force_opaque_root: bool = False) -> str:
+        theme = self._resolved_popup_theme(kind)
+        compact_mode = bool(self.config.get("compact_mode", True))
+        tab_padding = "2px 8px" if compact_mode else "4px 10px"
+        field_padding = "1px 5px" if compact_mode else "2px 6px"
+        header_padding = "3px 5px" if compact_mode else "4px 6px"
+        button_padding = "1px 7px" if compact_mode else "2px 8px"
+        check_indicator_px = 12 if compact_mode else 14
+        effective_transparent = self._effective_popup_transparency(kind)
+        bg = normalize_hex(theme.get("background", self.palette_data["surface"]), self.palette_data["surface"])
+        text = normalize_hex(theme.get("text", self.palette_data["label_text"]), self.palette_data["label_text"])
+        field_bg = normalize_hex(theme.get("field_bg", self.palette_data["input_bg"]), self.palette_data["input_bg"])
+        field_fill = self._popup_control_fill_css(kind, theme, field_bg)
+        field_border = shift(field_bg, -0.38)
+        selection_bg = self.palette_data["accent"]
+        selection_text = readable_text(selection_bg)
+        row_selected_bg = normalize_hex(theme.get("row_selected_color", selection_bg), selection_bg)
+        row_selected_text = readable_text(row_selected_bg)
+        hover_bg = normalize_hex(theme.get("row_hover_color", ""), "")
+        if not hover_bg:
+            hover_bg = blend(row_selected_bg, field_bg, 0.55)
+        hover_text = readable_text(hover_bg)
+        header_bg = normalize_hex(theme.get("header_color", ""), "")
+        if not header_bg:
+            header_bg = blend(field_bg, bg, 0.25)
+        button_bg = blend(self.palette_data["button_bg"], field_bg, 0.30)
+        button_hover = shift(button_bg, 0.08)
+        button_pressed = shift(button_bg, -0.08)
+        button_text = readable_text(button_bg)
+        button_border = shift(button_bg, -0.40)
+        save_bg = blend(selection_bg, button_bg, 0.50)
+        save_border = shift(save_bg, -0.40)
+        save_text = readable_text(save_bg)
+        pick_bg = blend(button_bg, field_bg, 0.25)
+        pick_border = shift(pick_bg, -0.38)
+        pick_text = readable_text(pick_bg)
+        reset_bg = blend("#BE4E4E", button_bg, 0.45)
+        reset_border = shift(reset_bg, -0.42)
+        reset_text = readable_text(reset_bg)
+        new_bg = blend(self.palette_data["primary"], button_bg, 0.45)
+        new_border = shift(new_bg, -0.40)
+        new_text = readable_text(new_bg)
+        button_bg_css = rgba_css(button_bg, 0.78)
+        button_hover_css = rgba_css(button_hover, 0.90)
+        button_pressed_css = rgba_css(button_pressed, 0.92)
+        save_bg_css = rgba_css(save_bg, 0.82)
+        new_bg_css = rgba_css(new_bg, 0.82)
+        pick_bg_css = rgba_css(pick_bg, 0.82)
+        reset_bg_css = rgba_css(reset_bg, 0.82)
+        title_badge_bg = rgba_css(blend(header_bg, bg, 0.18), 0.82 if effective_transparent else 0.62)
+        title_badge_border = rgba_css(shift(header_bg, -0.38), 0.90)
+        checkbox_fill = rgba_css(blend(field_bg, bg, 0.16), 0.88 if effective_transparent else 0.94)
+        checkbox_fill_checked = rgba_css(blend(selection_bg, field_bg, 0.20), 0.96)
+        checkbox_fill_disabled = rgba_css(field_bg, 0.58)
+        checkbox_border = shift(field_bg, -0.46)
+        requested_transparent = bool(theme.get("transparent", False))
+        if force_opaque_root:
+            root_bg = bg
+        elif effective_transparent:
+            root_bg = "transparent"
+        elif requested_transparent:
+            root_bg = rgba_css(bg, 0.05)
+        else:
+            root_bg = bg
+        tab_bg = "transparent"
+        tab_hover = rgba_css(selection_bg, 0.26)
+        tab_selected_bg = rgba_css(selection_bg, 0.34)
+        tab_pane_bg = "transparent"
+        root_selector = "QDialog"
+        container_transparent_css = (
+            "QWidget, QFrame, QGroupBox, QScrollArea, QTabWidget, QStackedWidget {"
+            "background-color: transparent;"
+            "}"
+        )
+        return (
+            f"{root_selector} {{"
+            f"background-color: {root_bg};"
+            f"color: {text};"
+            "}"
+            "QLabel {"
+            "background-color: transparent;"
+            f"color: {text};"
+            "font-weight: 700;"
+            "}"
+            f"QLabel[section='true'] {{ background-color: {title_badge_bg}; border: 1px solid {title_badge_border}; border-radius: 7px; padding: 2px 8px; }}"
+            + container_transparent_css
+            + (
+            "QTabWidget::pane {"
+            f"background-color: {tab_pane_bg};"
+            f"border: 1px solid {field_border};"
+            "border-radius: 4px;"
+            "}"
+            "QTabBar::tab {"
+            f"background-color: {tab_bg};"
+            f"color: {text};"
+            f"border: 1px solid {field_border};"
+            f"padding: {tab_padding};"
+            "border-top-left-radius: 4px;"
+            "border-top-right-radius: 4px;"
+            "margin-right: 2px;"
+            "}"
+            "QTabBar::tab:selected {"
+            f"background-color: {tab_selected_bg};"
+            f"color: {selection_text};"
+            "}"
+            "QTabBar::tab:hover {"
+            f"background-color: {tab_hover};"
+            f"color: {selection_text};"
+            "}"
+            "QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDateEdit, QComboBox, QListWidget, QTableWidget, QListView, QTreeView {"
+            f"background: {field_fill};"
+            f"color: {text};"
+            f"border: 1px solid {field_border};"
+            "border-radius: 4px;"
+            f"padding: {field_padding};"
+            f"selection-background-color: {selection_bg};"
+            f"selection-color: {selection_text};"
+            "}"
+            f"QCheckBox::indicator {{ width: {check_indicator_px}px; height: {check_indicator_px}px; border-radius: 3px; background: {checkbox_fill}; border: 1px solid {checkbox_border}; }}"
+            f"QCheckBox::indicator:checked {{ background: {checkbox_fill_checked}; border: 1px solid {shift(selection_bg, -0.42)}; }}"
+            f"QCheckBox::indicator:disabled {{ background: {checkbox_fill_disabled}; border: 1px solid {shift(checkbox_border, 0.08)}; }}"
+            "QTableWidget, QListView, QTreeView {"
+            "gridline-color: "
+            f"{shift(field_border, -0.10)};"
+            "alternate-background-color: transparent;"
+            "}"
+            "QHeaderView::section {"
+            f"background-color: {header_bg};"
+            f"color: {text};"
+            f"border: 1px solid {field_border};"
+            f"padding: {header_padding};"
+            "font-weight: 700;"
+            "}"
+            "QComboBox QAbstractItemView {"
+            f"background: {field_fill};"
+            f"color: {text};"
+            f"border: 1px solid {field_border};"
+            f"selection-background-color: {row_selected_bg};"
+            f"selection-color: {row_selected_text};"
+            "}"
+            "QListWidget::item, QTableWidget::item, QListView::item, QTreeView::item, QComboBox QAbstractItemView::item {"
+            "background-color: transparent;"
+            "}"
+            "QListWidget::item:hover, QTableWidget::item:hover, QListView::item:hover, QTreeView::item:hover, QComboBox QAbstractItemView::item:hover {"
+            f"background-color: {hover_bg};"
+            f"color: {hover_text};"
+            "}"
+            "QListWidget::item:selected, QTableWidget::item:selected, QListView::item:selected, QTreeView::item:selected, QComboBox QAbstractItemView::item:selected {"
+            f"background-color: {row_selected_bg};"
+            f"color: {row_selected_text};"
+            "}"
+            "QPushButton {"
+            f"background-color: {button_bg_css};"
+            f"color: {button_text};"
+            f"border: 1px solid {button_border};"
+            "border-radius: 4px;"
+            f"padding: {button_padding};"
+            "}"
+            "QPushButton#DepotFramelessCloseButton {"
+            "background-color: rgba(225,80,80,110);"
+            "border: 1px solid rgba(255,135,135,175);"
+            "border-radius: 11px;"
+            f"color: {readable_text('#E15050')};"
+            "font-size: 12px;"
+            "font-weight: 800;"
+            "padding: 0px;"
+            "}"
+            "QPushButton#DepotFramelessCloseButton:hover {"
+            "background-color: rgba(235,95,95,155);"
+            "}"
+            "QPushButton#DepotFramelessCloseButton:pressed {"
+            "background-color: rgba(198,74,74,178);"
+            "}"
+            "QPushButton:hover {"
+            f"background-color: {button_hover_css};"
+            "}"
+            "QPushButton:pressed {"
+            f"background-color: {button_pressed_css};"
+            "}"
+            "QPushButton[actionRole='save'] {"
+            f"background-color: {save_bg_css};"
+            f"color: {save_text};"
+            f"border: 1px solid {save_border};"
+            "}"
+            "QPushButton[actionRole='new'] {"
+            f"background-color: {new_bg_css};"
+            f"color: {new_text};"
+            f"border: 1px solid {new_border};"
+            "}"
+            "QPushButton[actionRole='pick'] {"
+            f"background-color: {pick_bg_css};"
+            f"color: {pick_text};"
+            f"border: 1px solid {pick_border};"
+            "}"
+            "QPushButton[actionRole='reset'] {"
+            f"background-color: {reset_bg_css};"
+            f"color: {reset_text};"
+            f"border: 1px solid {reset_border};"
+            "}"
+            )
+        )
+
+    def _select_popup_color(self, kind: str, field: str) -> None:
+        current = QColor(self._resolved_popup_theme(kind).get(field, "#FFFFFF"))
+        color = show_flowgrid_themed_color(self, self, kind, f"Pick {kind.title()} {field.title()} Color", current)
+        if not color.isValid():
+            return
+        theme = self._materialize_popup_theme_for_edit(kind)
+        theme[field] = normalize_hex(color.name().upper(), theme.get(field, "#FFFFFF"))
+        theme["inherit_main_theme"] = False
+        self.queue_save_config()
+        self._refresh_popup_themes()
+
+    def _pick_popup_theme_color(self, kind: str, field: str) -> None:
+        current = QColor(self._resolved_popup_theme(kind).get(field, "#FFFFFF"))
+        color = show_flowgrid_themed_color(self, self, kind, f"Pick {kind.title()} {field.title()} Color", current)
+        if not color.isValid():
+            return
+        theme = self._materialize_popup_theme_for_edit(kind)
+        theme[field] = normalize_hex(color.name().upper(), theme.get(field, "#FFFFFF"))
+        theme["inherit_main_theme"] = False
+        self._refresh_popup_theme_tab(kind)
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def _popup_optional_default_color(self, kind: str, field: str) -> str:
+        theme = self._resolved_popup_theme(kind)
+        field_bg = normalize_hex(theme.get("field_bg", self.palette_data.get("input_bg", "#FFFFFF")), "#FFFFFF")
+        selected = normalize_hex(
+            theme.get("row_selected_color", self.palette_data.get("accent", DEFAULT_THEME_ACCENT)),
+            DEFAULT_THEME_ACCENT,
+        )
+        if field == "header_color":
+            return blend(
+                field_bg,
+                normalize_hex(theme.get("background", self.palette_data.get("surface", DEFAULT_THEME_SURFACE)), DEFAULT_THEME_SURFACE),
+                0.25,
+            )
+        if field == "row_hover_color":
+            return blend(selected, field_bg, 0.55)
+        if field == "row_selected_color":
+            return selected
+        return field_bg
+
+    def _pick_popup_optional_color(self, kind: str, field: str) -> None:
+        theme = self._materialize_popup_theme_for_edit(kind)
+        current_hex = normalize_hex(theme.get(field, ""), "")
+        if not current_hex:
+            current_hex = self._popup_optional_default_color(kind, field)
+        color = show_flowgrid_themed_color(
+            self,
+            self,
+            kind,
+            f"Pick {kind.title()} {field.replace('_', ' ').title()} Color",
+            QColor(current_hex),
+        )
+        if not color.isValid():
+            return
+        theme[field] = normalize_hex(color.name().upper(), "")
+        theme["inherit_main_theme"] = False
+        self._refresh_popup_theme_tab(kind)
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def _clear_popup_optional_color(self, kind: str, field: str) -> None:
+        theme = self._materialize_popup_theme_for_edit(kind)
+        theme[field] = ""
+        theme["inherit_main_theme"] = False
+        self._refresh_popup_theme_tab(kind)
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def on_popup_theme_control_changed(self, kind: str) -> None:
+        theme = self._materialize_popup_theme_for_edit(kind)
+        style_combo = getattr(self, f"{kind}_control_style_combo", None)
+        fade_slider = getattr(self, f"{kind}_control_fade_slider", None)
+        opacity_slider = getattr(self, f"{kind}_control_opacity_slider", None)
+        tail_slider = getattr(self, f"{kind}_control_tail_opacity_slider", None)
+        if style_combo is None or fade_slider is None or opacity_slider is None or tail_slider is None:
+            return
+        style = str(style_combo.currentText() or "Fade Left to Right").strip()
+        if style not in {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}:
+            style = "Fade Left to Right"
+        theme["control_style"] = style
+        theme["control_fade_strength"] = int(clamp(int(fade_slider.value()), 0, 100))
+        theme["control_opacity"] = int(clamp(int(opacity_slider.value()), 0, 100))
+        theme["control_tail_opacity"] = int(clamp(int(tail_slider.value()), 0, 100))
+        theme["inherit_main_theme"] = False
+
+        fade_value = getattr(self, f"{kind}_control_fade_value", None)
+        if fade_value is not None:
+            fade_value.setText(f"{int(theme['control_fade_strength'])}%")
+        opacity_value = getattr(self, f"{kind}_control_opacity_value", None)
+        if opacity_value is not None:
+            opacity_value.setText(f"{int(theme['control_opacity'])}%")
+        tail_value = getattr(self, f"{kind}_control_tail_opacity_value", None)
+        if tail_value is not None:
+            tail_value.setText(f"{int(theme['control_tail_opacity'])}%")
+
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def _refresh_popup_themes(self) -> None:
+        if hasattr(self, "active_agent_window") and self.active_agent_window is not None:
+            self.active_agent_window.apply_theme_styles()
+        if hasattr(self, "active_qa_window") and self.active_qa_window is not None:
+            self.active_qa_window.apply_theme_styles()
+        if hasattr(self, "admin_dialog") and self.admin_dialog is not None:
+            self.admin_dialog.apply_theme_styles()
+        if hasattr(self, "depot_dashboard_dialog") and self.depot_dashboard_dialog is not None:
+            self.depot_dashboard_dialog.apply_theme_styles()
+
+    def on_popup_theme_preset_selected(self, kind: str, name: str) -> None:
+        preset_name = str(name or "").strip()
+        if not preset_name:
+            return
+        presets = self.config.get("theme_presets", {})
+        preset = presets.get(preset_name)
+        if not isinstance(preset, dict):
+            return
+        primary = normalize_hex(str(preset.get("primary", DEFAULT_THEME_PRIMARY)), DEFAULT_THEME_PRIMARY)
+        accent = normalize_hex(str(preset.get("accent", DEFAULT_THEME_ACCENT)), DEFAULT_THEME_ACCENT)
+        surface = normalize_hex(str(preset.get("surface", DEFAULT_THEME_SURFACE)), DEFAULT_THEME_SURFACE)
+        popup_palette = compute_palette({"primary": primary, "accent": accent, "surface": surface})
+        theme = self.config.setdefault(f"{kind}_theme", {})
+        theme["background"] = normalize_hex(popup_palette.get("control_bg", surface), surface)
+        theme["text"] = normalize_hex(popup_palette.get("label_text", readable_text(surface)), readable_text(surface))
+        theme["field_bg"] = normalize_hex(
+            popup_palette.get("input_bg", blend(surface, primary, 0.18)),
+            blend(surface, primary, 0.18),
+        )
+        theme["inherit_main_theme"] = False
+        self.config[f"{kind}_selected_theme_preset"] = preset_name
+        self._refresh_popup_theme_tab(kind)
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def _refresh_popup_theme_tab(self, kind: str) -> None:
+        swatches_key = f"{kind}_color_swatches"
+        if not hasattr(self, swatches_key):
+            return
+        color_swatches = getattr(self, swatches_key)
+        theme = self._resolved_popup_theme(kind)
+        config_key = self._popup_window_on_top_config_key(kind)
+
+        preset_combo = getattr(self, f"{kind}_theme_preset_combo", None)
+        if preset_combo is not None:
+            presets = self.config.get("theme_presets", {})
+            selected = str(self.config.get(f"{kind}_selected_theme_preset", "") or "").strip()
+            if not selected:
+                selected = str(self.config.get("selected_theme_preset", "") or "").strip()
+            preset_combo.blockSignals(True)
+            preset_combo.clear()
+            preset_combo.addItems(list(presets.keys()))
+            if selected in presets:
+                preset_combo.setCurrentText(selected)
+            elif preset_combo.count() > 0:
+                preset_combo.setCurrentIndex(0)
+            preset_combo.blockSignals(False)
+
+        for fld, swatch in color_swatches.items():
+            value = normalize_hex(theme.get(fld, "#FFFFFF"), "#FFFFFF")
+            swatch.setText(value)
+            swatch.setStyleSheet(
+                "QPushButton {"
+                f"background-color: {rgba_css(value, 0.75)};"
+                f"color: {readable_text(value)};"
+                f"border: 1px solid {shift(value, -0.45)};"
+                "font-weight: 700;"
+                "}"
+            )
+
+        transparent_check_key = f"{kind}_transparent_bg_check"
+        if hasattr(self, transparent_check_key):
+            transparent_check = getattr(self, transparent_check_key)
+            transparent_check.blockSignals(True)
+            transparent_check.setChecked(bool(theme.get("transparent", False)))
+            transparent_check.blockSignals(False)
+
+        always_on_top_check = getattr(self, f"{kind}_window_always_on_top_check", None)
+        if always_on_top_check is not None:
+            default_on_top = kind in {"agent", "qa"}
+            always_on_top_check.blockSignals(True)
+            always_on_top_check.setChecked(bool(self.config.get(config_key, default_on_top)))
+            always_on_top_check.blockSignals(False)
+
+        style_combo = getattr(self, f"{kind}_control_style_combo", None)
+        if style_combo is not None:
+            style_combo.blockSignals(True)
+            style_value = str(theme.get("control_style", "Fade Left to Right") or "Fade Left to Right")
+            style_idx = style_combo.findText(style_value)
+            style_combo.setCurrentIndex(style_idx if style_idx >= 0 else 1)
+            style_combo.blockSignals(False)
+
+        fade_slider = getattr(self, f"{kind}_control_fade_slider", None)
+        fade_value = getattr(self, f"{kind}_control_fade_value", None)
+        if fade_slider is not None:
+            fade_slider.blockSignals(True)
+            fade_num = int(clamp(int(theme.get("control_fade_strength", 65)), 0, 100))
+            fade_slider.setValue(fade_num)
+            fade_slider.blockSignals(False)
+            if fade_value is not None:
+                fade_value.setText(f"{fade_num}%")
+
+        opacity_slider = getattr(self, f"{kind}_control_opacity_slider", None)
+        opacity_value = getattr(self, f"{kind}_control_opacity_value", None)
+        if opacity_slider is not None:
+            opacity_slider.blockSignals(True)
+            opacity_num = int(clamp(int(theme.get("control_opacity", 82)), 0, 100))
+            opacity_slider.setValue(opacity_num)
+            opacity_slider.blockSignals(False)
+            if opacity_value is not None:
+                opacity_value.setText(f"{opacity_num}%")
+
+        tail_slider = getattr(self, f"{kind}_control_tail_opacity_slider", None)
+        tail_value = getattr(self, f"{kind}_control_tail_opacity_value", None)
+        if tail_slider is not None:
+            tail_slider.blockSignals(True)
+            tail_num = int(clamp(int(theme.get("control_tail_opacity", 0)), 0, 100))
+            tail_slider.setValue(tail_num)
+            tail_slider.blockSignals(False)
+            if tail_value is not None:
+                tail_value.setText(f"{tail_num}%")
+
+        optional_swatches_key = f"{kind}_optional_color_swatches"
+        if hasattr(self, optional_swatches_key):
+            optional_swatches = getattr(self, optional_swatches_key)
+            for field, swatch in optional_swatches.items():
+                raw_value = normalize_hex(theme.get(field, ""), "")
+                color_value = raw_value or self._popup_optional_default_color(kind, field)
+                label = raw_value if raw_value else f"Auto ({color_value})"
+                swatch.setText(label)
+                swatch.setStyleSheet(
+                    "QPushButton {"
+                    f"background-color: {rgba_css(color_value, 0.75)};"
+                    f"color: {readable_text(color_value)};"
+                    f"border: 1px solid {shift(color_value, -0.45)};"
+                    "font-weight: 700;"
+                    "}"
+                )
+
+    def on_theme_page_background_option_changed(self, checked: bool) -> None:
+        self.config["background_tint_enabled"] = not bool(checked)
+        self.refresh_settings_controls()
+        self.refresh_all_views()
+        self.queue_save_config()
+
+    def on_popup_auto_reinherit_changed(self, checked: bool) -> None:
+        enabled = bool(checked)
+        self.config["popup_auto_reinherit_enabled"] = enabled
+        if enabled:
+            repaired = self._auto_reinherit_popup_defaults()
+            if repaired:
+                self.mark_background_dirty()
+                self.refresh_theme_controls()
+                self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def on_popup_background_option_changed(self, kind: str, checked: bool) -> None:
+        theme = self._materialize_popup_theme_for_edit(kind)
+        theme["inherit_main_theme"] = False
+        theme["transparent"] = bool(checked)
+        self._refresh_popup_themes()
+        self.queue_save_config()
+
+    def on_popup_window_always_on_top_changed(self, kind: str, checked: bool) -> None:
+        self._apply_popup_window_on_top_preference(kind, checked)
+        self.queue_save_config()
+
+    def reset_theme(self) -> None:
+        selected = self.config.get("selected_theme_preset")
+        presets = self.config.get("theme_presets", {})
+        fallback = presets.get(selected) or next(iter(presets.values()))
+        self.config["theme"] = deep_clone(fallback)
+        self._theme_updated()
+
+    def on_theme_preset_selected(self, name: str) -> None:
+        if not name:
+            return
+        preset = self.config.get("theme_presets", {}).get(name)
+        if not preset:
+            return
+        self.config["selected_theme_preset"] = name
+        self.config["theme"] = deep_clone(preset)
+        self._theme_updated()
+
+    def create_theme_preset(self) -> None:
+        name = f"Preset {len(self.config.get('theme_presets', {})) + 1}"
+        base = name
+        suffix = 1
+        while name in self.config["theme_presets"]:
+            suffix += 1
+            name = f"{base} {suffix}"
+        self.config["theme_presets"][name] = deep_clone(self.config["theme"])
+        self.config["selected_theme_preset"] = name
+        self.refresh_theme_controls()
+        self.queue_save_config()
+
+    def save_theme_preset(self) -> None:
+        name = self.theme_preset_combo.currentText().strip()
+        if not name:
+            return
+        self.config["theme_presets"][name] = deep_clone(self.config["theme"])
+        self.config["selected_theme_preset"] = name
+        self.refresh_theme_controls()
+        self.queue_save_config()
+
+    def open_image_layers_dialog(self, kind: str | bool = "main") -> None:
+        if isinstance(kind, bool):
+            kind = "main"
+        if not isinstance(kind, str):
+            kind = "main"
+        kind = kind.strip().lower()
+        if kind not in {"main", "agent", "qa", "admin", "dashboard"}:
+            kind = "main"
+
+        if kind == "main":
+            if self.image_dialog is None:
+                self.image_dialog = ImageLayersDialog(self, kind="main")
+
+            popup_pos = self.config.get("popup_positions", {}).get("image_layers")
+            if isinstance(popup_pos, dict) and "x" in popup_pos and "y" in popup_pos and not self.image_dialog.isVisible():
+                self.image_dialog.move(int(popup_pos["x"]), int(popup_pos["y"]))
+
+            self.image_dialog.refresh_list()
+            self.image_dialog.apply_theme_styles()
+            self.image_dialog.show()
+            self.image_dialog.raise_()
+            self.image_dialog.activateWindow()
+        else:
+            # Popup dialogs (agent, qa, admin, dashboard)
+            dialog_key = f"{kind}_image_dialog"
+            if not hasattr(self, dialog_key):
+                setattr(self, dialog_key, ImageLayersDialog(self, kind=kind))
+            dialog = getattr(self, dialog_key)
+
+            popup_pos = self.config.get("popup_positions", {}).get(f"image_layers_{kind}")
+            if isinstance(popup_pos, dict) and "x" in popup_pos and "y" in popup_pos and not dialog.isVisible():
+                dialog.move(int(popup_pos["x"]), int(popup_pos["y"]))
+
+            dialog.refresh_list()
+            dialog.apply_theme_styles()
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+
+    def open_quick_layout_dialog(self) -> None:
+        self._reveal_immediately()
+        if self.quick_layout_dialog is None:
+            self.quick_layout_dialog = QuickLayoutDialog(self)
+
+        popup_pos = self.config.get("popup_positions", {}).get("quick_layout")
+        if isinstance(popup_pos, dict) and "x" in popup_pos and "y" in popup_pos and not self.quick_layout_dialog.isVisible():
+            self.quick_layout_dialog.move(int(popup_pos["x"]), int(popup_pos["y"]))
+
+        self.quick_layout_dialog.apply_theme_styles()
+        self.quick_layout_dialog.refresh_cards()
+        self.quick_layout_dialog.show()
+        self.quick_layout_dialog.raise_()
+        self.quick_layout_dialog.activateWindow()
+
+    # ----------------------- Settings Screen ------------------------ #
+    def refresh_settings_controls(self) -> None:
+        self.opacity_slider.blockSignals(True)
+        self.hover_delay_slider.blockSignals(True)
+        self.hover_fade_in_slider.blockSignals(True)
+        self.hover_fade_out_slider.blockSignals(True)
+        self.always_on_top_check.blockSignals(True)
+        self.compact_mode_check.blockSignals(True)
+        self.sidebar_right_switch.blockSignals(True)
+
+        opacity = float(clamp(float(self.config.get("window_opacity", 1.0)), 0.0, 1.0))
+        self.opacity_slider.setValue(int(opacity * 100))
+        self.opacity_value.setText(f"{opacity:.2f}")
+        delay_s = int(clamp(int(self.config.get("hover_reveal_delay_s", 5)), 0, 10))
+        fade_in_s = int(clamp(int(self.config.get("hover_fade_in_s", 5)), 0, 10))
+        fade_out_s = int(clamp(int(self.config.get("hover_fade_out_s", 5)), 0, 10))
+        self.hover_delay_slider.setValue(delay_s)
+        self.hover_fade_in_slider.setValue(fade_in_s)
+        self.hover_fade_out_slider.setValue(fade_out_s)
+        self.hover_delay_value.setText(f"{delay_s}s")
+        self.hover_fade_in_value.setText(f"{fade_in_s}s")
+        self.hover_fade_out_value.setText(f"{fade_out_s}s")
+        self.always_on_top_check.setChecked(bool(self.config.get("always_on_top", False)))
+        self.compact_mode_check.setChecked(bool(self.config.get("compact_mode", True)))
+        self.sidebar_right_switch.setChecked(bool(self.config.get("sidebar_on_right", False)))
+
+        self.opacity_slider.blockSignals(False)
+        self.hover_delay_slider.blockSignals(False)
+        self.hover_fade_in_slider.blockSignals(False)
+        self.hover_fade_out_slider.blockSignals(False)
+        self.always_on_top_check.blockSignals(False)
+        self.compact_mode_check.blockSignals(False)
+        self.sidebar_right_switch.blockSignals(False)
+        self._refresh_sidebar_switch_caption()
+
+    def on_settings_changed(self) -> None:
+        self.config["always_on_top"] = bool(self.always_on_top_check.isChecked())
+        self.config["compact_mode"] = bool(self.compact_mode_check.isChecked())
+        self._apply_window_flags()
+        self.apply_theme_styles()
+        self.refresh_all_views()
+        self.queue_save_config()
+
+    def on_sidebar_position_changed(self, checked: bool) -> None:
+        self.config["sidebar_on_right"] = bool(checked)
+        self._refresh_sidebar_switch_caption()
+        self._apply_sidebar_position()
+        self.refresh_all_views()
+        self.queue_save_config()
+
+    def _refresh_sidebar_switch_caption(self) -> None:
+        is_right = bool(self.sidebar_right_switch.isChecked())
+        if hasattr(self, "sidebar_switch_status"):
+            self.sidebar_switch_status.setText("Sidebar position: Right" if is_right else "Sidebar position: Left")
+        if hasattr(self, "sidebar_left_label"):
+            self.sidebar_left_label.setStyleSheet("font-weight: 800;" if not is_right else "font-weight: 500;")
+        if hasattr(self, "sidebar_right_label"):
+            self.sidebar_right_label.setStyleSheet("font-weight: 800;" if is_right else "font-weight: 500;")
+
+    def on_hover_settings_changed(self) -> None:
+        self.config["hover_reveal_delay_s"] = int(self.hover_delay_slider.value())
+        self.config["hover_fade_in_s"] = int(self.hover_fade_in_slider.value())
+        self.config["hover_fade_out_s"] = int(self.hover_fade_out_slider.value())
+        self.hover_delay_value.setText(f"{self.config['hover_reveal_delay_s']}s")
+        self.hover_fade_in_value.setText(f"{self.config['hover_fade_in_s']}s")
+        self.hover_fade_out_value.setText(f"{self.config['hover_fade_out_s']}s")
+        if not self._hover_inside:
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
+        self.queue_save_config()
+
+    def _base_opacity(self) -> float:
+        return float(clamp(float(self.config.get("window_opacity", 1.0)), 0.0, 1.0))
+
+    def _hover_delay_ms(self) -> int:
+        return int(clamp(int(self.config.get("hover_reveal_delay_s", 5)), 0, 10) * 1000)
+
+    def _hover_fade_in_ms(self) -> int:
+        return int(clamp(int(self.config.get("hover_fade_in_s", 5)), 0, 10) * 1000)
+
+    def _hover_fade_out_ms(self) -> int:
+        return int(clamp(int(self.config.get("hover_fade_out_s", 5)), 0, 10) * 1000)
+
+    def _start_opacity_animation(self, target_opacity: float, duration_ms: int) -> None:
+        target = float(clamp(target_opacity, 0.0, 1.0))
+        self._ui_opacity_anim.stop()
+        if duration_ms <= 0:
+            self._set_ui_opacity(target)
+            return
+        self._ui_opacity_anim.setDuration(duration_ms)
+        self._ui_opacity_anim.setStartValue(self._ui_opacity_current)
+        self._ui_opacity_anim.setEndValue(target)
+        self._ui_opacity_anim.start()
+
+    def _on_hover_delay_elapsed(self) -> None:
+        if not self._hover_inside:
+            return
+        if self._base_opacity() >= 0.999:
+            return
+        self._hover_revealed = True
+        self._start_opacity_animation(1.0, self._hover_fade_in_ms())
+
+    def on_opacity_changed(self, slider_value: int) -> None:
+        opacity = clamp(slider_value / 100.0, 0.0, 1.0)
+        self.config["window_opacity"] = opacity
+        self.opacity_value.setText(f"{opacity:.2f}")
+        if self._hover_revealed:
+            self._set_ui_opacity(1.0)
+        else:
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
+        self.queue_save_config()
+
+    def _apply_window_flags(self) -> None:
+        self.setWindowOpacity(1.0)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, bool(self.config.get("always_on_top", False)))
+        self.show()
+        if self._hover_revealed:
+            self._set_ui_opacity(1.0)
+        else:
+            self._set_ui_opacity(self._effective_shell_idle_opacity())
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Resize:
+            try:
+                if watched in [scroll.viewport() for scroll in self.quick_tab_scrolls]:
+                    self.refresh_quick_grid()
+                    return False
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.event_filter_resize_handler_failed",
+                    severity="warning",
+                    summary="Resize event filter handling failed; continuing with default event processing.",
+                    exc=exc,
+                    context={"watched": repr(watched)},
+                )
+        if isinstance(watched, QWidget) and watched is not None and (watched is self or self.isAncestorOf(watched)):
+            if event.type() == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                self._reveal_immediately()
+                if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(watched):
+                    self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                    self.move(event.globalPosition().toPoint() - self._drag_offset)
+                    event.accept()
+                    return True
+            elif event.type() == QEvent.Type.MouseButtonRelease and self._drag_offset is not None:
+                self._drag_offset = None
+                if isinstance(event, QMouseEvent):
+                    event.accept()
+                    return True
+        return super().eventFilter(watched, event)
+
+    # ---------------------- Icon / Titlebar ------------------------- #
+    def pick_custom_icon(self) -> None:
+        icon_path, _ = show_flowgrid_themed_open_file_name(
+            self,
+            self,
+            "main",
+            "Select Window Icon",
+            str(Path.home()),
+            "Images (*.png *.ico *.jpg *.jpeg *.bmp *.webp);;All Files (*.*)",
+        )
+        if not icon_path:
+            return
+        self.config["app_icon_path"] = icon_path
+        self.apply_window_icon()
+        self._sync_desktop_shortcut_after_icon_change()
+        self.queue_save_config()
+
+    def clear_custom_icon(self) -> None:
+        self.config["app_icon_path"] = ""
+        self.apply_window_icon()
+        self._sync_desktop_shortcut_after_icon_change()
+        self.queue_save_config()
+
+    def _build_smoothed_icon(self, icon_path: str) -> QIcon:
+        return _build_smoothed_qicon(icon_path)
+
+    def _sync_desktop_shortcut_after_icon_change(self) -> None:
+        status, detail = _sync_desktop_shortcut(self.config, create_if_missing=False)
+        if status == "failed":
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Shortcut Update Failed",
+                f"{detail}\n\nSee the runtime log for additional diagnostics.",
+            )
+
+    def apply_window_icon(self) -> None:
+        icon_source = _resolve_active_app_icon_path(self.config)
+        icon = self._build_smoothed_icon(str(icon_source)) if icon_source is not None else QIcon()
+        if icon.isNull():
+            icon = QApplication.style().standardIcon(QApplication.style().StandardPixmap.SP_DesktopIcon)
+        self.setWindowIcon(icon)
+        app = QApplication.instance()
+        if app is not None:
+            app.setWindowIcon(icon)
+        self.titlebar.update_icon(icon)
+
+    # ------------------------- Window events ------------------------ #
+    def _apply_window_mask(self) -> None:
+        if self.width() <= 0 or self.height() <= 0:
+            return
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()), self._corner_radius, self._corner_radius)
+        self.setMask(QRegion(path.toFillPolygon().toPolygon()))
+
+    def _restore_window_position(self) -> None:
+        pos = self.config.get("window_position")
+        if isinstance(pos, dict) and "x" in pos and "y" in pos:
+            x = safe_int(pos.get("x", 0), 0)
+            y = safe_int(pos.get("y", 0), 0)
+            win_w = max(120, int(self.width()))
+            win_h = max(120, int(self.height()))
+            target_rect = QRect(int(x), int(y), win_w, win_h)
+
+            screens = QGuiApplication.screens()
+            visible_geometry: QRect | None = None
+            for screen in screens:
+                try:
+                    geometry = screen.availableGeometry()
+                except Exception as exc:
+                    _runtime_log_event(
+                        "ui.restore_window_screen_geometry_failed",
+                        severity="warning",
+                        summary="Failed reading screen geometry while restoring window position; checking next screen.",
+                        exc=exc,
+                    )
+                    continue
+                if geometry.intersects(target_rect):
+                    visible_geometry = geometry
+                    break
+
+            if visible_geometry is None:
+                primary = QGuiApplication.primaryScreen()
+                if primary is not None:
+                    geometry = primary.availableGeometry()
+                    x = int(geometry.left() + max(0, (geometry.width() - win_w) / 2))
+                    y = int(geometry.top() + max(0, (geometry.height() - win_h) / 2))
+                    self.config["window_position"] = {"x": x, "y": y}
+                    self.queue_save_config()
+                self.move(int(x), int(y))
+                return
+
+            max_x = int(visible_geometry.right() - win_w + 1)
+            max_y = int(visible_geometry.bottom() - win_h + 1)
+            clamped_x = int(clamp(x, visible_geometry.left(), max_x))
+            clamped_y = int(clamp(y, visible_geometry.top(), max_y))
+            if clamped_x != x or clamped_y != y:
+                self.config["window_position"] = {"x": clamped_x, "y": clamped_y}
+                self.queue_save_config()
+            self.move(clamped_x, clamped_y)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        target = _drag_target_widget(self, event.position().toPoint())
+        if event.button() == Qt.MouseButton.LeftButton and not _is_drag_blocked_widget(target):
+            self._reveal_immediately()
+            self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        self._apply_window_mask()
+        super().resizeEvent(event)
+
+    def enterEvent(self, event) -> None:  # noqa: N802
+        self._hover_inside = True
+        self._hover_delay_timer.stop()
+        self._popup_leave_timer.stop()
+        self._ui_opacity_anim.stop()
+
+        # If we were already at full opacity, keep it stable when re-entering quickly.
+        if self._ui_opacity_current >= 0.985:
+            self._hover_revealed = True
+            self._set_ui_opacity(1.0)
+        elif self._base_opacity() < 0.999:
+            self._hover_revealed = False
+            self._hover_delay_timer.start(self._hover_delay_ms())
+        else:
+            self._hover_revealed = True
+            self._set_ui_opacity(1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        # Start fade-out check immediately when pointer exits the app.
+        self._popup_leave_timer.stop()
+        self._on_popup_leave_check()
+        super().leaveEvent(event)
+
+    def moveEvent(self, event) -> None:  # noqa: N802
+        self.config["window_position"] = {"x": int(self.x()), "y": int(self.y())}
+        self.queue_save_config()
+        super().moveEvent(event)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() == QEvent.Type.ActivationChange and not self.isActiveWindow():
+            if not self._has_active_popup() and not self._has_active_internal_dialog():
+                self._popup_leave_timer.stop()
+                self._begin_fade_out()
+        super().changeEvent(event)
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        for scroll in self.quick_tab_scrolls:
+            try:
+                scroll.viewport().removeEventFilter(self)
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.close_remove_event_filter_failed",
+                    severity="warning",
+                    summary="Failed removing viewport event filter during app close.",
+                    exc=exc,
+                    context={"scroll_object": repr(scroll)},
+                )
+        self.config["window_position"] = {"x": int(self.x()), "y": int(self.y())}
+        if self.image_dialog is not None:
+            self.config.setdefault("popup_positions", {})["image_layers"] = {
+                "x": int(self.image_dialog.x()),
+                "y": int(self.image_dialog.y()),
+            }
+            self.image_dialog.close()
+        if self.quick_layout_dialog is not None:
+            self.config.setdefault("popup_positions", {})["quick_layout"] = {
+                "x": int(self.quick_layout_dialog.x()),
+                "y": int(self.quick_layout_dialog.y()),
+            }
+            self.quick_layout_dialog.close()
+        if self.quick_radial_menu is not None:
+            self.quick_radial_menu.close()
+        if hasattr(self, "window_manager") and self.window_manager is not None:
+            self.window_manager.close_all()
+        if hasattr(self, "quick_editor_dialog") and self.quick_editor_dialog is not None:
+            self.quick_editor_dialog.close()
+        self.save_config()
+        super().closeEvent(event)
+
+
+def _iter_flowgrid_shell_windows() -> list["QuickInputsWindow"]:
+    app = QApplication.instance()
+    quick_inputs_cls = globals().get("QuickInputsWindow")
+    if app is None or quick_inputs_cls is None:
+        return []
+    shells: list["QuickInputsWindow"] = []
+    for widget in app.topLevelWidgets():
+        if isinstance(widget, quick_inputs_cls):
+            shells.append(widget)
+    return shells
+
+
+def _visible_flowgrid_shell_window() -> "QuickInputsWindow" | None:
+    for shell in _iter_flowgrid_shell_windows():
+        try:
+            if shell.isVisible():
+                return shell
+        except Exception:
+            continue
+    return None
+
+
+def _ensure_shell_window_available(preferred_shell: "QuickInputsWindow" | None) -> "QuickInputsWindow" | None:
+    visible_shell = _visible_flowgrid_shell_window()
+    if visible_shell is not None:
+        try:
+            if visible_shell.isMinimized():
+                visible_shell.showNormal()
+            visible_shell.raise_()
+            visible_shell.activateWindow()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.shell_window_activate_failed",
+                severity="warning",
+                summary="Failed activating the existing Flowgrid shell window.",
+                exc=exc,
+            )
+        return visible_shell
+
+    candidate_shells: list["QuickInputsWindow"] = []
+    if preferred_shell is not None:
+        candidate_shells.append(preferred_shell)
+    for shell in _iter_flowgrid_shell_windows():
+        if shell not in candidate_shells:
+            candidate_shells.append(shell)
+
+    for shell in candidate_shells:
+        try:
+            if shell.isMinimized():
+                shell.showNormal()
+            else:
+                shell.show()
+            shell.raise_()
+            shell.activateWindow()
+            return shell
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.shell_window_restore_failed",
+                severity="warning",
+                summary="Failed restoring an existing Flowgrid shell window; trying the next candidate.",
+                exc=exc,
+            )
+
+    try:
+        shell = QuickInputsWindow()
+        shell.show()
+        shell.raise_()
+        shell.activateWindow()
+        return shell
+    except Exception as exc:
+        _runtime_log_event(
+            "ui.shell_window_create_failed",
+            severity="error",
+            summary="Failed creating a replacement Flowgrid shell window.",
+            exc=exc,
+        )
+        return None
+
+
+configure_runtime_logging(
+    log_dir_provider=_runtime_log_dir,
+    launch_log_error_callback=_log_launch_error,
+    safe_print_callback=_safe_print,
+)
+
+detect_current_user_id = _shared_detect_current_user_id
+_runtime_log_path = _shared_runtime_log_path
+_json_safe = _shared_json_safe
+_brief_runtime_context = _shared_brief_runtime_context
+_runtime_log_event = _shared_runtime_log_event
+
+clamp = _shared_clamp
+safe_int = _shared_safe_int
+normalize_hex = _shared_normalize_hex
+blend = _shared_blend
+contrast_ratio = _shared_contrast_ratio
+readable_text = _shared_readable_text
+shift = _shared_shift
+rgba_css = _shared_rgba_css
+compute_palette = _shared_compute_palette
+safe_layer_defaults = _shared_safe_layer_defaults
+
+FlowgridThemedDialog = _SharedFlowgridThemedDialog
+DepotFramelessToolWindow = _SharedDepotFramelessToolWindow
+TouchDistributionBar = _SharedTouchDistributionBar
+DepotRules = _SharedDepotRules
+
+_submission_latest_ts_sql = _shared_submission_latest_ts_sql
+_submission_entry_date_sql = _shared_submission_entry_date_sql
+_merged_part_detail_rows = _shared_merged_part_detail_rows
+_serialize_part_detail_rows = _shared_serialize_part_detail_rows
+_installed_key_set_from_text = _shared_installed_key_set_from_text
+_part_detail_row_key = _shared_part_detail_row_key
+_dedupe_part_detail_rows = _shared_dedupe_part_detail_rows
+_next_alert_quiet_until = _shared_next_alert_quiet_until
+_parse_iso_datetime_local = _shared_parse_iso_datetime_local
+_alert_quiet_active = _shared_alert_quiet_active
+_serialized_installed_keys = _shared_serialized_installed_keys
+
+configure_standard_table = _shared_configure_standard_table
+show_flowgrid_themed_message = _shared_show_flowgrid_themed_message
+show_flowgrid_themed_open_file_name = _shared_show_flowgrid_themed_open_file_name
+show_flowgrid_themed_open_file_names = _shared_show_flowgrid_themed_open_file_names
+show_flowgrid_themed_save_file_name = _shared_show_flowgrid_themed_save_file_name
+show_flowgrid_themed_existing_directory = _shared_show_flowgrid_themed_existing_directory
+show_flowgrid_themed_color = _shared_show_flowgrid_themed_color
+show_flowgrid_themed_input_text = _shared_show_flowgrid_themed_input_text
+show_flowgrid_themed_input_int = _shared_show_flowgrid_themed_input_int
+show_flowgrid_themed_input_item = _shared_show_flowgrid_themed_input_item
+_center_table_item = _shared_center_table_item
+_resolve_user_icon_from_agent_meta = _shared_resolve_user_icon_from_agent_meta
+_selected_part_id_from_table = _shared_selected_part_id_from_table
+_select_table_row_by_context_pos = _shared_select_table_row_by_context_pos
+_visible_flowgrid_shell_window = _shared_visible_flowgrid_shell_window
+_ensure_shell_window_available = _shared_ensure_shell_window_available
+
+PartNotesDialog = _SharedPartNotesDialog
+_edit_aux_queue_comment = _shared_edit_aux_queue_comment
+_copy_work_order_with_notice = _shared_copy_work_order_with_notice
+_edit_part_notes = _shared_edit_part_notes
+_populate_missing_po_followup_table = _shared_populate_missing_po_followup_table
+_reassign_missing_po_followup = _shared_reassign_missing_po_followup
+_resolve_missing_po_followup = _shared_resolve_missing_po_followup
+
+
+def main() -> int:
+    if os.name == "nt":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("QuickInputs.QtApp")
+        except Exception as exc:
+            _runtime_log_event(
+                "bootstrap.app_user_model_id_set_failed",
+                severity="warning",
+                summary="Failed setting explicit AppUserModelID for Windows shell integration.",
+                exc=exc,
+            )
+
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_TITLE)
+    app.setQuitOnLastWindowClosed(True)
+    window = QuickInputsWindow()
+    window.show()
+    return app.exec()
+
+
+def _run_command_line_mode() -> int | None:
+    if "--install" in _CLI_FLAGS:
+        return _run_installer_mode(launch_after_install="--no-launch" not in _CLI_FLAGS)
+    if "--create-shortcut" in _CLI_FLAGS:
+        return _run_installer_mode(launch_after_install=False)
+    return None
+
+
+if __name__ == "__main__":
+    try:
+        cli_result = _run_command_line_mode()
+        raise SystemExit(main() if cli_result is None else cli_result)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        details = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        _notify_launch_error("TH-9000", "Fatal runtime crash during launch.", details)
+        raise SystemExit(1)
+
