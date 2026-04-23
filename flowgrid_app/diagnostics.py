@@ -17,6 +17,8 @@ from flowgrid_app.paths import (
     DEPOT_DB_FILENAME,
     FLOWGRID_PROJECT_ROOT,
     _find_local_paths_config,
+    _get_install_state_path,
+    _get_local_installer_path,
     _get_shared_root_from_config,
     _local_data_root,
     _paths_equal,
@@ -197,6 +199,7 @@ def collect_install_preflight_results() -> list[DiagnosticEntry]:
 
     required_runtime_paths = (
         (runtime_dir / "Flowgrid.pyw", "Flowgrid.pyw"),
+        (_get_local_installer_path(), "Flowgrid_installer.pyw"),
         (runtime_dir / "flowgrid_app" / "__init__.py", "flowgrid_app package"),
         (runtime_dir / "Assets", "Assets folder"),
     )
@@ -211,6 +214,94 @@ def collect_install_preflight_results() -> list[DiagnosticEntry]:
         )
     else:
         _record(results, "Installed runtime files", "ok", "Local runtime entrypoint, package, and Assets folder are present.", runtime_dir)
+
+    try:
+        manifest_payload = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest_payload, dict):
+            raise ValueError("Flowgrid_paths.json must contain a JSON object.")
+        channel_id = str(manifest_payload.get("channel_id") or "main").strip().lower() or "main"
+        channel_label = str(manifest_payload.get("channel_label") or "Main").strip() or "Main"
+        read_only_db = bool(manifest_payload.get("read_only_db", False))
+        snapshot_source_root = str(manifest_payload.get("snapshot_source_root") or "").strip()
+        channel_detail = f"channel_id={channel_id} | channel_label={channel_label} | read_only_db={read_only_db}"
+        if snapshot_source_root:
+            channel_detail += f" | snapshot_source_root={snapshot_source_root}"
+        _record(results, "Channel contract", "ok", channel_detail, config_path)
+    except Exception as exc:
+        _record(
+            results,
+            "Channel contract",
+            "warning",
+            f"Could not fully inspect channel metadata from Flowgrid_paths.json: {type(exc).__name__}: {exc}",
+            config_path,
+        )
+
+    install_state_path = _get_install_state_path()
+    if not install_state_path.exists() or not install_state_path.is_file():
+        _record(
+            results,
+            "Install state manifest",
+            "failed",
+            "Flowgrid_install_state.json is missing from the local Config folder.",
+            install_state_path,
+        )
+    else:
+        try:
+            payload = json.loads(install_state_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Flowgrid_install_state.json must contain a JSON object.")
+            installed_commit_sha = str(payload.get("installed_commit_sha") or "").strip()
+            repo_managed_files = payload.get("repo_managed_files")
+            repo_file_count = len(repo_managed_files) if isinstance(repo_managed_files, dict) else 0
+            if not installed_commit_sha:
+                _record(
+                    results,
+                    "Install state manifest",
+                    "warning",
+                    "Install state exists but does not record an installed_commit_sha yet.",
+                    install_state_path,
+                )
+            elif repo_file_count <= 0:
+                _record(
+                    results,
+                    "Install state manifest",
+                    "warning",
+                    "Install state exists but does not contain repo-managed file hashes yet.",
+                    install_state_path,
+                )
+            else:
+                _record(
+                    results,
+                    "Install state manifest",
+                    "ok",
+                    f"Install state recorded commit {installed_commit_sha[:12]} with {repo_file_count} repo-managed files.",
+                    install_state_path,
+                )
+            channel_id = str(payload.get("channel_id") or "main").strip().lower() or "main"
+            channel_label = str(payload.get("channel_label") or "Main").strip() or "Main"
+            read_only_db = bool(payload.get("read_only_db", False))
+            snapshot_source_root = str(payload.get("snapshot_source_root") or "").strip()
+            last_snapshot_status = str(payload.get("last_snapshot_sync_status") or "").strip()
+            last_snapshot_summary = str(payload.get("last_snapshot_sync_summary") or "").strip()
+            install_state_detail = (
+                f"channel_id={channel_id} | channel_label={channel_label} | read_only_db={read_only_db}"
+            )
+            if snapshot_source_root:
+                install_state_detail += f" | snapshot_source_root={snapshot_source_root}"
+            if last_snapshot_status or last_snapshot_summary:
+                install_state_detail += (
+                    f" | last_snapshot_sync_status={last_snapshot_status or '-'}"
+                    f" | last_snapshot_sync_summary={last_snapshot_summary or '-'}"
+                )
+            _record(results, "Install state channel metadata", "ok", install_state_detail, install_state_path)
+        except Exception as exc:
+            _record(
+                results,
+                "Install state manifest",
+                "failed",
+                f"Failed parsing Flowgrid_install_state.json: {type(exc).__name__}: {exc}",
+                install_state_path,
+            )
 
     shared_db = shared_root / DEPOT_DB_FILENAME
     if not shared_db.exists() or not shared_db.is_file():
@@ -351,7 +442,7 @@ def collect_install_preflight_results() -> list[DiagnosticEntry]:
             finally:
                 try:
                     if diag_db is not None:
-                        diag_db.conn.close()
+                        diag_db.close("diagnostics.permission_coverage")
                 except Exception:
                     pass
     except Exception as exc:

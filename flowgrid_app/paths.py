@@ -54,7 +54,17 @@ APP_TITLE = "Flowgrid"
 
 CONFIG_FILENAME = "Flowgrid_config.json"
 
+CHANNEL_CONFIG_FILENAME = "Flowgrid_channel.json"
+
+INSTALL_STATE_FILENAME = "Flowgrid_install_state.json"
+
+LOCAL_INSTALLER_FILENAME = "Flowgrid_installer.pyw"
+
 DEPOT_DB_FILENAME = "Flowgrid_depot.db"
+
+DEFAULT_CHANNEL_ID = "main"
+
+DEFAULT_CHANNEL_LABEL = "Main"
 
 SHARED_SYNC_REFRESH_INTERVAL_MS = 15000
 
@@ -73,6 +83,77 @@ MIN_PYTHON_VERSION = (3, 10, 0)
 _FLOWGRID_PATHS_CONFIG: dict[str, Any] | None = None
 
 _FLOWGRID_PATHS_CONFIG_ERROR: str = ""
+
+
+def _normalize_channel_id(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text or DEFAULT_CHANNEL_ID
+
+
+def _normalize_channel_label(value: Any, *, channel_id: str | None = None) -> str:
+    resolved_channel = _normalize_channel_id(channel_id or value)
+    text = str(value or "").strip()
+    if text:
+        return text
+    if resolved_channel == DEFAULT_CHANNEL_ID:
+        return DEFAULT_CHANNEL_LABEL
+    return resolved_channel.replace("_", " ").replace("-", " ").title()
+
+
+def _normalize_channel_display_name(channel_id: Any = "", channel_label: Any = "") -> str:
+    resolved_channel = _normalize_channel_id(channel_id)
+    resolved_label = _normalize_channel_label(channel_label, channel_id=resolved_channel)
+    if resolved_channel == DEFAULT_CHANNEL_ID:
+        return APP_TITLE
+    return f"{APP_TITLE} {resolved_label}".strip()
+
+
+def _channel_settings_from_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    loaded = config if isinstance(config, dict) else _load_paths_config()
+    channel_id = _normalize_channel_id(loaded.get("channel_id", DEFAULT_CHANNEL_ID))
+    channel_label = _normalize_channel_label(loaded.get("channel_label", ""), channel_id=channel_id)
+    read_only_db = bool(loaded.get("read_only_db", False))
+    repo_url = str(loaded.get("repo_url", "") or "").strip()
+    branch = str(loaded.get("branch", "") or "").strip()
+    snapshot_source_root = str(loaded.get("snapshot_source_root", "") or "").strip()
+    return {
+        "channel_id": channel_id,
+        "channel_label": channel_label,
+        "channel_display_name": _normalize_channel_display_name(channel_id, channel_label),
+        "read_only_db": read_only_db,
+        "repo_url": repo_url,
+        "branch": branch,
+        "snapshot_source_root": snapshot_source_root,
+    }
+
+
+def _current_channel_settings() -> dict[str, Any]:
+    return _channel_settings_from_config()
+
+
+def _current_channel_id() -> str:
+    return str(_current_channel_settings().get("channel_id") or DEFAULT_CHANNEL_ID)
+
+
+def _current_channel_label() -> str:
+    return str(_current_channel_settings().get("channel_label") or DEFAULT_CHANNEL_LABEL)
+
+
+def _current_channel_display_name() -> str:
+    return str(_current_channel_settings().get("channel_display_name") or APP_TITLE)
+
+
+def _current_channel_read_only_db() -> bool:
+    return bool(_current_channel_settings().get("read_only_db", False))
+
+
+def _default_local_install_folder_name(config: dict[str, Any] | None = None) -> str:
+    settings = _channel_settings_from_config(config)
+    return str(settings.get("channel_display_name") or APP_TITLE)
+
+
+def _channel_shortcut_filename(config: dict[str, Any] | None = None) -> str:
+    return f"{_default_local_install_folder_name(config)}.lnk"
 
 def _reset_path_runtime_cache() -> None:
     global _FLOWGRID_PATHS_CONFIG, _FLOWGRID_PATHS_CONFIG_ERROR, _RESOLVED_DATA_ROOT
@@ -213,7 +294,12 @@ def _get_shared_root_from_config() -> Path:
 def _get_local_config_folder() -> Path:
     r"""Get the local config folder (e.g., Documents\Flowgrid\Config)."""
     shared_root = _get_shared_root_from_config()
-    config_folder = _resolve_path_from_config("local_paths.config_folder", "{DOCUMENTS}\\Flowgrid\\Config", shared_root)
+    default_root = _default_local_install_folder_name()
+    config_folder = _resolve_path_from_config(
+        "local_paths.config_folder",
+        f"{{DOCUMENTS}}\\{default_root}\\Config",
+        shared_root,
+    )
     config_folder.mkdir(parents=True, exist_ok=True)
     return config_folder
 
@@ -222,6 +308,16 @@ def _get_local_config_path() -> Path:
     folder = _get_local_config_folder()
     folder.mkdir(parents=True, exist_ok=True)
     return folder / CONFIG_FILENAME
+
+def _get_install_state_path() -> Path:
+    """Get the local installer/update state file path."""
+    folder = _get_local_config_folder()
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / INSTALL_STATE_FILENAME
+
+def _get_local_installer_path() -> Path:
+    """Get the locally installed standalone installer path."""
+    return _local_data_root() / LOCAL_INSTALLER_FILENAME
 
 def _shared_workflow_db_path() -> Path:
     """Return the authoritative shared workflow database path."""
@@ -457,6 +553,7 @@ def _migrate_legacy_agent_icons(target_db_path: Path) -> None:
 
 __all__ = [
     "APP_TITLE",
+    "CHANNEL_CONFIG_FILENAME",
     "ASSETS_DIR_NAME",
     "ASSET_ADMIN_ICON_DIR_NAME",
     "ASSET_AGENT_ICON_DIR_NAME",
@@ -465,6 +562,8 @@ __all__ = [
     "ASSET_UI_ICON_COMPAT_DIR_NAME",
     "CONFIG_FILENAME",
     "DATA_ROOT_ENV_VAR",
+    "DEFAULT_CHANNEL_ID",
+    "DEFAULT_CHANNEL_LABEL",
     "DEFAULT_SHARED_DATA_ROOT",
     "DEPOT_BACKGROUND_AUTO_REFRESH_MS",
     "DEPOT_DB_FILENAME",
@@ -473,22 +572,37 @@ __all__ = [
     "DEPOT_SEARCH_REFRESH_DEBOUNCE_MS",
     "DEPOT_VIEW_TTL_MS",
     "FLOWGRID_ICON_PACK_DIR_NAME",
+    "INSTALL_STATE_FILENAME",
     "FLOWGRID_PACKAGE_DIR",
     "FLOWGRID_PROJECT_ROOT",
     "FLOWGRID_SCRIPT_PATH",
+    "LOCAL_INSTALLER_FILENAME",
     "LOGS_DIR_NAME",
     "MIN_PYTHON_VERSION",
     "SHARED_SYNC_REFRESH_INTERVAL_MS",
     "_configured_data_root",
+    "_channel_settings_from_config",
+    "_channel_shortcut_filename",
+    "_current_channel_display_name",
+    "_current_channel_id",
+    "_current_channel_label",
+    "_current_channel_read_only_db",
+    "_current_channel_settings",
     "_data_file_path",
+    "_default_local_install_folder_name",
     "_find_local_paths_config",
+    "_get_install_state_path",
     "_get_local_config_folder",
     "_get_local_config_path",
+    "_get_local_installer_path",
     "_get_shared_root_from_config",
     "_legacy_data_candidates",
     "_load_paths_config",
     "_local_data_root",
     "_migrate_legacy_agent_icons",
+    "_normalize_channel_display_name",
+    "_normalize_channel_id",
+    "_normalize_channel_label",
     "_paths_equal",
     "_resolve_data_root",
     "_resolve_path_from_config",

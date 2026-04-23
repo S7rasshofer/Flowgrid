@@ -244,6 +244,8 @@ def _edit_aux_queue_comment(
     theme_kind: str,
     title: str,
 ) -> bool:
+    if owner._warn_if_read_only(title):
+        return False
     row = table.currentRow()
     if row < 0:
         owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
@@ -325,6 +327,8 @@ def _edit_part_notes(
     table: QTableWidget | None = None,
     part_id: int | None = None,
 ) -> tuple[bool, int | None]:
+    if owner._warn_if_read_only("Notes updates"):
+        return False, int(part_id) if part_id is not None else None
     target_part_id = int(part_id) if part_id is not None else _selected_part_id_from_table(table) if table is not None else None
     if target_part_id is None:
         owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
@@ -469,6 +473,8 @@ def _reassign_missing_po_followup(
     role_key: str,
     refresh_callback: Callable[[], None],
 ) -> None:
+    if owner._warn_if_read_only("Missing PO reassignment"):
+        return
     if table.currentRow() < 0:
         owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
         return
@@ -552,6 +558,8 @@ def _resolve_missing_po_followup(
     role_key: str,
     refresh_callback: Callable[[], None],
 ) -> None:
+    if owner._warn_if_read_only("Missing PO resolution"):
+        return
     if table.currentRow() < 0:
         owner._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
         return

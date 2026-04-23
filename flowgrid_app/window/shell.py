@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -105,7 +107,7 @@ from flowgrid_app.icon_io import (
     _build_smoothed_qicon,
     _resolve_active_app_icon_path,
 )
-from flowgrid_app.installer import _sync_desktop_shortcut
+from flowgrid_app.installer import _preferred_gui_python_executable, _sync_desktop_shortcut
 from flowgrid_app.paths import (
     APP_TITLE,
     ASSETS_DIR_NAME,
@@ -115,11 +117,13 @@ from flowgrid_app.paths import (
     FLOWGRID_ICON_PACK_DIR_NAME,
     SHARED_SYNC_REFRESH_INTERVAL_MS,
     _data_file_path,
+    _get_local_installer_path,
     _migrate_legacy_agent_icons,
     _resolve_data_root,
     _shared_workflow_db_path,
 )
 from flowgrid_app.runtime_logging import _runtime_log_event, detect_current_user_id
+from flowgrid_app.update_manager import check_for_updates, current_install_status, sync_shared_assets
 from flowgrid_app.workflow_core import DepotDB, DepotRefreshCoordinator, DepotTracker
 
 from .agent import DepotAgentWindow
@@ -267,6 +271,7 @@ class QuickInputsWindow(QMainWindow):
     def __init__(self, runtime_options: RuntimeOptions | None = None) -> None:
         super().__init__()
         self.runtime_options = runtime_options if isinstance(runtime_options, RuntimeOptions) else RuntimeOptions()
+        self.channel_display_name = str(self.runtime_options.channel_display_name or APP_TITLE).strip() or APP_TITLE
         mark_flowgrid_shell_window(self)
         configure_flowgrid_shell_factory(lambda: QuickInputsWindow(runtime_options=self.runtime_options))
         self.config_path = _data_file_path(CONFIG_FILENAME)
@@ -309,8 +314,21 @@ class QuickInputsWindow(QMainWindow):
         self._ui_opacity_effects: list[tuple[QGraphicsOpacityEffect, float, float]] = []
         self._corner_radius = 14
         self._drag_offset: QPoint | None = None
+        self._background_task_results: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue()
+        self._background_task_timer = QTimer(self)
+        self._background_task_timer.setInterval(180)
+        self._background_task_timer.timeout.connect(self._drain_background_task_results)
+        self._background_task_timer.start()
+        self._update_check_in_progress = False
+        self._shared_asset_pull_in_progress = False
+        self._startup_update_check_started = False
+        self._pending_update_info: dict[str, Any] = {}
+        self._install_status_cache: dict[str, Any] = current_install_status()
+        self._shutdown_in_progress = False
+        self._shutdown_completed = False
+        self._shutdown_had_issues = False
 
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(self._shell_window_title())
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setWindowFlag(Qt.WindowType.Window, True)
@@ -325,6 +343,25 @@ class QuickInputsWindow(QMainWindow):
         self.main_layout.setSpacing(0)
 
         self.titlebar = TitleBar(self)
+        self.titlebar.title_label.setText(self._shell_window_title())
+        self.shell_mode_chip = QLabel(self._shell_mode_chip_text())
+        self.shell_mode_chip.setObjectName("FlowgridShellModeChip")
+        self.shell_mode_chip.setStyleSheet(
+            "QLabel#FlowgridShellModeChip {"
+            "background-color: rgba(166, 75, 42, 0.92);"
+            "color: #FFF8ED;"
+            "border: 1px solid rgba(255, 225, 192, 0.85);"
+            "border-radius: 9px;"
+            "padding: 2px 8px;"
+            "font-size: 10px;"
+            "font-weight: 900;"
+            "letter-spacing: 0.4px;"
+            "}"
+        )
+        self.shell_mode_chip.setVisible(bool(self.shell_mode_chip.text()))
+        titlebar_layout = self.titlebar.layout()
+        if titlebar_layout is not None:
+            titlebar_layout.insertWidget(2, self.shell_mode_chip, 0, Qt.AlignmentFlag.AlignVCenter)
         self.main_layout.addWidget(self.titlebar)
 
         self.body = QWidget()
@@ -446,6 +483,7 @@ class QuickInputsWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+        self._start_startup_maintenance()
 
     # ---------------------------- Config ---------------------------- #
     def load_config(self) -> dict[str, Any]:
@@ -2206,6 +2244,39 @@ class QuickInputsWindow(QMainWindow):
         icon_row.addWidget(self.clear_icon_button)
         icon_row.addStretch(1)
         layout.addLayout(icon_row)
+
+        updates_title = QLabel("Updates")
+        updates_title.setProperty("section", True)
+        layout.addWidget(updates_title)
+        self.channel_mode_status_label = QLabel("")
+        self.channel_mode_status_label.setProperty("muted", True)
+        self.channel_mode_status_label.setWordWrap(True)
+        layout.addWidget(self.channel_mode_status_label)
+
+        self.update_commit_status_label = QLabel("Installed commit: -")
+        self.update_commit_status_label.setProperty("muted", True)
+        self.update_check_status_label = QLabel("Update status: Not checked yet.")
+        self.update_check_status_label.setProperty("muted", True)
+        self.shared_assets_status_label = QLabel("Shared assets: Not synced yet.")
+        self.shared_assets_status_label.setProperty("muted", True)
+        layout.addWidget(self.update_commit_status_label)
+        layout.addWidget(self.update_check_status_label)
+        layout.addWidget(self.shared_assets_status_label)
+
+        update_actions_row = QHBoxLayout()
+        update_actions_row.setContentsMargins(0, 0, 0, 0)
+        update_actions_row.setSpacing(6)
+        self.check_updates_button = QPushButton("Check for Updates")
+        self.install_update_button = QPushButton("Install Update")
+        self.pull_shared_assets_button = QPushButton("Pull Shared Assets")
+        self.check_updates_button.setProperty("actionRole", "pick")
+        self.install_update_button.setProperty("actionRole", "save")
+        self.pull_shared_assets_button.setProperty("actionRole", "pick")
+        self.install_update_button.setEnabled(False)
+        update_actions_row.addWidget(self.check_updates_button, 1)
+        update_actions_row.addWidget(self.install_update_button, 1)
+        update_actions_row.addWidget(self.pull_shared_assets_button, 1)
+        layout.addLayout(update_actions_row)
         layout.addStretch(1)
 
         self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
@@ -2217,7 +2288,31 @@ class QuickInputsWindow(QMainWindow):
         self.sidebar_right_switch.toggled.connect(self.on_sidebar_position_changed)
         self.pick_icon_button.clicked.connect(self.pick_custom_icon)
         self.clear_icon_button.clicked.connect(self.clear_custom_icon)
+        self.check_updates_button.clicked.connect(self.on_check_updates_clicked)
+        self.install_update_button.clicked.connect(self.on_install_update_clicked)
+        self.pull_shared_assets_button.clicked.connect(self.on_pull_shared_assets_clicked)
         return tab
+
+    def _shell_window_title(self) -> str:
+        title = str(self.channel_display_name or APP_TITLE).strip() or APP_TITLE
+        if self.runtime_options.read_only_db:
+            return f"{title} [READ ONLY]"
+        return title
+
+    def _shell_mode_chip_text(self) -> str:
+        channel_label = str(self.runtime_options.channel_label or "").strip()
+        channel_id = str(self.runtime_options.channel_id or "").strip().lower()
+        if self.runtime_options.read_only_db and channel_label:
+            return f"{channel_label.upper()} READ ONLY"
+        if self.runtime_options.read_only_db:
+            return "READ ONLY"
+        if channel_id and channel_id != "main":
+            return channel_label.upper() if channel_label else channel_id.upper()
+        return ""
+
+    def _default_update_source_label(self) -> str:
+        branch = str(self.runtime_options.branch or "main").strip() or "main"
+        return f"GitHub {branch}"
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
@@ -4805,6 +4900,232 @@ class QuickInputsWindow(QMainWindow):
         self.quick_layout_dialog.raise_()
         self.quick_layout_dialog.activateWindow()
 
+    # ----------------------- Update Flow --------------------------- #
+    def _refresh_install_status_cache(self) -> None:
+        try:
+            self._install_status_cache = current_install_status()
+        except Exception as exc:
+            _runtime_log_event(
+                "update.status_cache_refresh_failed",
+                severity="warning",
+                summary="Failed refreshing the local install/update status cache.",
+                exc=exc,
+            )
+
+    def _refresh_update_status_labels(self) -> None:
+        self._refresh_install_status_cache()
+        source_label = str(self._install_status_cache.get("update_source_label") or self._default_update_source_label()).strip() or self._default_update_source_label()
+        channel_display_name = str(self._install_status_cache.get("channel_display_name") or self.channel_display_name or APP_TITLE).strip() or APP_TITLE
+        read_only_db = bool(self._install_status_cache.get("read_only_db", self.runtime_options.read_only_db))
+        snapshot_source_root = str(
+            self._install_status_cache.get("snapshot_source_root") or self.runtime_options.snapshot_source_root or ""
+        ).strip()
+        installed_short = str(self._install_status_cache.get("installed_short_sha") or "").strip() or "-"
+        installer_path = str(self._install_status_cache.get("local_installer_path") or "").strip()
+        update_summary = str(self._install_status_cache.get("last_check_summary") or "").strip() or "Not checked yet."
+        asset_summary = str(self._install_status_cache.get("last_shared_asset_sync_summary") or "").strip() or "Not synced yet."
+
+        if self._update_check_in_progress:
+            update_summary = f"Checking {source_label} for updates..."
+        if self._shared_asset_pull_in_progress:
+            asset_summary = "Syncing shared assets..."
+
+        if hasattr(self, "channel_mode_status_label"):
+            mode_text = f"Channel: {channel_display_name} | Data mode: {'Read-only snapshot' if read_only_db else 'Read/write shared root'}"
+            if snapshot_source_root and read_only_db:
+                mode_text += f" | Snapshot source: {snapshot_source_root}"
+            self.channel_mode_status_label.setText(mode_text)
+            self.channel_mode_status_label.setToolTip(installer_path or mode_text)
+        if hasattr(self, "update_commit_status_label"):
+            self.update_commit_status_label.setText(f"Installed commit: {installed_short}")
+            self.update_commit_status_label.setToolTip(installer_path or "Local installer path unavailable.")
+        if hasattr(self, "update_check_status_label"):
+            self.update_check_status_label.setText(f"Update status: {update_summary}")
+        if hasattr(self, "shared_assets_status_label"):
+            self.shared_assets_status_label.setText(f"Shared assets: {asset_summary}")
+
+        pending_update = bool(self._pending_update_info.get("can_install"))
+        if hasattr(self, "check_updates_button"):
+            self.check_updates_button.setEnabled(not self._update_check_in_progress)
+        if hasattr(self, "pull_shared_assets_button"):
+            self.pull_shared_assets_button.setEnabled(not self._shared_asset_pull_in_progress)
+        if hasattr(self, "install_update_button"):
+            self.install_update_button.setEnabled(
+                pending_update and not self._update_check_in_progress and not self._shared_asset_pull_in_progress
+            )
+            if pending_update:
+                remote_short = str(self._pending_update_info.get("remote_short_sha") or "").strip()
+                self.install_update_button.setToolTip(
+                    f"Install the available {source_label} update ({remote_short or 'new commit'}) and relaunch {channel_display_name}."
+                )
+            else:
+                self.install_update_button.setToolTip(f"No {source_label} update is currently pending.")
+
+    def _run_background_task(self, task_name: str, worker) -> None:
+        def _target() -> None:
+            try:
+                payload = worker()
+            except Exception as exc:
+                _runtime_log_event(
+                    "update.background_task_failed",
+                    severity="warning",
+                    summary="A Flowgrid background update task failed unexpectedly.",
+                    exc=exc,
+                    context={"task_name": task_name},
+                )
+                payload = {
+                    "status": "warning",
+                    "summary": f"{task_name} failed: {type(exc).__name__}: {exc}",
+                }
+            self._background_task_results.put(
+                (task_name, dict(payload) if isinstance(payload, dict) else {"status": "warning"})
+            )
+
+        thread = threading.Thread(target=_target, name=f"flowgrid-{task_name}", daemon=True)
+        thread.start()
+
+    def _drain_background_task_results(self) -> None:
+        while True:
+            try:
+                task_name, payload = self._background_task_results.get_nowait()
+            except queue.Empty:
+                break
+            if task_name == "startup_maintenance":
+                self._update_check_in_progress = False
+                self._shared_asset_pull_in_progress = False
+                self._handle_update_check_result(payload.get("update", {}), show_dialog=False)
+                self._handle_shared_asset_result(payload.get("assets", {}), show_dialog=False)
+            elif task_name == "manual_update_check":
+                self._update_check_in_progress = False
+                self._handle_update_check_result(payload, show_dialog=True)
+            elif task_name == "manual_asset_pull":
+                self._shared_asset_pull_in_progress = False
+                self._handle_shared_asset_result(payload, show_dialog=True)
+            self._refresh_update_status_labels()
+
+    def _perform_startup_maintenance(self) -> dict[str, Any]:
+        return {
+            "update": check_for_updates(),
+            "assets": sync_shared_assets(),
+        }
+
+    def _start_startup_maintenance(self) -> None:
+        if self._startup_update_check_started:
+            return
+        self._startup_update_check_started = True
+        self._update_check_in_progress = True
+        self._shared_asset_pull_in_progress = True
+        self._refresh_update_status_labels()
+        self._run_background_task("startup_maintenance", self._perform_startup_maintenance)
+
+    def _handle_update_check_result(self, payload: dict[str, Any], *, show_dialog: bool) -> None:
+        status = str(payload.get("status") or "").strip().lower()
+        summary = str(payload.get("summary") or "").strip() or "Update check completed."
+        if status == "update_available":
+            self._pending_update_info = dict(payload)
+        elif status == "up_to_date":
+            self._pending_update_info = {}
+
+        if show_dialog:
+            if status == "warning":
+                self._show_shell_message(QMessageBox.Icon.Warning, "Update Check", summary)
+            elif status == "update_available":
+                self._show_shell_message(QMessageBox.Icon.Information, "Update Available", summary)
+            else:
+                self._show_shell_message(QMessageBox.Icon.Information, "Update Check", summary)
+
+    def _handle_shared_asset_result(self, payload: dict[str, Any], *, show_dialog: bool) -> None:
+        status = str(payload.get("status") or "").strip().lower()
+        summary = str(payload.get("summary") or "").strip() or "Shared asset sync completed."
+        if show_dialog:
+            if status == "warning":
+                self._show_shell_message(QMessageBox.Icon.Warning, "Shared Assets", summary)
+            else:
+                self._show_shell_message(QMessageBox.Icon.Information, "Shared Assets", summary)
+
+    def on_check_updates_clicked(self) -> None:
+        if self._update_check_in_progress:
+            return
+        self._update_check_in_progress = True
+        self._refresh_update_status_labels()
+        self._run_background_task("manual_update_check", check_for_updates)
+
+    def on_pull_shared_assets_clicked(self) -> None:
+        if self._shared_asset_pull_in_progress:
+            return
+        self._shared_asset_pull_in_progress = True
+        self._refresh_update_status_labels()
+        self._run_background_task("manual_asset_pull", sync_shared_assets)
+
+    def on_install_update_clicked(self) -> None:
+        pending = dict(self._pending_update_info)
+        source_label = str(pending.get("update_source_label") or self._default_update_source_label()).strip() or self._default_update_source_label()
+        if not pending or not bool(pending.get("can_install")):
+            self._show_shell_message(QMessageBox.Icon.Information, "Install Update", f"No {source_label} update is currently pending.")
+            return
+
+        installer_path = _get_local_installer_path()
+        if not installer_path.exists() or not installer_path.is_file():
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Install Update",
+                f"Local installer copy is missing:\n{installer_path}",
+            )
+            return
+
+        launcher_path = _preferred_gui_python_executable()
+        if not launcher_path.exists() or not launcher_path.is_file():
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Install Update",
+                f"Python launcher not found:\n{launcher_path}",
+            )
+            return
+
+        try:
+            subprocess.Popen(
+                [
+                    str(launcher_path),
+                    str(installer_path),
+                    "--apply-update",
+                    "--parent-pid",
+                    str(os.getpid()),
+                    "--relaunch",
+                ],
+                cwd=str(installer_path.parent),
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "update.apply_launch_failed",
+                severity="error",
+                summary="Failed launching the standalone installer for an app update.",
+                exc=exc,
+                context={"installer_path": str(installer_path), "launcher_path": str(launcher_path)},
+            )
+            self._show_shell_message(
+                QMessageBox.Icon.Warning,
+                "Install Update",
+                f"Could not launch the updater:\n{type(exc).__name__}: {exc}",
+            )
+            return
+
+        _runtime_log_event(
+            "update.apply_requested",
+            severity="info",
+            summary="Flowgrid update install was requested from Settings.",
+            context={
+                "installer_path": str(installer_path),
+                "remote_commit_sha": str(pending.get("remote_commit_sha") or ""),
+            },
+        )
+        self._close_shell_internal_dialogs()
+        if hasattr(self, "window_manager") and self.window_manager is not None:
+            self.window_manager.close_all()
+        self.save_config()
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(150, app.quit)
+
     # ----------------------- Settings Screen ------------------------ #
     def refresh_settings_controls(self) -> None:
         self.opacity_slider.blockSignals(True)
@@ -4839,6 +5160,7 @@ class QuickInputsWindow(QMainWindow):
         self.compact_mode_check.blockSignals(False)
         self.sidebar_right_switch.blockSignals(False)
         self._refresh_sidebar_switch_caption()
+        self._refresh_update_status_labels()
 
     def on_settings_changed(self) -> None:
         self.config["always_on_top"] = bool(self.always_on_top_check.isChecked())
@@ -5153,22 +5475,175 @@ class QuickInputsWindow(QMainWindow):
                 "y": int(self.quick_layout_dialog.y()),
             }
 
-    def _close_shell_internal_dialogs(self) -> None:
-        if self.image_dialog is not None:
-            self.image_dialog.close()
-        if self.quick_layout_dialog is not None:
-            self.quick_layout_dialog.close()
-        if self.quick_radial_menu is not None:
-            self.quick_radial_menu.close()
-        if hasattr(self, "quick_editor_dialog") and self.quick_editor_dialog is not None:
-            self.quick_editor_dialog.close()
+    def _close_shell_internal_dialogs(self) -> list[str]:
+        failed_dialogs: list[str] = []
+        dialog_targets = [
+            ("image_dialog", self.image_dialog),
+            ("quick_layout_dialog", self.quick_layout_dialog),
+            ("quick_radial_menu", self.quick_radial_menu),
+            ("quick_editor_dialog", getattr(self, "quick_editor_dialog", None)),
+        ]
+        for dialog_name, dialog in dialog_targets:
+            if dialog is None:
+                continue
+            try:
+                dialog.close()
+            except Exception as exc:
+                failed_dialogs.append(dialog_name)
+                _runtime_log_event(
+                    "ui.shell_internal_dialog_close_failed",
+                    severity="warning",
+                    summary="Failed closing a shell-owned Flowgrid dialog during shell cleanup.",
+                    exc=exc,
+                    context={"dialog_name": dialog_name},
+                )
+        return failed_dialogs
+
+    def _shutdown_application(self, reason: str) -> bool:
+        if self._shutdown_completed:
+            return not self._shutdown_had_issues
+        if self._shutdown_in_progress:
+            return False
+
+        shutdown_reason = str(reason or "").strip() or "shutdown"
+        self._shutdown_in_progress = True
+        issues: list[str] = []
+
+        def _log_shutdown_issue(
+            issue_key: str,
+            event_key: str,
+            summary: str,
+            *,
+            exc: BaseException | None = None,
+            context: dict[str, Any] | None = None,
+        ) -> None:
+            issues.append(issue_key)
+            event_context = {"reason": shutdown_reason}
+            if context:
+                event_context.update(context)
+            _runtime_log_event(
+                event_key,
+                severity="warning",
+                summary=summary,
+                exc=exc,
+                context=event_context,
+            )
+
+        try:
+            self._persist_shell_close_state()
+
+            self._drag_offset = None
+            self._hover_inside = False
+            self._hover_revealed = False
+            self._update_check_in_progress = False
+            self._shared_asset_pull_in_progress = False
+            try:
+                for timer_name in (
+                    "_foreground_timer",
+                    "_shared_sync_timer",
+                    "_background_task_timer",
+                    "_hover_delay_timer",
+                    "_popup_leave_timer",
+                ):
+                    timer = getattr(self, timer_name, None)
+                    if timer is not None:
+                        timer.stop()
+                self._ui_opacity_anim.stop()
+            except Exception as exc:
+                _log_shutdown_issue(
+                    "timers",
+                    "runtime.shutdown_stop_timers_failed",
+                    "Failed stopping one or more shell timers during shutdown.",
+                    exc=exc,
+                )
+
+            failed_internal_dialogs = self._close_shell_internal_dialogs()
+            if failed_internal_dialogs:
+                issues.extend([f"internal_dialog:{name}" for name in failed_internal_dialogs])
+
+            try:
+                if hasattr(self, "window_manager") and self.window_manager is not None:
+                    self.window_manager.close_all()
+            except Exception as exc:
+                _log_shutdown_issue(
+                    "controlled_windows",
+                    "runtime.shutdown_controlled_windows_close_failed",
+                    "Failed closing one or more managed Flowgrid tool windows during shutdown.",
+                    exc=exc,
+                )
+
+            try:
+                self.flush_pending_config_save()
+            except Exception as exc:
+                _log_shutdown_issue(
+                    "config_flush",
+                    "runtime.shutdown_flush_config_failed",
+                    "Failed flushing the Flowgrid config during shutdown.",
+                    exc=exc,
+                    context={"config_path": str(self.config_path)},
+                )
+
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.removeEventFilter(self)
+                except Exception as exc:
+                    _log_shutdown_issue(
+                        "app_event_filter",
+                        "runtime.shutdown_remove_app_event_filter_failed",
+                        "Failed removing the application event filter during Flowgrid shutdown.",
+                        exc=exc,
+                    )
+            for scroll in self.quick_tab_scrolls:
+                try:
+                    scroll.viewport().removeEventFilter(self)
+                except Exception as exc:
+                    _log_shutdown_issue(
+                        "scroll_event_filter",
+                        "ui.close_remove_event_filter_failed",
+                        "Failed removing viewport event filter during app close.",
+                        exc=exc,
+                        context={"scroll_object": repr(scroll)},
+                    )
+
+            try:
+                db_closed = self.depot_db.close(f"shell:{shutdown_reason}")
+                if not db_closed:
+                    issues.append("depot_db_close")
+            except Exception as exc:
+                _log_shutdown_issue(
+                    "depot_db_close",
+                    "runtime.shutdown_depot_db_close_failed",
+                    "The Flowgrid shared workflow database close call raised unexpectedly during shutdown.",
+                    exc=exc,
+                    context={"db_path": str(getattr(self.depot_db, "db_path", ""))},
+                )
+        finally:
+            self._shutdown_in_progress = False
+            self._shutdown_completed = True
+            self._shutdown_had_issues = bool(issues)
+            _runtime_log_event(
+                "runtime.shutdown_completed_with_issues" if issues else "runtime.shutdown_completed",
+                severity="warning" if issues else "info",
+                summary=(
+                    "Flowgrid shutdown completed with cleanup issues."
+                    if issues
+                    else "Flowgrid shutdown completed and released runtime resources."
+                ),
+                context={
+                    "reason": shutdown_reason,
+                    "db_path": str(getattr(self.depot_db, "db_path", "")),
+                    "issue_count": len(issues),
+                    "issues": issues,
+                },
+            )
+        return not issues
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._persist_shell_close_state()
-        self._close_shell_internal_dialogs()
-        self.save_config()
-
         if self._has_visible_controlled_windows():
+            self._persist_shell_close_state()
+            self._close_shell_internal_dialogs()
+            self.save_config()
             self._drag_offset = None
             self._hover_inside = False
             self._hover_revealed = False
@@ -5184,22 +5659,7 @@ class QuickInputsWindow(QMainWindow):
             )
             return
 
-        app = QApplication.instance()
-        if app is not None:
-            app.removeEventFilter(self)
-        for scroll in self.quick_tab_scrolls:
-            try:
-                scroll.viewport().removeEventFilter(self)
-            except Exception as exc:
-                _runtime_log_event(
-                    "ui.close_remove_event_filter_failed",
-                    severity="warning",
-                    summary="Failed removing viewport event filter during app close.",
-                    exc=exc,
-                    context={"scroll_object": repr(scroll)},
-                )
-        if hasattr(self, "window_manager") and self.window_manager is not None:
-            self.window_manager.close_all()
+        self._shutdown_application("shell.closeEvent")
         super().closeEvent(event)
 
 __all__ = [

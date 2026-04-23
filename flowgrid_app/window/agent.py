@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from html import escape
 from pathlib import Path
 from typing import Any
 import sqlite3
@@ -247,6 +246,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._client_due_active_ids: set[int] = set()
         self._missing_po_followup_ids: set[int] = set()
         self._recent_submission_rows_by_id: dict[int, dict[str, Any]] = {}
+        self._recent_submission_row_widgets: list[tuple[QPushButton, QLabel]] = []
         self._team_client_due_count = 0
         self._tab_flash_timer = QTimer(self)
         self._tab_flash_timer.setInterval(700)
@@ -287,9 +287,37 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         if self.team_client_tab is not None:
             self._build_team_client_tab()
         self._agent_tabs_ready = True
+        self._apply_read_only_ui_state()
 
         if self.app_window is not None:
             self.apply_theme_styles()
+
+    def _apply_read_only_ui_state(self) -> None:
+        if not self.is_read_only_mode():
+            return
+        self._disable_widgets_for_read_only(
+            [
+                getattr(self, "work_order_input", None),
+                getattr(self, "work_status", None),
+                getattr(self, "work_category", None),
+                getattr(self, "work_client_check", None),
+                getattr(self, "work_comments", None),
+                getattr(self, "work_submit_btn", None),
+                getattr(self, "parts_open_notes_btn", None),
+                getattr(self, "parts_working_btn", None),
+                getattr(self, "parts_installed_btn", None),
+                getattr(self, "cat_open_notes_btn", None),
+                getattr(self, "cat_working_btn", None),
+                getattr(self, "cat_installed_btn", None),
+                getattr(self, "agent_rtv_open_notes_btn", None),
+                getattr(self, "agent_missing_po_open_notes_btn", None),
+                getattr(self, "agent_missing_po_reassign_btn", None),
+                getattr(self, "agent_missing_po_resolve_btn", None),
+            ],
+            "Agent data updates",
+        )
+        for delete_btn, _label in self._recent_submission_row_widgets:
+            self._disable_widgets_for_read_only([delete_btn], "Recent submission removal")
 
     def _build_work_tab(self):
         root = QHBoxLayout(self.work_tab)
@@ -350,7 +378,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         action_row = QHBoxLayout(action_row_wrap)
         action_row.setContentsMargins(0, 0, 0, 0)
         action_row.setSpacing(6)
+        self.work_today_compact_summary_label = QLabel("Today: 0")
+        self.work_today_compact_summary_label.setProperty("section", True)
+        self.work_today_compact_summary_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.work_today_compact_summary_label.setVisible(False)
+        self.work_today_compact_summary_label.setFixedHeight(24)
         action_row.addStretch(1)
+        action_row.addWidget(self.work_today_compact_summary_label, 0)
         action_row.addWidget(self.work_submit_btn, 0)
 
         left_layout.addRow("User", user_row_wrap)
@@ -362,22 +396,39 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         left_layout.addRow("", action_row_wrap)
         left_col.addWidget(form_wrap, 0)
 
-        self.work_today_compact_summary_label = QLabel("Today: 0")
-        self.work_today_compact_summary_label.setProperty("section", True)
-        self.work_today_compact_summary_label.setVisible(False)
-        left_col.addWidget(self.work_today_compact_summary_label, 0)
-
-        self.recent_submissions_label = QLabel()
-        self.recent_submissions_label.setWordWrap(False)
-        self.recent_submissions_label.setOpenExternalLinks(False)
-        self.recent_submissions_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.recent_submissions_label.linkActivated.connect(self._on_recent_submission_link_activated)
-        self.recent_submissions_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        line_height = max(14, int(self.recent_submissions_label.fontMetrics().lineSpacing()))
-        self.recent_submissions_label.setFixedHeight((line_height * 4) + 6)
-        left_col.addWidget(self.recent_submissions_label, 0)
+        self.recent_submissions_wrap = QWidget(left_wrap)
+        recent_layout = QVBoxLayout(self.recent_submissions_wrap)
+        recent_layout.setContentsMargins(0, 0, 0, 0)
+        recent_layout.setSpacing(2)
+        self.recent_submissions_heading_label = QLabel("Latest 3 submissions:")
+        recent_layout.addWidget(self.recent_submissions_heading_label, 0)
+        line_height = max(16, int(self.recent_submissions_heading_label.fontMetrics().lineSpacing()))
+        self._recent_submission_row_widgets = []
+        for index in range(1, 4):
+            row_wrap = QWidget(self.recent_submissions_wrap)
+            row_layout = QHBoxLayout(row_wrap)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            delete_btn = QPushButton("x")
+            delete_btn.setObjectName("DepotFramelessCloseButton")
+            delete_btn.setFixedSize(18, 18)
+            delete_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            delete_btn.setAutoDefault(False)
+            delete_btn.setDefault(False)
+            delete_btn.setToolTip("Remove this recent submission")
+            delete_btn.setProperty("submissionId", 0)
+            delete_btn.hide()
+            delete_btn.clicked.connect(self._on_recent_submission_delete_clicked)
+            text_label = QLabel(f"{index}. (none)")
+            text_label.setWordWrap(False)
+            text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            text_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            text_label.setFixedHeight(line_height + 2)
+            row_layout.addWidget(delete_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+            row_layout.addWidget(text_label, 1)
+            recent_layout.addWidget(row_wrap, 0)
+            self._recent_submission_row_widgets.append((delete_btn, text_label))
+        left_col.addWidget(self.recent_submissions_wrap, 0)
         left_col.addStretch(1)
         root.addWidget(left_wrap, 3)
 
@@ -1011,6 +1062,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         )
 
     def _submit_work_entry(self):
+        if self._warn_if_read_only("Work submission"):
+            return
         wo = self.work_order_input.text().strip()
         if not wo:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Work order is required.")
@@ -1021,7 +1074,11 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         comments = self.work_comments.text().strip()
 
         try:
-            blocking_submission = self.tracker.get_blocking_work_submission(wo)
+            blocking_submission = self.tracker.get_blocking_work_submission(
+                wo,
+                self.current_user,
+                next_touch=touch,
+            )
             if blocking_submission is not None:
                 latest_touch = str(blocking_submission.get("touch", "") or "").strip() or "Unknown"
                 latest_user = DepotRules.normalize_user_id(str(blocking_submission.get("user_id", "") or ""))
@@ -1148,11 +1205,11 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         dialog.exec()
         return dialog.clickedButton() == remove_button
 
-    def _on_recent_submission_link_activated(self, link: str) -> None:
-        text = str(link or "").strip()
-        if not text.startswith("delete_recent:"):
+    def _on_recent_submission_delete_clicked(self) -> None:
+        if self._warn_if_read_only("Recent submission removal"):
             return
-        submission_id = int(max(0, safe_int(text.partition(":")[2], 0)))
+        button = self.sender()
+        submission_id = int(max(0, safe_int(button.property("submissionId"), 0))) if isinstance(button, QPushButton) else 0
         if submission_id <= 0:
             return
         row = self._recent_submission_rows_by_id.get(submission_id)
@@ -1191,7 +1248,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         )
         self._refresh_after_work_change(impacted_sections, reason="delete_work_submission")
         self._show_copy_notice(
-            self.recent_submissions_label,
+            self.recent_submissions_wrap,
             f"Removed {str(result.get('work_order', '') or '').strip() or 'submission'}",
             duration_ms=3200,
         )
@@ -1225,14 +1282,20 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 context={"user_id": str(self.current_user)},
             )
             self._recent_submission_rows_by_id = {}
-            self.recent_submissions_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.recent_submissions_label.setText("Recent submissions: unavailable")
+            self.recent_submissions_heading_label.setText("Recent submissions: unavailable")
+            for index, (delete_btn, text_label) in enumerate(self._recent_submission_row_widgets, start=1):
+                delete_btn.hide()
+                delete_btn.setProperty("submissionId", 0)
+                text_label.setText(f"{index}. (unavailable)")
             return
 
+        self.recent_submissions_heading_label.setText("Latest 3 submissions:")
         if not rows:
             self._recent_submission_rows_by_id = {}
-            self.recent_submissions_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.recent_submissions_label.setText("Latest 3 submissions:\n1. (none)\n2. (none)\n3. (none)")
+            for index, (delete_btn, text_label) in enumerate(self._recent_submission_row_widgets, start=1):
+                delete_btn.hide()
+                delete_btn.setProperty("submissionId", 0)
+                text_label.setText(f"{index}. (none)")
             self._mark_depot_view_refreshed(
                 "agent_recent",
                 state_key,
@@ -1244,7 +1307,6 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             return
 
         rendered_rows: list[dict[str, Any]] = []
-        lines: list[str] = ["Latest 3 submissions:"]
         for index, row in enumerate(rows, start=1):
             row_payload = dict(row)
             submission_id = int(max(0, safe_int(row_payload.get("id", 0), 0)))
@@ -1253,26 +1315,25 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             category = category_map.get(DepotRules.normalize_work_order(wo), "") or str(row["category"] or "").strip() or "Other"
             client_marker = " | Client" if int(row["client_unit"] or 0) else ""
             stamp = self._format_submission_stamp(str(row["latest_stamp"] or ""))
-            remove_link = (
-                f'<a href="delete_recent:{submission_id}" '
-                'style="text-decoration:none;">'
-                '<span style="background-color:#D95A5A; color:#FFFFFF; font-weight:700; '
-                'padding:1px 6px; border-radius:8px;">&minus;</span></a>'
-            )
-            lines.append(
-                f'{remove_link} {index}. {escape(wo)} ({escape(touch)} | {escape(category)}{escape(client_marker)}) '
-                f'[{escape(stamp)}]'
-            )
+            if index <= len(self._recent_submission_row_widgets):
+                delete_btn, text_label = self._recent_submission_row_widgets[index - 1]
+                delete_btn.show()
+                delete_btn.setProperty("submissionId", submission_id)
+                delete_btn.setToolTip(f"Remove {wo} ({touch})")
+                text_label.setText(f"{index}. {wo} ({touch} | {category}{client_marker}) [{stamp}]")
             rendered_rows.append(row_payload)
 
         for index in range(len(rows) + 1, 4):
-            lines.append(f"{index}. (none)")
+            if index <= len(self._recent_submission_row_widgets):
+                delete_btn, text_label = self._recent_submission_row_widgets[index - 1]
+                delete_btn.hide()
+                delete_btn.setProperty("submissionId", 0)
+                delete_btn.setToolTip("Remove this recent submission")
+                text_label.setText(f"{index}. (none)")
 
         self._recent_submission_rows_by_id = {
             int(max(0, safe_int(row_payload.get("id", 0), 0))): row_payload for row_payload in rendered_rows
         }
-        self.recent_submissions_label.setTextFormat(Qt.TextFormat.RichText)
-        self.recent_submissions_label.setText("<br/>".join(lines))
         self._mark_depot_view_refreshed(
             "agent_recent",
             state_key,
@@ -1484,6 +1545,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         return format_working_updated_stamp(raw_stamp)
 
     def _toggle_selected_part_working(self, table: QTableWidget) -> None:
+        if self._warn_if_read_only("Working-owner updates"):
+            return
         part_id = _selected_part_id_from_table(table)
         if part_id is None:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
@@ -1530,6 +1593,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._refresh_category_parts(force=True, reason="part_working_toggle", ttl_ms=0)
 
     def _toggle_selected_part_installed(self, table: QTableWidget) -> None:
+        if self._warn_if_read_only("Installed-part updates"):
+            return
         part_id = _selected_part_id_from_table(table)
         if part_id is None:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a row first.")
@@ -1638,6 +1703,8 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         return super().eventFilter(watched, event)
 
     def _open_agent_notes_for_table(self, table: QTableWidget) -> None:
+        if self._warn_if_read_only("Notes updates"):
+            return
         changed, _part_id = _edit_part_notes(
             self,
             self.tracker,

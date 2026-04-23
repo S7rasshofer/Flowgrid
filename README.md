@@ -5,8 +5,11 @@
 Flowgrid is a desktop productivity and workflow tool for repair operations. 
 It combines a quick-launch input grid, a tracker hub for repair activity, inventory/parts coordination, admin maintenance, and dashboard reporting for a repair process.
 
-> Put `Assets`, `Flowgrid.pyw`, `Flowgrid_installer.pyw`, and `flowgrid_app` in the shared Flowgrid source location.
-> Run `Flowgrid_installer.pyw` from the shared source to install the local runtime in `Documents\\Flowgrid`.
+> Production bootstrap can start from only `Flowgrid_installer.pyw` in the shared Flowgrid location.
+> The installer creates or validates the shared `Logs`, `Flowgrid_depot.db`, and `Assets` tree, then installs the local runtime into `Documents\\Flowgrid` for `main` or `Documents\\Flowgrid Beta` for `beta`.
+> Runtime code (`Flowgrid.pyw`, `flowgrid_app`, packaged `Assets`) is pulled from the channel-configured GitHub repo/branch and installed locally.
+> Shared-drive `Assets` are overlaid onto the local runtime at startup and from Settings without deleting local-only files.
+> Optional `Flowgrid_channel.json` beside the installer defines channel metadata (`main` by default). `beta` installs side by side, uses its own shared snapshot root, and opens the copied DB read-only.
 > `python Flowgrid.pyw --create-shortcut` creates or repairs the local desktop shortcut.
 > `python Flowgrid.pyw --install` remains a legacy alias for local shortcut setup.
 > `python Flowgrid.pyw --diagnose-install` runs a read-only install preflight.

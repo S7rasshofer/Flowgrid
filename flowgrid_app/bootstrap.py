@@ -9,12 +9,17 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from flowgrid_app import RuntimeOptions
 from flowgrid_app.paths import (
     APP_TITLE,
     CONFIG_FILENAME,
     DEPOT_DB_FILENAME,
     LOGS_DIR_NAME,
     MIN_PYTHON_VERSION,
+    _current_channel_display_name,
+    _current_channel_id,
+    _current_channel_label,
+    _current_channel_settings,
     _find_local_paths_config,
     _get_local_config_folder,
     _get_shared_root_from_config,
@@ -187,6 +192,7 @@ def _log_runtime_storage_contract(shared_root: Path | None = None) -> None:
     config_path = _find_local_paths_config()
     resolved_shared_root = shared_root if shared_root is not None else _get_shared_root_from_config()
     runtime_dir = _local_data_root()
+    channel_settings = _current_channel_settings()
     local_config_path = _resolve_path_from_config(
         "local_paths.config_folder",
         "{DOCUMENTS}\\Flowgrid\\Config",
@@ -209,6 +215,13 @@ def _log_runtime_storage_contract(shared_root: Path | None = None) -> None:
         context={
             "paths_config": str(config_path) if config_path is not None else "",
             "runtime_dir": str(runtime_dir),
+            "channel_id": str(channel_settings.get("channel_id") or ""),
+            "channel_label": str(channel_settings.get("channel_label") or ""),
+            "channel_display_name": str(channel_settings.get("channel_display_name") or ""),
+            "read_only_db": bool(channel_settings.get("read_only_db", False)),
+            "repo_url": str(channel_settings.get("repo_url") or ""),
+            "branch": str(channel_settings.get("branch") or ""),
+            "snapshot_source_root": str(channel_settings.get("snapshot_source_root") or ""),
             "shared_root": str(resolved_shared_root),
             "shared_workflow_db": str(resolved_shared_root / DEPOT_DB_FILENAME),
             "local_user_config": str(local_config_path),
@@ -411,6 +424,26 @@ def _run_base_startup_initialization(
         _fatal_launch_error("TH-1900", "Unexpected startup initialization failure.", repr(exc))
 
 
+def _runtime_options_from_install_manifest() -> RuntimeOptions:
+    channel_settings = _current_channel_settings()
+    read_only_db = bool(channel_settings.get("read_only_db", False))
+    channel_id = str(channel_settings.get("channel_id") or _current_channel_id())
+    channel_label = str(channel_settings.get("channel_label") or _current_channel_label())
+    channel_display_name = str(channel_settings.get("channel_display_name") or _current_channel_display_name() or APP_TITLE)
+    return RuntimeOptions(
+        read_only_db=read_only_db,
+        skip_shortcut_sync=read_only_db,
+        skip_startup_repairs=read_only_db,
+        skip_shared_icon_reconcile=read_only_db,
+        channel_id=channel_id,
+        channel_label=channel_label,
+        channel_display_name=channel_display_name,
+        repo_url=str(channel_settings.get("repo_url") or ""),
+        branch=str(channel_settings.get("branch") or ""),
+        snapshot_source_root=str(channel_settings.get("snapshot_source_root") or ""),
+    )
+
+
 def main() -> int:
     from PySide6.QtWidgets import QApplication
     from .window.shell import QuickInputsWindow
@@ -427,9 +460,11 @@ def main() -> int:
             )
 
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_TITLE)
+    runtime_options = _runtime_options_from_install_manifest()
+    app.setApplicationName(str(runtime_options.channel_display_name or APP_TITLE))
     app.setQuitOnLastWindowClosed(True)
-    window = QuickInputsWindow()
+    window = QuickInputsWindow(runtime_options=runtime_options)
+    app.aboutToQuit.connect(lambda: window._shutdown_application("app.aboutToQuit"))
     window.show()
     return app.exec()
 

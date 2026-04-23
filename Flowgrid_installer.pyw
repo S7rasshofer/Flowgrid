@@ -1,54 +1,147 @@
 #!/usr/bin/env python3
 """
-Flowgrid Installer - Pure Python Installation Script
+Flowgrid Installer - Standalone GitHub bootstrap installer and updater.
 
-This installer runs from the shared drive and installs Flowgrid locally.
-No .CMD files, no PowerShell, no external scripts.
-
-Requirements:
-- Python 3.10+
-- PySide6 (required, will be auto-installed if missing)
-- Run from shared drive by double-clicking this .pyw file
-
-Installation steps:
-1. Verify Python version
-2. Check/install dependencies
-3. Copy app and assets to local Documents\\Flowgrid
-4. Write local shared-root manifest
-5. Verify shared database path
-6. Create desktop shortcut
-7. Show completion dialog
+Deployment contract:
+- Shared drive bootstrap can start from only Flowgrid_installer.pyw
+- Shared data lives in the shared root (Flowgrid_depot.db, Assets, Logs)
+- App/runtime code comes from the configured GitHub repo/branch
+- Shared Assets overlay onto the local runtime without deleting local-only files
 """
+
+from __future__ import annotations
 
 import ctypes
 import getpass
+import hashlib
 import json
 import os
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
+import tempfile
 import traceback
+import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-
-from flowgrid_app.installer import (
-    DESKTOP_SHORTCUT_FILENAME,
-    MANAGED_SHORTCUT_ICON_FILENAME,
-    WINDOWS_SHORTCUT_DESCRIPTION,
-    _create_or_update_windows_shortcut,
-    _preferred_gui_python_executable,
-)
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 APP_TITLE = "Flowgrid"
 CONFIG_FILENAME = "Flowgrid_config.json"
+CHANNEL_CONFIG_FILENAME = "Flowgrid_channel.json"
+INSTALL_STATE_FILENAME = "Flowgrid_install_state.json"
+LOCAL_INSTALLER_FILENAME = "Flowgrid_installer.pyw"
 LOCAL_APP_FOLDER_NAME = APP_TITLE
 LOGS_DIR_NAME = "Logs"
-MIN_PYTHON_VERSION = (3, 8, 0)
+DEPOT_DB_FILENAME = "Flowgrid_depot.db"
+MIN_PYTHON_VERSION = (3, 10, 0)
 DEPENDENCY_SPECS: Tuple[Tuple[str, str, bool], ...] = (
     ("PySide6", "PySide6", True),
 )
+DEFAULT_REPO_URL = "https://github.com/S7rasshofer/Flowgrid.git"
+DEFAULT_REPO_BRANCH = "main"
+GITHUB_USER_AGENT = "Flowgrid-Installer/1.0"
+GITHUB_API_ACCEPT = "application/vnd.github+json"
+GITHUB_ARCHIVE_ACCEPT = "application/zip"
+GITHUB_TIMEOUT_SECONDS = 20.0
+DESKTOP_SHORTCUT_FILENAME = f"{APP_TITLE}.lnk"
+MANAGED_SHORTCUT_ICON_FILENAME = "Flowgrid_shortcut.ico"
+WINDOWS_SHORTCUT_DESCRIPTION = "Launch Flowgrid"
+REPO_MANAGED_HASHES_KEY = "repo_managed_files"
+SHARED_ASSET_HASHES_KEY = "shared_asset_files"
+DEFAULT_CHANNEL_ID = "main"
+DEFAULT_CHANNEL_LABEL = "Main"
+DEFAULT_CHANNEL_READ_ONLY_DB = False
+LAST_SNAPSHOT_SYNC_AT_KEY = "last_snapshot_sync_at_utc"
+LAST_SNAPSHOT_SYNC_STATUS_KEY = "last_snapshot_sync_status"
+LAST_SNAPSHOT_SYNC_SUMMARY_KEY = "last_snapshot_sync_summary"
+MANAGED_SHARED_ASSET_DIRS = (
+    "agent_icons",
+    "admin_icons",
+    "qa_flag_icons",
+    "part_flag_images",
+    "ui_icons",
+    "Flowgrid Icons",
+)
 _FLOWGRID_PATHS_CONFIG: Optional[Dict[str, Any]] = None
+
+
+def _normalize_channel_id(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    return text or DEFAULT_CHANNEL_ID
+
+
+def _normalize_channel_label(value: Any, *, channel_id: str | None = None) -> str:
+    resolved_channel = _normalize_channel_id(channel_id or value)
+    text = str(value or "").strip()
+    if text:
+        return text
+    if resolved_channel == DEFAULT_CHANNEL_ID:
+        return DEFAULT_CHANNEL_LABEL
+    return resolved_channel.replace("_", " ").replace("-", " ").title()
+
+
+def _channel_display_name(channel_id: Any = "", channel_label: Any = "") -> str:
+    resolved_channel = _normalize_channel_id(channel_id)
+    resolved_label = _normalize_channel_label(channel_label, channel_id=resolved_channel)
+    if resolved_channel == DEFAULT_CHANNEL_ID:
+        return APP_TITLE
+    return f"{APP_TITLE} {resolved_label}".strip()
+
+
+def _expand_path_text(value: Any) -> str:
+    return os.path.expandvars(os.path.expanduser(str(value or "").strip()))
+
+
+def _load_channel_config(shared_root: Path) -> Dict[str, Any]:
+    config_path = shared_root / CHANNEL_CONFIG_FILENAME
+    payload: Dict[str, Any] = {}
+    if config_path.exists() and config_path.is_file():
+        try:
+            loaded = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Failed parsing {config_path}: {type(exc).__name__}: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise RuntimeError(f"{config_path} must contain a JSON object.")
+        payload.update(loaded)
+
+    channel_id = _normalize_channel_id(payload.get("channel_id", DEFAULT_CHANNEL_ID))
+    channel_label = _normalize_channel_label(payload.get("channel_label", ""), channel_id=channel_id)
+    repo_url = str(payload.get("repo_url") or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL
+    branch = str(payload.get("branch") or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+    read_only_db = bool(payload.get("read_only_db", DEFAULT_CHANNEL_READ_ONLY_DB))
+    snapshot_source_root = _expand_path_text(payload.get("snapshot_source_root", ""))
+    local_app_folder_name = APP_TITLE if channel_id == DEFAULT_CHANNEL_ID else _channel_display_name(channel_id, channel_label)
+    shortcut_filename = f"{local_app_folder_name}.lnk"
+    shortcut_description = f"Launch {local_app_folder_name}"
+    normalized = {
+        "channel_id": channel_id,
+        "channel_label": channel_label,
+        "channel_display_name": _channel_display_name(channel_id, channel_label),
+        "repo_url": repo_url,
+        "branch": branch,
+        "read_only_db": read_only_db,
+        "snapshot_source_root": snapshot_source_root,
+        "local_app_folder_name": local_app_folder_name,
+        "shortcut_filename": shortcut_filename,
+        "shortcut_description": shortcut_description,
+        "config_path": str(config_path),
+    }
+    return normalized
+
+
+def _resolve_snapshot_source_root(channel: Dict[str, Any], shared_root: Path) -> Path | None:
+    raw = str(channel.get("snapshot_source_root") or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = shared_root / candidate
+    return candidate.resolve()
 
 
 def _record_step(
@@ -78,24 +171,34 @@ def _step_marker(status: str) -> str:
         return "[FAIL]"
     return "[INFO]"
 
-# ============================================================================
-# CONFIGURATION LOADING (same as main app)
-# ============================================================================
 
-def _find_local_paths_config() -> Optional[Path]:
-    """Locate Flowgrid_paths.json in the local installer runtime folder."""
-    candidates: List[Path] = []
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
 
-    env_override = str(os.environ.get("FLOWGRID_PATHS_CONFIG", "") or "").strip()
-    if env_override:
-        candidates.append(Path(env_override))
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
+
+def _short_sha(value: str, length: int = 12) -> str:
+    text = str(value or "").strip()
+    return text[:length] if text else ""
+
+
+def _safe_print(message: str = "", end: str = "\n") -> None:
     try:
-        script_dir = Path(__file__).resolve().parent
-        candidates.append(script_dir / "Flowgrid_paths.json")
+        print(message, end=end)
     except Exception:
         pass
 
+
+def _find_local_paths_config() -> Optional[Path]:
+    candidates: List[Path] = []
+    env_override = str(os.environ.get("FLOWGRID_PATHS_CONFIG", "") or "").strip()
+    if env_override:
+        candidates.append(Path(env_override))
+    try:
+        candidates.append(Path(__file__).resolve().parent / "Flowgrid_paths.json")
+    except Exception:
+        pass
     candidates.append(Path.cwd() / "Flowgrid_paths.json")
 
     for candidate in candidates:
@@ -104,176 +207,172 @@ def _find_local_paths_config() -> Optional[Path]:
                 return candidate.resolve()
         except Exception:
             pass
-
     return None
 
 
 def load_paths_config() -> Dict[str, Any]:
-    """Load and cache Flowgrid_paths.json configuration."""
     global _FLOWGRID_PATHS_CONFIG
-
     if _FLOWGRID_PATHS_CONFIG is not None:
         return _FLOWGRID_PATHS_CONFIG
 
     config_path = _find_local_paths_config()
     if config_path is None:
-        return {}
+        _FLOWGRID_PATHS_CONFIG = {}
+        return _FLOWGRID_PATHS_CONFIG
 
     try:
-        with config_path.open("r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        details = f"Config path: {config_path}\nReason: {type(exc).__name__}: {exc}"
-        log_installer_error("PATHS_CONFIG_PARSE_FAILED", "Failed to parse Flowgrid_paths.json.", details)
-        raise RuntimeError(details)
+        raise RuntimeError(f"Failed parsing {config_path}: {type(exc).__name__}: {exc}") from exc
 
     if not isinstance(loaded, dict):
-        details = f"Config path: {config_path}\nValue type: {type(loaded).__name__}"
-        log_installer_error("PATHS_CONFIG_INVALID", "Flowgrid_paths.json must contain a JSON object.", details)
-        raise RuntimeError(details)
+        raise RuntimeError(f"{config_path} must contain a JSON object.")
 
     _FLOWGRID_PATHS_CONFIG = loaded
     return _FLOWGRID_PATHS_CONFIG
 
 
 def get_script_root() -> Path:
-    """Get the directory where this installer script is located."""
     try:
         return Path(__file__).resolve().parent
     except Exception:
         return Path.cwd()
 
 
-def get_env_source_root() -> Optional[Path]:
-    """Get source root from an environment override, if present."""
-    override = str(os.environ.get("FLOWGRID_SOURCE_ROOT", "") or "").strip()
-    if not override:
+def _resolve_windows_documents_directory() -> Path | None:
+    if os.name != "nt":
         return None
-    candidate = Path(override)
-    if candidate.exists() and (candidate / "Flowgrid.pyw").exists():
-        return candidate.resolve()
+
+    try:
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0005, None, 0, buffer)
+        if result == 0 and str(buffer.value).strip():
+            path = Path(str(buffer.value).strip())
+            if path.exists() and path.is_dir():
+                return path
+    except Exception:
+        pass
+
+    userprofile = str(os.environ.get("USERPROFILE", "") or "").strip()
+    if userprofile:
+        candidate = Path(userprofile) / "Documents"
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    candidate = Path.home() / "Documents"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+
     return None
-
-
-def get_config_source_root(shared_root: Path) -> Optional[Path]:
-    """Get an explicit source root from configuration, if present."""
-    config = load_paths_config()
-    source_root = config.get("source_root")
-    if not source_root and isinstance(config.get("shared_paths"), dict):
-        source_root = config["shared_paths"].get("source_root")
-    if not source_root:
-        return None
-    candidate = Path(substitute_path_variables(str(source_root), shared_root))
-    if candidate.exists() and (candidate / "Flowgrid.pyw").exists():
-        return candidate.resolve()
-    return None
-
-
-def find_nearby_source_root() -> Optional[Path]:
-    """Search the script and working-directory ancestry for Flowgrid.pyw."""
-    checked = set()
-    for base in (get_script_root(), Path.cwd()):
-        path = base
-        for _ in range(6):
-            if path in checked:
-                break
-            checked.add(path)
-            if (path / "Flowgrid.pyw").exists():
-                return path.resolve()
-            path = path.parent
-    return None
-
-
-def find_actual_shared_root() -> Path:
-    """Resolve the shared root from the installer environment."""
-    env_root = get_env_source_root()
-    if env_root is not None:
-        return env_root
-
-    script_root = get_script_root()
-    if (script_root / "Flowgrid.pyw").exists() and (script_root / "Assets").exists():
-        return script_root.resolve()
-
-    raise RuntimeError(
-        "Installer must be run from the shared drive source root or "
-        "FLOWGRID_SOURCE_ROOT must point to a valid shared install path."
-    )
 
 
 def substitute_path_variables(template: str, shared_root: Path) -> str:
-    """Substitute {DOCUMENTS}, {SHARED_ROOT}, etc. in path strings."""
-    if not template:
-        return ""
-
-    result = str(template)
-
-    # Substitute {DOCUMENTS}
+    result = str(template or "")
     if "{DOCUMENTS}" in result:
-        try:
-            documents = _resolve_windows_documents_directory() or (Path.home() / "Documents")
-            result = result.replace("{DOCUMENTS}", str(documents))
-        except Exception:
-            pass
-
-    # Substitute {SHARED_ROOT}
+        documents = _resolve_windows_documents_directory() or (Path.home() / "Documents")
+        result = result.replace("{DOCUMENTS}", str(documents))
     if "{SHARED_ROOT}" in result:
         result = result.replace("{SHARED_ROOT}", str(shared_root))
-
     return result
 
 
 def resolve_path_from_config(config_key: str, default: str, shared_root: Path) -> Path:
-    """Retrieve a path from the config, with substitution and fallback."""
     config = load_paths_config()
-
-    # Navigate nested keys (e.g., "local_paths.database_folder")
-    parts = str(config_key).split(".")
-    value = config
-    for part in parts:
+    value: Any = config
+    for part in str(config_key or "").split("."):
         if isinstance(value, dict):
             value = value.get(part)
         else:
             value = None
             break
-
     if value is None:
-        return Path(substitute_path_variables(default, shared_root))
-
+        value = default
     return Path(substitute_path_variables(str(value), shared_root))
 
 
-DEFAULT_SHARED_ROOT = Path(r"Z:\DATA\Flowgrid")
+def find_actual_shared_root() -> Path:
+    env_root = str(os.environ.get("FLOWGRID_SHARED_ROOT", "") or os.environ.get("FLOWGRID_SOURCE_ROOT", "")).strip()
+    if env_root:
+        candidate = Path(env_root)
+        if candidate.exists() and candidate.is_dir():
+            return candidate.resolve()
+
+    config = load_paths_config()
+    shared_root_str = str(config.get("shared_drive_root") or "").strip()
+    if shared_root_str:
+        candidate = Path(shared_root_str)
+        if candidate.exists() and candidate.is_dir():
+            return candidate.resolve()
+
+    script_root = get_script_root()
+    if (script_root / DEPOT_DB_FILENAME).exists():
+        return script_root.resolve()
+    if _find_local_paths_config() is None:
+        return script_root.resolve()
+
+    raise RuntimeError(
+        "Installer could not determine the shared Flowgrid root. "
+        "Run it from the shared Flowgrid folder or set FLOWGRID_SHARED_ROOT."
+    )
 
 
-def get_shared_root_from_config() -> Path:
-    """Get the configured shared drive root from the actual installer location."""
-    return find_actual_shared_root()
+def get_installation_paths() -> Dict[str, Any]:
+    shared_root = find_actual_shared_root()
+    channel = _load_channel_config(shared_root)
+    documents_folder = _resolve_windows_documents_directory() or (Path.home() / "Documents")
+    local_app_folder = documents_folder / str(channel.get("local_app_folder_name") or LOCAL_APP_FOLDER_NAME)
+    local_config_folder = local_app_folder / "Config"
+    local_data_folder = local_app_folder / "Data"
+    local_queue_folder = local_app_folder / "Queue"
+    shared_assets = resolve_path_from_config("shared_paths.assets_folder", "{SHARED_ROOT}\\Assets", shared_root)
+    snapshot_source_root = _resolve_snapshot_source_root(channel, shared_root)
+    return {
+        "channel": channel,
+        "channel_id": str(channel.get("channel_id") or DEFAULT_CHANNEL_ID),
+        "channel_label": str(channel.get("channel_label") or DEFAULT_CHANNEL_LABEL),
+        "channel_display_name": str(channel.get("channel_display_name") or APP_TITLE),
+        "repo_url": str(channel.get("repo_url") or DEFAULT_REPO_URL),
+        "branch": str(channel.get("branch") or DEFAULT_REPO_BRANCH),
+        "read_only_db": bool(channel.get("read_only_db", False)),
+        "snapshot_source_root": str(channel.get("snapshot_source_root") or ""),
+        "snapshot_source_root_path": snapshot_source_root,
+        "shortcut_filename": str(channel.get("shortcut_filename") or DESKTOP_SHORTCUT_FILENAME),
+        "shortcut_description": str(channel.get("shortcut_description") or WINDOWS_SHORTCUT_DESCRIPTION),
+        "shared_root": shared_root,
+        "shared_logs": shared_root / LOGS_DIR_NAME,
+        "source_root": get_script_root(),
+        "shared_assets": shared_assets,
+        "shared_db": shared_root / DEPOT_DB_FILENAME,
+        "shared_config": shared_root / CONFIG_FILENAME,
+        "shared_channel_config": shared_root / CHANNEL_CONFIG_FILENAME,
+        "documents_folder": documents_folder,
+        "local_app_folder": local_app_folder,
+        "local_app": local_app_folder / "Flowgrid.pyw",
+        "local_installer": local_app_folder / LOCAL_INSTALLER_FILENAME,
+        "local_package": local_app_folder / "flowgrid_app",
+        "local_config_folder": local_config_folder,
+        "local_config": local_config_folder / CONFIG_FILENAME,
+        "local_data_folder": local_data_folder,
+        "local_queue_folder": local_queue_folder,
+        "local_assets": local_app_folder / "Assets",
+        "local_paths_config": local_app_folder / "Flowgrid_paths.json",
+        "install_state": local_config_folder / INSTALL_STATE_FILENAME,
+    }
 
-
-def get_source_root() -> Path:
-    """Return the actual source root used for installation files."""
-    return find_actual_shared_root()
-
-
-# ============================================================================
-# ERROR LOGGING TO SHARED DRIVE
-# ============================================================================
 
 def get_installer_error_log_path() -> Path:
-    """Get path for installer error log on shared drive."""
-    shared_root = find_actual_shared_root()
-    log_path = shared_root / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
+    try:
+        shared_root = find_actual_shared_root()
+        log_path = shared_root / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
+    except Exception:
+        log_path = get_script_root() / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     return log_path
 
 
 def log_installer_error(error_code: str, summary: str, details: str = "") -> None:
-    """Log installer errors to shared drive."""
     try:
-        from datetime import datetime
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_path = get_installer_error_log_path()
-
+        now = _utc_now_iso()
         lines = [
             f"[{now}] [{error_code}] {summary}",
             f"Python: {sys.executable}",
@@ -281,49 +380,29 @@ def log_installer_error(error_code: str, summary: str, details: str = "") -> Non
             f"User: {os.environ.get('USERNAME', 'UNKNOWN')}",
             f"Computer: {os.environ.get('COMPUTERNAME', 'UNKNOWN')}",
         ]
-
         if details:
             lines.append(f"Details: {details}")
-
-        lines.extend([
-            f"Traceback: {traceback.format_exc()}",
-            "-" * 80,
-            ""
-        ])
-
+        lines.extend(
+            [
+                f"Traceback: {traceback.format_exc()}",
+                "-" * 80,
+                "",
+            ]
+        )
+        with get_installer_error_log_path().open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines))
+    except Exception:
         try:
-            with log_path.open("a", encoding="utf-8") as handle:
-                handle.write("\n".join(lines))
-        except Exception as write_exc:
-            fallback_path = get_script_root() / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
-            try:
-                fallback_path.parent.mkdir(parents=True, exist_ok=True)
-                with fallback_path.open("a", encoding="utf-8") as handle:
-                    handle.write("\n".join(lines))
-                    handle.write("\n[FAILOVER] Failed to write to shared log path: " + str(write_exc) + "\n")
-            except Exception:
-                # If fallback also fails, print to console
-                print(f"[INSTALLER ERROR] {error_code}: {summary}")
-                if details:
-                    print(f"Details: {details}")
-                print(f"Failed to write installer log to both {log_path} and {fallback_path}")
-    except Exception as log_exc:
-        # If logging fails, try to print to console as last resort
-        try:
-            print(f"[INSTALLER ERROR] {error_code}: {summary}")
+            _safe_print(f"[INSTALLER ERROR] {error_code}: {summary}")
             if details:
-                print(f"Details: {details}")
+                _safe_print(details)
         except Exception:
             pass
 
 
 def log_installer_status(status_code: str, summary: str, details: str = "") -> None:
-    """Write informational installer diagnostics to the shared installer log."""
     try:
-        from datetime import datetime
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        log_path = get_installer_error_log_path()
-
+        now = _utc_now_iso()
         lines = [
             f"[{now}] [INFO:{status_code}] {summary}",
             f"Python: {sys.executable}",
@@ -331,248 +410,166 @@ def log_installer_status(status_code: str, summary: str, details: str = "") -> N
             f"User: {os.environ.get('USERNAME', 'UNKNOWN')}",
             f"Computer: {os.environ.get('COMPUTERNAME', 'UNKNOWN')}",
         ]
-
         if details:
             lines.append(f"Details: {details}")
-
-        lines.extend([
-            "-" * 80,
-            ""
-        ])
-
-        with log_path.open("a", encoding="utf-8") as handle:
+        lines.extend(["-" * 80, ""])
+        with get_installer_error_log_path().open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines))
     except Exception:
         pass
 
 
-# ============================================================================
-# PYTHON VERSION CHECK
-# ============================================================================
-
 def check_python_version() -> Tuple[bool, str]:
-    """Verify Python version meets the shared Flowgrid runtime minimum."""
-    required_version = MIN_PYTHON_VERSION
     current_version = sys.version_info[:3]
-
-    if current_version < required_version:
+    if current_version < MIN_PYTHON_VERSION:
         version_str = ".".join(map(str, current_version))
-        required_str = ".".join(map(str, required_version))
-        return False, f"Python {required_str}+ required. Current: {version_str}"
-
+        required_str = ".".join(map(str, MIN_PYTHON_VERSION))
+        return False, f"Python {required_str}+ is required. Current: {version_str}"
     return True, ""
 
 
-# ============================================================================
-# DEPENDENCY MANAGEMENT
-# ============================================================================
-
-def get_dependency_specs() -> List[Tuple[str, str, bool]]:
-    """Get dependency specs aligned with the runtime contract."""
-    specs = list(DEPENDENCY_SPECS)
-    config = load_paths_config()
-    app_settings = config.get("app_settings", {})
-    required_raw = app_settings.get("required_packages")
-    optional_raw = app_settings.get("optional_packages")
-
-    if isinstance(required_raw, list):
-        specs = [(str(name), str(name).replace("-", "_"), True) for name in required_raw if str(name).strip()]
-        if isinstance(optional_raw, list):
-            specs.extend(
-                (str(name), str(name).replace("-", "_"), False)
-                for name in optional_raw
-                if str(name).strip()
-            )
-
-    return specs
-
-
-def get_required_packages() -> List[str]:
-    """Compatibility helper returning required package names only."""
-    return [package_name for package_name, _module_name, required in get_dependency_specs() if required]
-
-
 def check_package_import(module_name: str) -> Tuple[bool, str]:
-    """Check if a package/module can be imported."""
     try:
         __import__(module_name)
         return True, ""
-    except ImportError as e:
-        return False, str(e)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def install_package(package_name: str) -> Tuple[bool, str]:
-    """Install a Python package using pip."""
     try:
-        print(f"Installing {package_name}...")
-
         result = subprocess.run(
             [sys.executable, "-m", "pip", "--disable-pip-version-check", "install", package_name],
             capture_output=True,
             text=True,
-            timeout=300  # 5 minute timeout
+            timeout=300,
         )
-
         if result.returncode == 0:
-            print(f"✓ Successfully installed {package_name}")
             return True, ""
-        else:
-            error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown pip error"
-            return False, f"pip install failed: {error_msg}"
-
+        detail = (str(result.stderr or "").strip() or str(result.stdout or "").strip() or "No pip output.")[-2000:]
+        return False, detail
     except subprocess.TimeoutExpired:
-        return False, "Installation timed out after 5 minutes"
-    except Exception as e:
-        return False, f"Installation error: {e}"
+        return False, "pip install timed out after 300 seconds."
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 def ensure_dependencies() -> Tuple[bool, str]:
-    """Check/install required dependencies and report optional-package state."""
-    dependency_specs = get_dependency_specs()
     failed_packages: List[str] = []
-    optional_warnings: List[str] = []
-
-    for package_name, module_name, required in dependency_specs:
-        print(f"Checking {package_name}...")
-
-        installed, error = check_package_import(module_name)
+    for package_name, module_name, required in DEPENDENCY_SPECS:
+        ok, reason = check_package_import(module_name)
+        if ok:
+            continue
+        installed, install_detail = install_package(package_name)
         if installed:
-            print(f"[OK] {package_name} is already installed")
-            continue
-
-        success, install_error = install_package(package_name)
-        if not success:
-            if required:
-                failed_packages.append(f"{package_name}: {install_error}")
-            else:
-                optional_warnings.append(f"{package_name}: {install_error}")
-            continue
-
-        installed, error = check_package_import(module_name)
-        if not installed:
-            if required:
-                failed_packages.append(f"{package_name}: Import failed after install - {error}")
-            else:
-                optional_warnings.append(f"{package_name}: Import failed after install - {error}")
-
+            ok, reason = check_package_import(module_name)
+            if ok:
+                continue
+            install_detail = reason
+        if required:
+            failed_packages.append(f"{package_name}: {install_detail}")
     if failed_packages:
-        return False, f"Failed to install: {', '.join(failed_packages)}"
-
-    if optional_warnings:
-        warning_text = "; ".join(optional_warnings)
-        print(f"[WARN] Optional packages unavailable: {warning_text}")
-        log_installer_status("OPTIONAL_DEPENDENCIES", "Optional dependencies unavailable.", warning_text)
-
+        return False, "; ".join(failed_packages)
     return True, ""
 
 
-# ============================================================================
-# FILE COPYING UTILITIES
-# ============================================================================
-
-def copy_file_with_progress(src: Path, dst: Path, description: str) -> bool:
-    """Copy a file using temp+replace for deterministic reinstall behavior."""
-    temp_path = dst.with_name(f"{dst.name}.tmp")
-    try:
-        print(f"Copying {description}...")
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        if temp_path.exists():
-            temp_path.unlink()
-        shutil.copy2(src, temp_path)
-        os.replace(temp_path, dst)
-        return True
-    except Exception as e:
-        if temp_path.exists():
-            try:
-                temp_path.unlink()
-            except Exception:
-                pass
-        log_installer_error("COPY_FILE_FAILED", f"Failed to copy {description}", str(e))
-        return False
+def _powershell_single_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
-def copy_directory_recursive(src: Path, dst: Path, description: str) -> bool:
-    """Copy an entire directory recursively."""
-    try:
-        print(f"Copying {description}...")
-        if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(
-            src,
-            dst,
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
-        )
-        return True
-    except Exception as e:
-        log_installer_error("COPY_DIR_FAILED", f"Failed to copy {description}", str(e))
-        return False
-
-
-def _remove_managed_path(path: Path, description: str) -> bool:
-    """Delete an installer-managed file or directory before reinstall."""
-    try:
-        if not path.exists():
-            return True
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-        return True
-    except Exception as exc:
-        log_installer_error(
-            "MANAGED_PATH_REMOVE_FAILED",
-            f"Failed removing managed runtime path: {description}",
-            f"Path: {path}\nReason: {type(exc).__name__}: {exc}",
-        )
-        return False
-
-
-def _managed_local_runtime_targets(paths: Dict[str, Path]) -> List[Tuple[Path, str]]:
-    """Return installer-managed local runtime artifacts used for reinstall/update detection."""
-    return [
-        (paths["local_app"], "local Flowgrid application"),
-        (paths["local_package"], "local Flowgrid package folder"),
-        (paths["local_paths_config"], "local shared-root manifest"),
-        (paths["local_assets"], "local packaged Assets folder"),
-    ]
-
-
-def detect_existing_local_install(paths: Dict[str, Path]) -> bool:
-    """Treat the run as an update when an installer-managed local runtime already exists."""
-    local_app = paths["local_app"]
-    if local_app.exists() and local_app.is_file():
-        return True
-
-    for target, _description in _managed_local_runtime_targets(paths)[1:]:
-        if target.exists():
-            return True
-    return False
-
-
-def purge_managed_local_runtime(paths: Dict[str, Path]) -> bool:
-    """Remove installer-owned local runtime artifacts before reinstalling."""
-    for target, description in _managed_local_runtime_targets(paths):
-        if not _remove_managed_path(target, description):
-            return False
-    return True
-
-
-def _find_default_wrench_icon(source_root: Path, shared_root: Path) -> Path | None:
-    candidates = [
-        source_root / "Assets" / "Flowgrid Icons" / "wrench.png",
-        source_root / "Assets" / "Flowgrid Icons" / "wrench.png",
-        Path(str(shared_root)) / "Assets" / "Flowgrid Icons" / "wrench.png",
-    ]
+def _preferred_gui_python_executable() -> Path:
+    candidates: List[Path] = []
+    for raw in (getattr(sys, "_base_executable", ""), sys.executable):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        candidates.append(path)
+        candidates.append(path.parent / "pythonw.exe")
+        if path.name.lower() == "python.exe":
+            candidates.append(path.with_name("pythonw.exe"))
+    unique: List[Path] = []
     for candidate in candidates:
+        if candidate in unique:
+            continue
+        unique.append(candidate)
+    for candidate in unique:
+        if candidate.name.lower() == "pythonw.exe" and candidate.exists() and candidate.is_file():
+            return candidate
+    for candidate in unique:
         if candidate.exists() and candidate.is_file():
             return candidate
+    return Path(sys.executable)
+
+
+def _create_or_update_windows_shortcut(
+    shortcut_path: Path,
+    target_path: Path,
+    arguments: str,
+    working_directory: Path,
+    icon_path: Path,
+    description: str,
+) -> Tuple[bool, str]:
+    script = "\n".join(
+        [
+            "$ErrorActionPreference = 'Stop'",
+            "$shell = New-Object -ComObject WScript.Shell",
+            f"$shortcut = $shell.CreateShortcut({_powershell_single_quote(str(shortcut_path))})",
+            f"$shortcut.TargetPath = {_powershell_single_quote(str(target_path))}",
+            f"$shortcut.Arguments = {_powershell_single_quote(arguments)}",
+            f"$shortcut.WorkingDirectory = {_powershell_single_quote(str(working_directory))}",
+            f"$shortcut.IconLocation = {_powershell_single_quote(str(icon_path) + ',0')}",
+            f"$shortcut.Description = {_powershell_single_quote(description)}",
+            "$shortcut.WindowStyle = 1",
+            "$shortcut.Save()",
+        ]
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    if result.returncode == 0:
+        return True, ""
+    detail = (str(result.stderr or "").strip() or str(result.stdout or "").strip() or "Unknown shortcut save failure.")[-2000:]
+    return False, detail
+
+
+def _resolve_windows_desktop_directory() -> Path | None:
+    if os.name != "nt":
+        return None
+
+    try:
+        buffer = ctypes.create_unicode_buffer(260)
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer)
+        if result == 0 and str(buffer.value).strip():
+            path = Path(str(buffer.value).strip())
+            if path.exists() and path.is_dir():
+                return path
+    except Exception:
+        pass
+
+    onedrive = str(os.environ.get("OneDrive", "") or "").strip()
+    if onedrive:
+        candidate = Path(onedrive) / "Desktop"
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    candidate = Path.home() / "Desktop"
+    if candidate.exists() and candidate.is_dir():
+        return candidate
+
     return None
 
 
 def _create_shortcut_icon(source_icon: Path, target_ico: Path) -> Path:
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtGui import QImage, QPainter, QPixmap
     from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage, QPainter, QPixmap
+    from PySide6.QtWidgets import QApplication
 
     app = QApplication.instance()
     if app is None:
@@ -603,105 +600,74 @@ def _create_shortcut_icon(source_icon: Path, target_ico: Path) -> Path:
     return target_ico
 
 
-# ============================================================================
-# INSTALLATION STEPS
-# ============================================================================
-
-def _assets_source_candidates(source_root: Path, shared_root: Path) -> Path:
-    """Choose the best source path for assets."""
-    default_shared_assets = resolve_path_from_config("shared_paths.assets_folder", "{SHARED_ROOT}\\Assets", shared_root)
-    local_installer_assets = source_root / "Assets"
-
-    def is_valid_asset_folder(path: Path) -> bool:
-        if not path.exists() or not path.is_dir():
-            return False
-        try:
-            names = {child.name for child in path.iterdir() if child.is_dir()}
-            expected = {
-                "admin_icons",
-                "agent_icons",
-                "Flowgrid Icons",
-                "part_flag_images",
-                "qa_flag_icons",
-                "ui_icons",
-            }
-            return bool(names & expected)
-        except Exception:
-            return False
-
-    if is_valid_asset_folder(local_installer_assets):
-        return local_installer_assets
-    if is_valid_asset_folder(default_shared_assets):
-        return default_shared_assets
-    return local_installer_assets if local_installer_assets.exists() else default_shared_assets
+def _managed_shortcut_icon_path(paths: Dict[str, Path]) -> Path:
+    return paths["shared_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME
 
 
-def _resolve_windows_documents_directory() -> Path | None:
-    if os.name != "nt":
-        return None
-
-    try:
-        buffer = ctypes.create_unicode_buffer(260)
-        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0005, None, 0, buffer)
-        if result == 0 and str(buffer.value).strip():
-            path = Path(str(buffer.value).strip())
-            if path.exists() and path.is_dir():
-                return path
-    except Exception:
-        pass
-
-    userprofile = str(os.environ.get("USERPROFILE", "") or "").strip()
-    if userprofile:
-        candidate = Path(userprofile) / "Documents"
-        if candidate.exists() and candidate.is_dir():
+def _find_default_wrench_icon(paths: Dict[str, Path]) -> Path | None:
+    candidates = [
+        paths["local_assets"] / "Flowgrid Icons" / "wrench.png",
+        paths["shared_root"] / "Assets" / "Flowgrid Icons" / "wrench.png",
+        paths["source_root"] / "Assets" / "Flowgrid Icons" / "wrench.png",
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
             return candidate
-
-    candidate = Path.home() / "Documents"
-    if candidate.exists() and candidate.is_dir():
-        return candidate
-
     return None
 
 
-def get_installation_paths() -> Dict[str, Path]:
-    """Get all paths needed for installation."""
-    source_root = get_source_root()
-    shared_root = find_actual_shared_root()
+def create_desktop_shortcut(paths: Dict[str, Path]) -> bool:
+    try:
+        desktop_path = _resolve_windows_desktop_directory()
+        if desktop_path is None:
+            raise RuntimeError("Unable to resolve desktop folder.")
 
-    shared_assets = _assets_source_candidates(source_root, shared_root)
-    documents_folder = _resolve_windows_documents_directory() or (Path.home() / "Documents")
-    local_app_folder = documents_folder / LOCAL_APP_FOLDER_NAME
-    local_config_folder = local_app_folder / "Config"
-    local_data_folder = local_app_folder / "Data"
-    local_queue_folder = local_app_folder / "Queue"
+        icon_source = _find_default_wrench_icon(paths)
+        if icon_source is None:
+            raise RuntimeError("Unable to locate the default wrench icon for desktop shortcut creation.")
 
-    return {
-        "shared_root": shared_root,
-        "source_root": source_root,
-        "shared_app": source_root / "Flowgrid.pyw",
-        "shared_package": source_root / "flowgrid_app",
-        "shared_assets": shared_assets,
-        "shared_db": shared_root / "Flowgrid_depot.db",
-        "shared_config": shared_root / CONFIG_FILENAME,
-        "documents_folder": documents_folder,
-        "local_app_folder": local_app_folder,
-        "local_app": local_app_folder / "Flowgrid.pyw",
-        "local_package": local_app_folder / "flowgrid_app",
-        "local_config_folder": local_config_folder,
-        "local_config": local_config_folder / CONFIG_FILENAME,
-        "local_data_folder": local_data_folder,
-        "local_queue_folder": local_queue_folder,
-        "local_assets": local_app_folder / "Assets",
-        "local_paths_config": local_app_folder / "Flowgrid_paths.json",
-    }
+        managed_icon_path = _managed_shortcut_icon_path(paths)
+        _create_shortcut_icon(icon_source, managed_icon_path)
+
+        launcher_path = _preferred_gui_python_executable()
+        script_path = paths["local_app"]
+        if not launcher_path.exists() or not launcher_path.is_file():
+            raise RuntimeError(f"Python launcher not found: {launcher_path}")
+        if not script_path.exists() or not script_path.is_file():
+            raise RuntimeError(f"Installed Flowgrid.pyw not found: {script_path}")
+
+        shortcut_path = desktop_path / str(paths.get("shortcut_filename") or DESKTOP_SHORTCUT_FILENAME)
+        ok, detail = _create_or_update_windows_shortcut(
+            shortcut_path,
+            launcher_path,
+            f'"{script_path}"',
+            script_path.parent,
+            managed_icon_path,
+            str(paths.get("shortcut_description") or WINDOWS_SHORTCUT_DESCRIPTION),
+        )
+        if not ok:
+            raise RuntimeError(detail or "Unknown desktop shortcut save failure.")
+        return True
+    except Exception as exc:
+        log_installer_error("SHORTCUT_FAILED", "Failed to create desktop shortcut.", str(exc))
+        return False
 
 
 def write_local_paths_config(paths: Dict[str, Path]) -> bool:
-    """Write the local install manifest that pins the shared root."""
     target = paths["local_paths_config"]
     temp_path = target.with_name(f"{target.name}.tmp")
     payload = {
         "shared_drive_root": str(paths["shared_root"]),
+        "shared_paths": {
+            "assets_folder": str(paths["shared_assets"]),
+        },
+        "channel_id": str(paths.get("channel_id") or DEFAULT_CHANNEL_ID),
+        "channel_label": str(paths.get("channel_label") or DEFAULT_CHANNEL_LABEL),
+        "channel_display_name": str(paths.get("channel_display_name") or APP_TITLE),
+        "read_only_db": bool(paths.get("read_only_db", False)),
+        "repo_url": str(paths.get("repo_url") or DEFAULT_REPO_URL),
+        "branch": str(paths.get("branch") or DEFAULT_REPO_BRANCH),
+        "snapshot_source_root": str(paths.get("snapshot_source_root") or ""),
         "local_paths": {
             "app_folder": str(paths["local_app_folder"]),
             "config_folder": str(paths["local_config_folder"]),
@@ -710,47 +676,52 @@ def write_local_paths_config(paths: Dict[str, Path]) -> bool:
             "assets_folder": str(paths["local_assets"]),
         },
     }
-
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         os.replace(temp_path, target)
         return True
     except Exception as exc:
-        if temp_path.exists():
-            try:
+        try:
+            if temp_path.exists():
                 temp_path.unlink()
-            except Exception:
-                pass
-        log_installer_error("WRITE_MANIFEST_FAILED", "Failed to write local Flowgrid_paths.json manifest", str(exc))
+        except Exception:
+            pass
+        log_installer_error("WRITE_MANIFEST_FAILED", "Failed writing local Flowgrid_paths.json.", str(exc))
         return False
 
 
 def verify_local_paths_config(paths: Dict[str, Path]) -> bool:
-    """Read back the local manifest and verify the shared root contract."""
     target = paths["local_paths_config"]
-    expected_root = str(paths["shared_root"])
     try:
-        with target.open("r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(payload, dict):
             raise ValueError("Manifest payload is not a JSON object.")
         actual_root = str(payload.get("shared_drive_root") or "").strip()
+        expected_root = str(paths["shared_root"])
         if actual_root != expected_root:
             raise ValueError(f"Expected shared_drive_root={expected_root!r}, found {actual_root!r}.")
+        actual_channel_id = _normalize_channel_id(payload.get("channel_id", DEFAULT_CHANNEL_ID))
+        if actual_channel_id != str(paths.get("channel_id") or DEFAULT_CHANNEL_ID):
+            raise ValueError(
+                f"Expected channel_id={str(paths.get('channel_id') or DEFAULT_CHANNEL_ID)!r}, found {actual_channel_id!r}."
+            )
+        actual_read_only_db = bool(payload.get("read_only_db", False))
+        if actual_read_only_db != bool(paths.get("read_only_db", False)):
+            raise ValueError(
+                f"Expected read_only_db={bool(paths.get('read_only_db', False))!r}, found {actual_read_only_db!r}."
+            )
         return True
     except Exception as exc:
-        details = (
-            f"Manifest path: {target}\n"
-            f"Expected shared root: {expected_root}\n"
-            f"Reason: {type(exc).__name__}: {exc}"
+        log_installer_error(
+            "VERIFY_MANIFEST_FAILED",
+            "Failed verifying local Flowgrid_paths.json manifest.",
+            f"Path: {target}\nReason: {type(exc).__name__}: {exc}",
         )
-        log_installer_error("VERIFY_MANIFEST_FAILED", "Failed verifying local Flowgrid_paths.json manifest.", details)
         return False
 
 
 def create_local_folders(paths: Dict[str, Path]) -> bool:
-    """Create all necessary local folders."""
     try:
         paths["local_app_folder"].mkdir(parents=True, exist_ok=True)
         paths["local_config_folder"].mkdir(parents=True, exist_ok=True)
@@ -758,17 +729,15 @@ def create_local_folders(paths: Dict[str, Path]) -> bool:
         paths["local_queue_folder"].mkdir(parents=True, exist_ok=True)
         paths["local_assets"].parent.mkdir(parents=True, exist_ok=True)
         return True
-    except Exception as e:
-        log_installer_error("CREATE_FOLDERS_FAILED", "Failed to create local folders", str(e))
+    except Exception as exc:
+        log_installer_error("CREATE_FOLDERS_FAILED", "Failed creating local folders.", str(exc))
         return False
 
 
 def initialize_local_user_config(paths: Dict[str, Path]) -> bool:
-    """Ensure each user has a local config file under Documents."""
     target = paths["local_config"]
     temp_path = target.with_name(f"{target.name}.tmp")
     shared_legacy = paths["shared_config"]
-
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists() and target.is_file():
@@ -781,16 +750,10 @@ def initialize_local_user_config(paths: Dict[str, Path]) -> bool:
                 loaded = json.loads(raw_text)
                 if isinstance(loaded, dict):
                     payload = json.dumps(loaded, indent=2, ensure_ascii=False) + "\n"
-                else:
-                    log_installer_error(
-                        "LOCAL_CONFIG_SHARED_INVALID",
-                        "Shared Flowgrid config was not a JSON object; creating a blank local config instead.",
-                        f"Path: {shared_legacy}",
-                    )
             except Exception as exc:
                 log_installer_error(
                     "LOCAL_CONFIG_SHARED_READ_FAILED",
-                    "Failed reading shared Flowgrid config during local config bootstrap; creating a blank local config instead.",
+                    "Failed reading shared Flowgrid config while bootstrapping the local config file.",
                     f"Path: {shared_legacy}\nReason: {type(exc).__name__}: {exc}",
                 )
 
@@ -798,74 +761,17 @@ def initialize_local_user_config(paths: Dict[str, Path]) -> bool:
         os.replace(temp_path, target)
         return True
     except Exception as exc:
-        if temp_path.exists():
-            try:
+        try:
+            if temp_path.exists():
                 temp_path.unlink()
-            except Exception:
-                pass
+        except Exception:
+            pass
         log_installer_error(
             "LOCAL_CONFIG_INIT_FAILED",
-            "Failed to create the per-user local Flowgrid config file.",
+            "Failed creating the local Flowgrid_config.json file.",
             f"Path: {target}\nReason: {type(exc).__name__}: {exc}",
         )
         return False
-
-
-def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str]]:
-    """Return warnings and errors for source material availability."""
-    warnings: List[str] = []
-    errors: List[str] = []
-
-    expected_shared_root = paths["shared_root"]
-    if not expected_shared_root.exists():
-        errors.append(f"Expected shared drive root does not exist: {expected_shared_root}")
-    elif not expected_shared_root.is_dir():
-        errors.append(f"Expected shared drive root is not a directory: {expected_shared_root}")
-    else:
-        # Check for required files at the configured shared root
-        required_files = ["Flowgrid.pyw", "flowgrid_app", "Assets"]
-        for req in required_files:
-            req_path = expected_shared_root / req
-            if not req_path.exists():
-                errors.append(f"Required source file/folder missing: {req_path}")
-
-    if not paths["shared_app"].exists():
-        errors.append(f"Flowgrid.pyw not found at source location: {paths['shared_app']}")
-
-    if not paths["shared_package"].exists() or not paths["shared_package"].is_dir():
-        errors.append(f"flowgrid_app package not found at source location: {paths['shared_package']}")
-
-    if not paths["shared_assets"].exists():
-        errors.append(f"Assets folder not found at source location: {paths['shared_assets']}")
-
-    return warnings, errors
-
-
-def copy_app_files(paths: Dict[str, Path]) -> bool:
-    """Copy Flowgrid.pyw to local folder."""
-    if not paths["shared_app"].exists():
-        log_installer_error("APP_NOT_FOUND", "Flowgrid.pyw not found on shared drive", str(paths["shared_app"]))
-        return False
-
-    return copy_file_with_progress(paths["shared_app"], paths["local_app"], "Flowgrid application")
-
-
-def copy_app_package(paths: Dict[str, Path]) -> bool:
-    """Copy flowgrid_app package to local folder."""
-    if not paths["shared_package"].exists() or not paths["shared_package"].is_dir():
-        log_installer_error("PACKAGE_NOT_FOUND", "flowgrid_app package not found on shared drive", str(paths["shared_package"]))
-        return False
-
-    return copy_directory_recursive(paths["shared_package"], paths["local_package"], "flowgrid_app package")
-
-
-def copy_assets(paths: Dict[str, Path]) -> bool:
-    """Copy Assets folder to local folder."""
-    if not paths["shared_assets"].exists():
-        log_installer_error("ASSETS_NOT_FOUND", "Assets folder not found on shared drive", str(paths["shared_assets"]))
-        return False
-
-    return copy_directory_recursive(paths["shared_assets"], paths["local_assets"], "Assets folder")
 
 
 def _detect_installer_user() -> str:
@@ -878,7 +784,6 @@ def _detect_installer_user() -> str:
         candidates.append(getpass.getuser() or "")
     except Exception:
         pass
-
     for raw in candidates:
         value = str(raw or "").strip()
         if value:
@@ -886,23 +791,290 @@ def _detect_installer_user() -> str:
     return "UNKNOWN"
 
 
-def initialize_database(paths: Dict[str, Path]) -> bool:
-    """Write the local install manifest and bootstrap shared DB admin users."""
+def _channel_metadata_for_state(paths: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = {
+        "channel_id": str(paths.get("channel_id") or DEFAULT_CHANNEL_ID),
+        "channel_label": str(paths.get("channel_label") or DEFAULT_CHANNEL_LABEL),
+        "channel_display_name": str(paths.get("channel_display_name") or APP_TITLE),
+        "read_only_db": bool(paths.get("read_only_db", False)),
+        "repo_url": str(paths.get("repo_url") or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL,
+        "branch": str(paths.get("branch") or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH,
+        "snapshot_source_root": str(paths.get("snapshot_source_root") or "").strip(),
+    }
+    if not metadata["read_only_db"]:
+        metadata.setdefault(LAST_SNAPSHOT_SYNC_AT_KEY, "")
+        metadata.setdefault(LAST_SNAPSHOT_SYNC_STATUS_KEY, "not_applicable")
+        metadata.setdefault(
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY,
+            "Main channel uses the production shared root directly.",
+        )
+    return metadata
+
+
+def _channel_remote_label(paths: Dict[str, Any]) -> str:
+    branch = str(paths.get("branch") or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+    return f"GitHub {branch}"
+
+
+def _ensure_shared_storage_contract(paths: Dict[str, Any]) -> bool:
+    try:
+        paths["shared_root"].mkdir(parents=True, exist_ok=True)
+        paths["shared_logs"].mkdir(parents=True, exist_ok=True)
+        paths["shared_assets"].mkdir(parents=True, exist_ok=True)
+        for folder_name in MANAGED_SHARED_ASSET_DIRS:
+            (paths["shared_assets"] / folder_name).mkdir(parents=True, exist_ok=True)
+        return True
+    except Exception as exc:
+        log_installer_error(
+            "SHARED_STORAGE_CONTRACT_FAILED",
+            "Failed preparing the shared Flowgrid storage contract.",
+            f"Shared root: {paths['shared_root']}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return False
+
+
+def _seed_missing_shared_assets_from_source(paths: Dict[str, Any], source_assets_root: Path | None) -> Dict[str, Any]:
+    target_root = Path(paths["shared_assets"])
+    if source_assets_root is None:
+        return {
+            "status": "warning",
+            "summary": "No packaged Assets source was available to seed the shared Assets tree.",
+            "added": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+    if not source_assets_root.exists() or not source_assets_root.is_dir():
+        return {
+            "status": "warning",
+            "summary": f"Packaged Assets source was unavailable at {source_assets_root}; shared Assets seeding was skipped.",
+            "added": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+
+    added = 0
+    skipped = 0
+    errors = 0
+    try:
+        target_root.mkdir(parents=True, exist_ok=True)
+        for source_path in sorted(source_assets_root.rglob("*")):
+            relative_path = source_path.relative_to(source_assets_root)
+            target_path = target_root / relative_path
+            if source_path.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if target_path.exists():
+                skipped += 1
+                continue
+            try:
+                _copy_file_atomic(source_path, target_path)
+                added += 1
+            except Exception as exc:
+                errors += 1
+                log_installer_error(
+                    "SHARED_ASSET_SEED_COPY_FAILED",
+                    "Failed copying a packaged asset into the shared Assets tree.",
+                    f"Source: {source_path}\nTarget: {target_path}\nReason: {type(exc).__name__}: {exc}",
+                )
+    except Exception as exc:
+        log_installer_error(
+            "SHARED_ASSET_SEED_FAILED",
+            "Failed seeding the shared Assets tree from packaged assets.",
+            f"Source root: {source_assets_root}\nTarget root: {target_root}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return {
+            "status": "warning",
+            "summary": f"Shared Assets seed failed: {type(exc).__name__}: {exc}",
+            "added": added,
+            "skipped": skipped,
+            "errors": errors + 1,
+        }
+
+    status = "ok" if errors == 0 else "warning"
+    summary = (
+        f"Shared Assets seed complete: added {added}, existing {skipped}."
+        if errors == 0
+        else f"Shared Assets seeded with warnings: added {added}, existing {skipped}, errors {errors}."
+    )
+    return {
+        "status": status,
+        "summary": summary,
+        "added": added,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def _read_only_sqlite_uri(path: Path) -> str:
+    raw_path = str(path)
+    if raw_path.startswith("\\\\"):
+        return f"file:{raw_path}?mode=ro"
+    try:
+        return f"{path.resolve().as_uri()}?mode=ro"
+    except Exception:
+        return f"file:{str(path).replace(os.sep, '/')}?mode=ro"
+
+
+def _prune_snapshot_asset_tree(paths: Dict[str, Any], expected_files: set[str]) -> int:
+    shared_assets = Path(paths["shared_assets"])
+    shared_root = Path(paths["shared_root"])
+    try:
+        if not shared_assets.resolve().is_relative_to(shared_root.resolve()):
+            return 0
+    except Exception:
+        return 0
+
+    removed = 0
+    for existing_file in sorted(shared_assets.rglob("*")):
+        if not existing_file.is_file():
+            continue
+        relative = existing_file.relative_to(shared_assets).as_posix()
+        if relative in expected_files:
+            continue
+        try:
+            existing_file.unlink()
+            removed += 1
+        except Exception as exc:
+            log_installer_error(
+                "SNAPSHOT_ASSET_PRUNE_FAILED",
+                "Failed pruning a stale beta snapshot asset.",
+                f"Path: {existing_file}\nReason: {type(exc).__name__}: {exc}",
+            )
+    for existing_dir in sorted(shared_assets.rglob("*"), reverse=True):
+        if existing_dir.is_dir():
+            try:
+                existing_dir.rmdir()
+            except OSError:
+                pass
+    return removed
+
+
+def _refresh_read_only_snapshot(paths: Dict[str, Any]) -> bool:
+    snapshot_source_root = paths.get("snapshot_source_root_path")
+    shared_root = Path(paths["shared_root"])
+    if snapshot_source_root is None:
+        log_installer_error(
+            "SNAPSHOT_SOURCE_MISSING",
+            "Read-only channel is missing snapshot_source_root.",
+            f"Shared root: {shared_root}",
+        )
+        return False
+    source_root = Path(snapshot_source_root)
+    try:
+        if source_root.resolve() == shared_root.resolve():
+            raise RuntimeError("snapshot_source_root cannot point at the same folder as the target shared root.")
+    except Exception as exc:
+        log_installer_error(
+            "SNAPSHOT_SOURCE_INVALID",
+            "Read-only snapshot source root is invalid.",
+            f"Source root: {source_root}\nTarget root: {shared_root}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return False
+
+    source_db = source_root / DEPOT_DB_FILENAME
+    source_assets = source_root / "Assets"
+    target_db = Path(paths["shared_db"])
+    target_assets = Path(paths["shared_assets"])
+    synced_at = _utc_now_iso()
+
+    try:
+        target_db.parent.mkdir(parents=True, exist_ok=True)
+        _copy_file_atomic(source_db, target_db)
+        target_assets.mkdir(parents=True, exist_ok=True)
+
+        expected_files: set[str] = set()
+        copied = 0
+        updated = 0
+        unchanged = 0
+        for source_path in sorted(source_assets.rglob("*")):
+            if not source_path.is_file():
+                continue
+            relative = source_path.relative_to(source_assets).as_posix()
+            expected_files.add(relative)
+            target_path = target_assets / Path(relative.replace("/", os.sep))
+            if target_path.exists() and target_path.is_file():
+                try:
+                    if _file_sha256(source_path) == _file_sha256(target_path):
+                        unchanged += 1
+                        continue
+                except Exception:
+                    pass
+                _copy_file_atomic(source_path, target_path)
+                updated += 1
+                continue
+            _copy_file_atomic(source_path, target_path)
+            copied += 1
+
+        removed = _prune_snapshot_asset_tree(paths, expected_files)
+        for folder_name in MANAGED_SHARED_ASSET_DIRS:
+            (target_assets / folder_name).mkdir(parents=True, exist_ok=True)
+
+        summary = (
+            f"Read-only shared snapshot refreshed from {source_root}: "
+            f"assets added {copied}, updated {updated}, unchanged {unchanged}, removed stale {removed}."
+        )
+        paths["_snapshot_sync_state"] = {
+            LAST_SNAPSHOT_SYNC_AT_KEY: synced_at,
+            LAST_SNAPSHOT_SYNC_STATUS_KEY: "ok",
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: summary,
+            "snapshot_source_root": str(source_root),
+        }
+        log_installer_status("SNAPSHOT_SYNC_OK", "Read-only shared snapshot refreshed.", summary)
+        return True
+    except Exception as exc:
+        summary = f"Failed refreshing the read-only shared snapshot: {type(exc).__name__}: {exc}"
+        paths["_snapshot_sync_state"] = {
+            LAST_SNAPSHOT_SYNC_AT_KEY: synced_at,
+            LAST_SNAPSHOT_SYNC_STATUS_KEY: "failed",
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: summary,
+            "snapshot_source_root": str(source_root),
+        }
+        log_installer_error(
+            "SNAPSHOT_SYNC_FAILED",
+            "Failed refreshing the read-only shared snapshot.",
+            f"Source root: {source_root}\nTarget root: {shared_root}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return False
+
+
+def _verify_read_only_snapshot(paths: Dict[str, Any]) -> bool:
+    shared_db = Path(paths["shared_db"])
+    try:
+        with sqlite3.connect(_read_only_sqlite_uri(shared_db), uri=True, timeout=30.0) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return True
+    except Exception as exc:
+        log_installer_error(
+            "VERIFY_SHARED_SNAPSHOT_FAILED",
+            "Failed verifying the read-only shared snapshot database.",
+            f"Shared DB path: {shared_db}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return False
+
+
+def initialize_database(paths: Dict[str, Any]) -> bool:
     if not write_local_paths_config(paths):
         return False
     if not verify_local_paths_config(paths):
         return False
     if not initialize_local_user_config(paths):
         return False
+    if not _ensure_shared_storage_contract(paths):
+        return False
+
+    if bool(paths.get("read_only_db", False)):
+        if not _refresh_read_only_snapshot(paths):
+            return False
+        return _verify_read_only_snapshot(paths)
 
     current_user = _detect_installer_user()
     shared_db = paths["shared_db"]
-
     try:
         shared_db.parent.mkdir(parents=True, exist_ok=True)
-        shared_assets_root = shared_db.parent / "Assets"
-        for folder in ("agent_icons", "admin_icons", "qa_flag_icons", "part_flag_images"):
+        shared_assets_root = paths["shared_assets"]
+        for folder in MANAGED_SHARED_ASSET_DIRS:
             (shared_assets_root / folder).mkdir(parents=True, exist_ok=True)
+
         with sqlite3.connect(str(shared_db), timeout=30.0) as conn:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA busy_timeout = 20000")
@@ -951,102 +1123,508 @@ def initialize_database(paths: Dict[str, Path]) -> bool:
                     (current_user, current_user),
                 )
             conn.commit()
+        paths["_snapshot_sync_state"] = {
+            LAST_SNAPSHOT_SYNC_AT_KEY: "",
+            LAST_SNAPSHOT_SYNC_STATUS_KEY: "not_applicable",
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: "Main channel uses the production shared root directly.",
+        }
         return True
-    except Exception as e:
+    except Exception as exc:
         log_installer_error(
             "VERIFY_SHARED_DB_FAILED",
-            "Failed to verify shared database access on the network drive",
-            f"Shared DB path: {shared_db}\nReason: {type(e).__name__}: {e}",
+            "Failed verifying shared database access.",
+            f"Shared DB path: {shared_db}\nReason: {type(exc).__name__}: {exc}",
         )
         return False
 
 
-def _resolve_windows_desktop_directory() -> Path | None:
-    if os.name != "nt":
-        return None
+def _default_install_state(paths: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    metadata = _channel_metadata_for_state(paths or {})
+    return {
+        "repo_url": str(metadata.get("repo_url") or DEFAULT_REPO_URL),
+        "branch": str(metadata.get("branch") or DEFAULT_REPO_BRANCH),
+        "channel_id": str(metadata.get("channel_id") or DEFAULT_CHANNEL_ID),
+        "channel_label": str(metadata.get("channel_label") or DEFAULT_CHANNEL_LABEL),
+        "channel_display_name": str(metadata.get("channel_display_name") or APP_TITLE),
+        "read_only_db": bool(metadata.get("read_only_db", False)),
+        "snapshot_source_root": str(metadata.get("snapshot_source_root") or ""),
+        "installed_commit_sha": "",
+        "installed_at_utc": "",
+        "last_check_at_utc": "",
+        "last_check_status": "",
+        "last_check_summary": "",
+        "last_remote_commit_sha": "",
+        "last_shared_asset_sync_at_utc": "",
+        "last_shared_asset_sync_status": "",
+        "last_shared_asset_sync_summary": "",
+        LAST_SNAPSHOT_SYNC_AT_KEY: str(metadata.get(LAST_SNAPSHOT_SYNC_AT_KEY) or ""),
+        LAST_SNAPSHOT_SYNC_STATUS_KEY: str(metadata.get(LAST_SNAPSHOT_SYNC_STATUS_KEY) or ""),
+        LAST_SNAPSHOT_SYNC_SUMMARY_KEY: str(metadata.get(LAST_SNAPSHOT_SYNC_SUMMARY_KEY) or ""),
+        REPO_MANAGED_HASHES_KEY: {},
+        SHARED_ASSET_HASHES_KEY: {},
+    }
 
+
+def _normalize_hash_mapping(raw_value: Any) -> Dict[str, str]:
+    if not isinstance(raw_value, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for raw_key, raw_hash in raw_value.items():
+        key = str(raw_key or "").replace("\\", "/").strip("/")
+        value = str(raw_hash or "").strip().lower()
+        if key and value:
+            normalized[key] = value
+    return normalized
+
+
+def load_install_state(paths: Dict[str, Path]) -> Dict[str, Any]:
+    target = paths["install_state"]
+    state = _default_install_state(paths)
+    if not target.exists() or not target.is_file():
+        return state
     try:
-        buffer = ctypes.create_unicode_buffer(260)
-        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x0010, None, 0, buffer)
-        if result == 0 and str(buffer.value).strip():
-            path = Path(str(buffer.value).strip())
-            if path.exists() and path.is_dir():
-                return path
-    except Exception:
-        pass
-
-    onedrive = str(os.environ.get("OneDrive", "") or "").strip()
-    if onedrive:
-        candidate = Path(onedrive) / "Desktop"
-        if candidate.exists() and candidate.is_dir():
-            return candidate
-
-    candidate = Path.home() / "Desktop"
-    if candidate.exists() and candidate.is_dir():
-        return candidate
-
-    return None
-
-
-def _managed_shortcut_icon_path(paths: Dict[str, Path]) -> Path:
-    return paths["shared_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME
-
-
-def create_desktop_shortcut(paths: Dict[str, Path]) -> bool:
-    """Create desktop shortcut using the shared .lnk contract."""
-    try:
-        print("Creating desktop shortcut...")
-
-        desktop_path = _resolve_windows_desktop_directory()
-        if desktop_path is None:
-            raise RuntimeError("Unable to resolve desktop folder")
-
-        icon_source = _find_default_wrench_icon(paths["source_root"], paths["shared_root"])
-        if icon_source is None:
-            raise RuntimeError("Unable to locate the default wrench icon for desktop shortcut creation.")
-
-        from flowgrid_app.icon_io import _write_managed_shortcut_icon
-
-        managed_icon_path = _managed_shortcut_icon_path(paths)
-        managed_icon_path.parent.mkdir(parents=True, exist_ok=True)
-        _write_managed_shortcut_icon(icon_source, managed_icon_path)
-
-        launcher_path = _preferred_gui_python_executable()
-        script_path = paths["local_app"]
-        if not launcher_path.exists() or not launcher_path.is_file():
-            raise RuntimeError(f"Python launcher not found: {launcher_path}")
-        if not script_path.exists() or not script_path.is_file():
-            raise RuntimeError(f"Installed Flowgrid.pyw not found: {script_path}")
-
-        shortcut_path = desktop_path / DESKTOP_SHORTCUT_FILENAME
-        arguments = f'"{script_path}"'
-        ok, detail = _create_or_update_windows_shortcut(
-            shortcut_path,
-            launcher_path,
-            arguments,
-            script_path.parent,
-            managed_icon_path,
-            WINDOWS_SHORTCUT_DESCRIPTION,
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log_installer_error(
+            "INSTALL_STATE_PARSE_FAILED",
+            "Failed parsing Flowgrid_install_state.json; installer will continue with defaults.",
+            f"Path: {target}\nReason: {type(exc).__name__}: {exc}",
         )
-        if not ok:
-            raise RuntimeError(detail or "Unknown desktop shortcut save failure.")
+        return state
+    if not isinstance(loaded, dict):
+        log_installer_error(
+            "INSTALL_STATE_INVALID",
+            "Flowgrid_install_state.json was not a JSON object; installer will continue with defaults.",
+            f"Path: {target}\nValue type: {type(loaded).__name__}",
+        )
+        return state
+    merged = dict(state)
+    merged.update(loaded)
+    merged["channel_id"] = _normalize_channel_id(merged.get("channel_id", state.get("channel_id", DEFAULT_CHANNEL_ID)))
+    merged["channel_label"] = _normalize_channel_label(
+        merged.get("channel_label", state.get("channel_label", DEFAULT_CHANNEL_LABEL)),
+        channel_id=merged["channel_id"],
+    )
+    merged["channel_display_name"] = str(merged.get("channel_display_name") or state.get("channel_display_name") or APP_TITLE).strip() or APP_TITLE
+    merged["read_only_db"] = bool(merged.get("read_only_db", state.get("read_only_db", False)))
+    merged["snapshot_source_root"] = str(merged.get("snapshot_source_root") or state.get("snapshot_source_root") or "").strip()
+    merged["repo_url"] = str(merged.get("repo_url", DEFAULT_REPO_URL) or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL
+    merged["branch"] = str(merged.get("branch", DEFAULT_REPO_BRANCH) or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+    merged[REPO_MANAGED_HASHES_KEY] = _normalize_hash_mapping(merged.get(REPO_MANAGED_HASHES_KEY))
+    merged[SHARED_ASSET_HASHES_KEY] = _normalize_hash_mapping(merged.get(SHARED_ASSET_HASHES_KEY))
+    return merged
+
+
+def save_install_state(paths: Dict[str, Path], state: Dict[str, Any]) -> bool:
+    target = paths["install_state"]
+    temp_path = target.with_name(f"{target.name}.tmp")
+    payload = dict(_default_install_state(paths))
+    payload.update(state if isinstance(state, dict) else {})
+    payload["channel_id"] = _normalize_channel_id(payload.get("channel_id", DEFAULT_CHANNEL_ID))
+    payload["channel_label"] = _normalize_channel_label(payload.get("channel_label", ""), channel_id=payload["channel_id"])
+    payload["channel_display_name"] = str(payload.get("channel_display_name") or paths.get("channel_display_name") or APP_TITLE).strip() or APP_TITLE
+    payload["read_only_db"] = bool(payload.get("read_only_db", False))
+    payload["snapshot_source_root"] = str(payload.get("snapshot_source_root") or "").strip()
+    payload["repo_url"] = str(payload.get("repo_url", DEFAULT_REPO_URL) or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL
+    payload["branch"] = str(payload.get("branch", DEFAULT_REPO_BRANCH) or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+    payload[REPO_MANAGED_HASHES_KEY] = _normalize_hash_mapping(payload.get(REPO_MANAGED_HASHES_KEY))
+    payload[SHARED_ASSET_HASHES_KEY] = _normalize_hash_mapping(payload.get(SHARED_ASSET_HASHES_KEY))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        os.replace(temp_path, target)
         return True
-
-    except Exception as e:
-        log_installer_error("SHORTCUT_FAILED", "Failed to create desktop shortcut", str(e))
+    except Exception as exc:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        log_installer_error(
+            "INSTALL_STATE_SAVE_FAILED",
+            "Failed writing Flowgrid_install_state.json.",
+            f"Path: {target}\nReason: {type(exc).__name__}: {exc}",
+        )
         return False
+
+
+def _split_github_repo_parts(repo_url: str) -> Tuple[str, str]:
+    parsed = urlparse(str(repo_url or "").strip() or DEFAULT_REPO_URL)
+    if "github.com" not in parsed.netloc.lower():
+        raise RuntimeError(f"Unsupported repository host for update checks: {repo_url}")
+    path = str(parsed.path or "").strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [piece for piece in path.split("/") if piece]
+    if len(parts) < 2:
+        raise RuntimeError(f"Unable to derive GitHub owner/repo from: {repo_url}")
+    return parts[0], parts[1]
+
+
+def _json_request(url: str, *, timeout_seconds: float = GITHUB_TIMEOUT_SECONDS) -> Any:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": GITHUB_USER_AGENT,
+            "Accept": GITHUB_API_ACCEPT,
+        },
+    )
+    with urlopen(request, timeout=timeout_seconds) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _download_file(url: str, target_path: Path, *, timeout_seconds: float = GITHUB_TIMEOUT_SECONDS) -> Path:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": GITHUB_USER_AGENT,
+            "Accept": GITHUB_ARCHIVE_ACCEPT,
+        },
+    )
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f"{target_path.name}.tmp")
+    with urlopen(request, timeout=timeout_seconds) as response, temp_path.open("wb") as handle:
+        shutil.copyfileobj(response, handle)
+    os.replace(temp_path, target_path)
+    return target_path
+
+
+def fetch_remote_commit_info(repo_url: str, branch: str) -> Dict[str, str]:
+    owner, repo_name = _split_github_repo_parts(repo_url)
+    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits/{branch}"
+    try:
+        payload = _json_request(api_url)
+    except HTTPError as exc:
+        raise RuntimeError(f"GitHub update check failed: HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"GitHub update check failed: {exc.reason}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"GitHub update check failed: {type(exc).__name__}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub update check returned an unexpected payload.")
+    sha = str(payload.get("sha") or "").strip()
+    if not sha:
+        raise RuntimeError("GitHub update check returned no commit SHA.")
+    zipball_url = str(payload.get("zipball_url") or "").strip()
+    if not zipball_url:
+        zipball_url = f"https://api.github.com/repos/{owner}/{repo_name}/zipball/{sha}"
+    return {
+        "repo_url": repo_url,
+        "branch": branch,
+        "sha": sha,
+        "short_sha": _short_sha(sha),
+        "zipball_url": zipball_url,
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_file_atomic(source_path: Path, target_path: Path) -> None:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f"{target_path.name}.tmp")
+    shutil.copy2(source_path, temp_path)
+    os.replace(temp_path, target_path)
+
+
+def _locate_snapshot_project_root(extracted_root: Path) -> Path:
+    for child in extracted_root.iterdir():
+        if child.is_dir() and (child / "Flowgrid.pyw").exists() and (child / "flowgrid_app").is_dir():
+            return child
+    raise RuntimeError("GitHub snapshot did not contain Flowgrid.pyw and flowgrid_app at the expected root.")
+
+
+def _iter_repo_source_files(snapshot_root: Path) -> Iterator[Tuple[str, Path]]:
+    for filename in ("Flowgrid.pyw", LOCAL_INSTALLER_FILENAME):
+        source_path = snapshot_root / filename
+        if source_path.exists() and source_path.is_file():
+            yield filename, source_path
+    for dirname in ("flowgrid_app", "Assets"):
+        root = snapshot_root / dirname
+        if not root.exists() or not root.is_dir():
+            continue
+        for source_path in sorted(root.rglob("*")):
+            if not source_path.is_file():
+                continue
+            if source_path.suffix.lower() in {".pyc", ".pyo"} or "__pycache__" in source_path.parts:
+                continue
+            yield source_path.relative_to(snapshot_root).as_posix(), source_path
+
+
+def _download_and_extract_snapshot(remote_info: Dict[str, str]) -> Tuple[Any, Path]:
+    temp_dir = tempfile.TemporaryDirectory(prefix="flowgrid_snapshot_")
+    temp_root = Path(temp_dir.name)
+    archive_path = temp_root / "flowgrid_snapshot.zip"
+    extract_root = temp_root / "extracted"
+    extract_root.mkdir(parents=True, exist_ok=True)
+    _download_file(str(remote_info.get("zipball_url") or "").strip(), archive_path)
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        archive.extractall(extract_root)
+    return temp_dir, _locate_snapshot_project_root(extract_root)
+
+
+def _apply_repo_manifest(
+    paths: Dict[str, Path],
+    snapshot_root: Path,
+    previous_state: Dict[str, Any],
+    remote_info: Dict[str, str],
+) -> Dict[str, Any]:
+    local_root = paths["local_app_folder"]
+    source_map: Dict[str, Path] = {}
+    new_manifest: Dict[str, str] = {}
+
+    for relative_path, source_path in _iter_repo_source_files(snapshot_root):
+        source_map[relative_path] = source_path
+        new_manifest[relative_path] = _file_sha256(source_path)
+
+    copied = 0
+    unchanged = 0
+    removed = 0
+
+    for relative_path, source_path in source_map.items():
+        target_path = local_root / Path(relative_path.replace("/", os.sep))
+        target_hash = ""
+        if target_path.exists() and target_path.is_file():
+            try:
+                target_hash = _file_sha256(target_path)
+            except Exception:
+                target_hash = ""
+        if target_hash == new_manifest[relative_path]:
+            unchanged += 1
+            continue
+        _copy_file_atomic(source_path, target_path)
+        copied += 1
+
+    previous_manifest = _normalize_hash_mapping(previous_state.get(REPO_MANAGED_HASHES_KEY))
+    for relative_path in sorted(set(previous_manifest) - set(new_manifest)):
+        relative_obj = Path(relative_path)
+        if relative_obj.is_absolute() or ".." in relative_obj.parts:
+            continue
+        if relative_path not in {"Flowgrid.pyw", LOCAL_INSTALLER_FILENAME} and not (
+            relative_path.startswith("flowgrid_app/") or relative_path.startswith("Assets/")
+        ):
+            continue
+        target_path = local_root / Path(relative_path.replace("/", os.sep))
+        if not target_path.exists() or not target_path.is_file():
+            continue
+        try:
+            target_path.unlink()
+            removed += 1
+            parent = target_path.parent
+            while parent != local_root and parent.exists():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        except Exception as exc:
+            log_installer_error(
+                "STALE_MANAGED_FILE_REMOVE_FAILED",
+                "Failed removing a stale repo-managed file during update.",
+                f"Relative path: {relative_path}\nReason: {type(exc).__name__}: {exc}",
+            )
+
+    if not previous_manifest:
+        expected_package_files = {path for path in new_manifest if path.startswith("flowgrid_app/")}
+        local_package = paths["local_package"]
+        if local_package.exists() and local_package.is_dir():
+            for existing_file in sorted(local_package.rglob("*")):
+                if not existing_file.is_file():
+                    continue
+                relative_path = existing_file.relative_to(local_root).as_posix()
+                if relative_path in expected_package_files:
+                    continue
+                try:
+                    existing_file.unlink()
+                    removed += 1
+                except Exception as exc:
+                    log_installer_error(
+                        "LEGACY_PACKAGE_PRUNE_FAILED",
+                        "Failed pruning a stale file from the local flowgrid_app package.",
+                        f"Path: {existing_file}\nReason: {type(exc).__name__}: {exc}",
+                    )
+
+    updated_state = dict(previous_state)
+    updated_state.update(
+        {
+            "repo_url": str(remote_info.get("repo_url") or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL,
+            "branch": str(remote_info.get("branch") or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH,
+            "installed_commit_sha": str(remote_info.get("sha") or "").strip(),
+            "installed_at_utc": _utc_now_iso(),
+            "last_check_at_utc": _utc_now_iso(),
+            "last_check_status": "up_to_date",
+            "last_check_summary": (
+                f"{str(paths.get('channel_display_name') or APP_TITLE)} installed from "
+                f"{_channel_remote_label(paths)} at {remote_info.get('short_sha', '')}."
+            ),
+            "last_remote_commit_sha": str(remote_info.get("sha") or "").strip(),
+            REPO_MANAGED_HASHES_KEY: new_manifest,
+        }
+    )
+    return {
+        "copied": copied,
+        "unchanged": unchanged,
+        "removed": removed,
+        "state": updated_state,
+    }
+
+
+def sync_shared_assets(paths: Dict[str, Path], state: Dict[str, Any]) -> Dict[str, Any]:
+    shared_assets_root = paths["shared_assets"]
+    local_assets_root = paths["local_assets"]
+    local_assets_root.mkdir(parents=True, exist_ok=True)
+    synced_at = _utc_now_iso()
+
+    if not shared_assets_root.exists() or not shared_assets_root.is_dir():
+        summary = f"Shared Assets folder is unavailable at {shared_assets_root}. Local packaged assets remain in use."
+        updated_state = dict(state)
+        updated_state.update(
+            {
+                "last_shared_asset_sync_at_utc": synced_at,
+                "last_shared_asset_sync_status": "warning",
+                "last_shared_asset_sync_summary": summary,
+            }
+        )
+        log_installer_status("SHARED_ASSETS_WARNING", "Shared asset sync skipped.", summary)
+        return {
+            "status": "warning",
+            "summary": summary,
+            "added": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "errors": 0,
+            "state": updated_state,
+        }
+
+    added = 0
+    updated = 0
+    unchanged = 0
+    errors = 0
+    manifest: Dict[str, str] = {}
+
+    for source_path in sorted(shared_assets_root.rglob("*")):
+        if not source_path.is_file():
+            continue
+        relative_path = source_path.relative_to(shared_assets_root).as_posix()
+        target_path = local_assets_root / Path(relative_path.replace("/", os.sep))
+        try:
+            shared_hash = _file_sha256(source_path)
+            manifest[relative_path] = shared_hash
+            if not target_path.exists():
+                _copy_file_atomic(source_path, target_path)
+                added += 1
+                continue
+            local_hash = _file_sha256(target_path)
+            if local_hash == shared_hash:
+                unchanged += 1
+                continue
+            _copy_file_atomic(source_path, target_path)
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            log_installer_error(
+                "SHARED_ASSET_COPY_FAILED",
+                "Failed copying a shared asset into the local runtime.",
+                f"Source: {source_path}\nTarget: {target_path}\nReason: {type(exc).__name__}: {exc}",
+            )
+
+    status = "ok" if errors == 0 else "warning"
+    summary = (
+        f"Shared assets synced: added {added}, updated {updated}, unchanged {unchanged}."
+        if errors == 0
+        else f"Shared assets synced with warnings: added {added}, updated {updated}, unchanged {unchanged}, errors {errors}."
+    )
+    updated_state = dict(state)
+    updated_state.update(
+        {
+            SHARED_ASSET_HASHES_KEY: manifest,
+            "last_shared_asset_sync_at_utc": synced_at,
+            "last_shared_asset_sync_status": status,
+            "last_shared_asset_sync_summary": summary,
+        }
+    )
+    log_installer_status("SHARED_ASSETS_SYNC", "Shared asset sync completed.", summary)
+    return {
+        "status": status,
+        "summary": summary,
+        "added": added,
+        "updated": updated,
+        "unchanged": unchanged,
+        "errors": errors,
+        "state": updated_state,
+    }
+
+
+def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str]]:
+    warnings: List[str] = []
+    errors: List[str] = []
+    shared_root = paths["shared_root"]
+    if not shared_root.exists():
+        errors.append(f"Expected shared drive root does not exist: {shared_root}")
+    elif not shared_root.is_dir():
+        errors.append(f"Expected shared drive root is not a directory: {shared_root}")
+
+    if bool(paths.get("read_only_db", False)):
+        snapshot_source_root = paths.get("snapshot_source_root_path")
+        if snapshot_source_root is None:
+            errors.append(
+                f"Read-only channel requires snapshot_source_root in {paths['shared_channel_config']}."
+            )
+        else:
+            source_root = Path(snapshot_source_root)
+            if not source_root.exists() or not source_root.is_dir():
+                errors.append(f"Snapshot source root is unavailable: {source_root}")
+            elif source_root.resolve() == Path(paths["shared_root"]).resolve():
+                errors.append(f"Snapshot source root cannot match the target shared root: {source_root}")
+            source_db = source_root / DEPOT_DB_FILENAME
+            if not source_db.exists() or not source_db.is_file():
+                errors.append(f"Snapshot source workflow DB missing: {source_db}")
+            source_assets = source_root / "Assets"
+            if not source_assets.exists() or not source_assets.is_dir():
+                errors.append(f"Snapshot source Assets folder missing: {source_assets}")
+    else:
+        shared_db = paths["shared_db"]
+        if not shared_db.exists() or not shared_db.is_file():
+            warnings.append(f"Shared workflow DB will be created at first run: {shared_db}")
+
+    shared_assets = paths["shared_assets"]
+    if not shared_assets.exists() or not shared_assets.is_dir():
+        warnings.append(f"Shared Assets folder will be created at first run: {shared_assets}")
+
+    return warnings, errors
+
+
+def detect_existing_local_install(paths: Dict[str, Path]) -> bool:
+    targets = (
+        paths["local_app"],
+        paths["local_installer"],
+        paths["local_package"],
+        paths["local_paths_config"],
+        paths["install_state"],
+        paths["local_assets"],
+    )
+    return any(path.exists() for path in targets)
 
 
 def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]], is_update_install: bool = False) -> str:
-    """Build a human-readable installer verification summary."""
-    headline = "Flowgrid has been updated." if is_update_install else "Flowgrid Installation Complete"
+    state = load_install_state(paths)
+    channel_display_name = str(paths.get("channel_display_name") or APP_TITLE)
+    headline = f"{channel_display_name} has been updated." if is_update_install else f"{channel_display_name} Installation Complete"
     lines: List[str] = [
         headline,
         "",
+        f"Channel: {channel_display_name}",
         f"Local install: {paths['local_app_folder']}",
         f"Local package: {paths['local_package']}",
+        f"Local installer: {paths['local_installer']}",
         f"Shared root: {paths['shared_root']}",
         f"Shared DB: {paths['shared_db']}",
+        f"Installed commit: {_short_sha(state.get('installed_commit_sha', '')) or '-'}",
         "",
         "Verification checks:",
     ]
@@ -1061,129 +1639,104 @@ def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]
         lines.append(line)
         if path:
             lines.append(f"      {path}")
-
-    warnings = [step for step in steps if str(step.get("status", "")).strip().lower() == "warning"]
-    if warnings:
-        lines.extend(["", "Warnings:"])
-        for step in warnings:
-            label = str(step.get("label", "") or "").strip()
-            detail = str(step.get("detail", "") or "").strip()
-            lines.append(f"- {label}{(': ' + detail) if detail else ''}")
-
     lines.extend(
         [
             "",
             "Authoritative data source:",
-            "- Shared workflow DB: shared_root\\Flowgrid_depot.db",
-            "- Editable icons: shared_root\\Assets\\agent_icons, admin_icons, qa_flag_icons",
+            (
+                f"- Shared workflow DB: {paths['shared_root']}\\{DEPOT_DB_FILENAME}"
+                if not bool(paths.get("read_only_db", False))
+                else f"- Shared workflow DB: read-only snapshot at {paths['shared_db']}"
+            ),
+            "- Shared Assets overlay onto the local packaged Assets folder",
+            f"- Code/runtime source: {_channel_remote_label(paths)}",
         ]
     )
+    if bool(paths.get("read_only_db", False)):
+        lines.append(f"- Snapshot source: {str(paths.get('snapshot_source_root') or '-').strip() or '-'}")
     return "\n".join(lines)
 
 
 def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
-    """Verify final installed runtime state for the completion popup."""
     results: List[Dict[str, str]] = []
-
-    local_app = paths["local_app"]
     _record_step(
         results,
         "Flowgrid.pyw installed",
-        "ok" if local_app.exists() and local_app.is_file() else "failed",
-        "Local runtime entrypoint present." if local_app.exists() and local_app.is_file() else "Local Flowgrid.pyw missing after install.",
-        str(local_app),
+        "ok" if paths["local_app"].exists() and paths["local_app"].is_file() else "failed",
+        "Local runtime entrypoint present." if paths["local_app"].exists() and paths["local_app"].is_file() else "Local Flowgrid.pyw missing after install.",
+        str(paths["local_app"]),
     )
-
-    local_package = paths["local_package"]
-    package_init = local_package / "__init__.py"
+    package_init = paths["local_package"] / "__init__.py"
     _record_step(
         results,
         "flowgrid_app package installed",
-        "ok" if local_package.exists() and local_package.is_dir() and package_init.exists() and package_init.is_file() else "failed",
-        (
-            "Local runtime support package present."
-            if local_package.exists() and local_package.is_dir() and package_init.exists() and package_init.is_file()
-            else "Local flowgrid_app package missing after install."
-        ),
-        str(local_package),
+        "ok" if paths["local_package"].exists() and package_init.exists() and package_init.is_file() else "failed",
+        "Local runtime support package present." if paths["local_package"].exists() and package_init.exists() else "Local flowgrid_app package missing after install.",
+        str(paths["local_package"]),
     )
-
-    local_assets = paths["local_assets"]
+    _record_step(
+        results,
+        "Local standalone installer installed",
+        "ok" if paths["local_installer"].exists() and paths["local_installer"].is_file() else "failed",
+        "Local Flowgrid installer copy present." if paths["local_installer"].exists() and paths["local_installer"].is_file() else "Local Flowgrid installer copy missing.",
+        str(paths["local_installer"]),
+    )
     _record_step(
         results,
         "Packaged Assets installed",
-        "ok" if local_assets.exists() and local_assets.is_dir() else "failed",
-        "Local packaged Assets folder present." if local_assets.exists() and local_assets.is_dir() else "Local Assets folder missing after install.",
-        str(local_assets),
+        "ok" if paths["local_assets"].exists() and paths["local_assets"].is_dir() else "failed",
+        "Local packaged Assets folder present." if paths["local_assets"].exists() and paths["local_assets"].is_dir() else "Local Assets folder missing after install.",
+        str(paths["local_assets"]),
     )
-
-    local_manifest = paths["local_paths_config"]
-    manifest_ok = local_manifest.exists() and local_manifest.is_file() and verify_local_paths_config(paths)
+    manifest_ok = paths["local_paths_config"].exists() and verify_local_paths_config(paths)
     _record_step(
         results,
         "Local Flowgrid_paths.json written and verified",
         "ok" if manifest_ok else "failed",
         "Local manifest points to the expected shared root." if manifest_ok else "Local Flowgrid_paths.json missing or invalid.",
-        str(local_manifest),
+        str(paths["local_paths_config"]),
     )
-
-    local_config = paths["local_config"]
     _record_step(
         results,
         "Local user config ready",
-        "ok" if local_config.exists() and local_config.is_file() else "failed",
-        "Per-user local config file present." if local_config.exists() and local_config.is_file() else "Per-user local config file missing.",
-        str(local_config),
+        "ok" if paths["local_config"].exists() and paths["local_config"].is_file() else "failed",
+        "Per-user local config file present." if paths["local_config"].exists() and paths["local_config"].is_file() else "Per-user local config file missing.",
+        str(paths["local_config"]),
+    )
+    _record_step(
+        results,
+        "Install state manifest ready",
+        "ok" if paths["install_state"].exists() and paths["install_state"].is_file() else "failed",
+        "Flowgrid_install_state.json present." if paths["install_state"].exists() and paths["install_state"].is_file() else "Flowgrid_install_state.json missing.",
+        str(paths["install_state"]),
     )
 
-    shared_db = paths["shared_db"]
     shared_db_ok = False
-    if shared_db.exists() and shared_db.is_file():
+    if paths["shared_db"].exists() and paths["shared_db"].is_file():
         try:
-            with sqlite3.connect(str(shared_db), timeout=10.0) as conn:
+            connect_target = _read_only_sqlite_uri(paths["shared_db"]) if bool(paths.get("read_only_db", False)) else str(paths["shared_db"])
+            with sqlite3.connect(connect_target, uri=bool(paths.get("read_only_db", False)), timeout=10.0) as conn:
                 conn.execute("SELECT 1")
             shared_db_ok = True
         except Exception as exc:
             log_installer_error(
                 "VERIFY_SHARED_DB_POST_INSTALL_FAILED",
                 "Shared DB exists but could not be opened during final installer verification.",
-                f"Path: {shared_db}\nReason: {type(exc).__name__}: {exc}",
+                f"Path: {paths['shared_db']}\nReason: {type(exc).__name__}: {exc}",
             )
     _record_step(
         results,
         "Shared DB reachable",
         "ok" if shared_db_ok else "failed",
         "Shared workflow DB exists and opened successfully." if shared_db_ok else "Shared workflow DB missing or not reachable.",
-        str(shared_db),
+        str(paths["shared_db"]),
     )
-
-    shared_assets_root = shared_db.parent / "Assets"
-    editable_dirs = [
-        shared_assets_root / "agent_icons",
-        shared_assets_root / "admin_icons",
-        shared_assets_root / "qa_flag_icons",
-    ]
-    editable_ok = all(path.exists() and path.is_dir() for path in editable_dirs)
-    _record_step(
-        results,
-        "Shared editable icon folders ready",
-        "ok" if editable_ok else "failed",
-        "Shared editable icon directories are present." if editable_ok else "One or more shared editable icon folders are missing.",
-        str(shared_assets_root),
-    )
-
     return results
 
 
-# ============================================================================
-# GUI DIALOGS
-# ============================================================================
-
 def show_installation_dialog(title: str, message: str, is_error: bool = False, paths: Dict[str, Path] | None = None) -> None:
-    """Show installation status dialog using PySide6."""
     try:
-        from PySide6.QtWidgets import QApplication, QMessageBox, QDialog, QVBoxLayout, QLabel, QPushButton, QPlainTextEdit
-        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication, QDialog, QLabel, QMessageBox, QPushButton, QPlainTextEdit, QVBoxLayout
 
         app = QApplication.instance()
         if app is None:
@@ -1196,64 +1749,142 @@ def show_installation_dialog(title: str, message: str, is_error: bool = False, p
             msg_box.setText(message)
             msg_box.setStandardButtons(QMessageBox.Ok)
             msg_box.exec()
-        else:
-            # Custom dialog for installation complete
-            dialog = QDialog()
-            dialog.setWindowTitle(title)
-            dialog.setModal(True)
-            dialog.resize(760, 520)
+            return
 
-            layout = QVBoxLayout()
-
-            summary_label = QLabel(title)
-            summary_label.setWordWrap(True)
-            layout.addWidget(summary_label)
-
-            status_block = QPlainTextEdit()
-            status_block.setReadOnly(True)
-            status_block.setPlainText(message)
-            status_block.setMinimumSize(700, 360)
-            layout.addWidget(status_block, 1)
-
-            button = QPushButton("Launch Flowgrid")
-            button.clicked.connect(dialog.accept)
-            layout.addWidget(button)
-
-            close_button = QPushButton("Close")
-            close_button.clicked.connect(dialog.reject)
-            layout.addWidget(close_button)
-
-            dialog.setLayout(layout)
-            result = dialog.exec()
-
-            if result == QDialog.Accepted and paths is not None:
-                # Launch Flowgrid
-                try:
-                    import subprocess
-                    subprocess.Popen([sys.executable, str(paths["local_app"])], cwd=str(paths["local_app"].parent))
-                except Exception as e:
-                    log_installer_error("LAUNCH_FAILED", "Failed to launch Flowgrid after install", str(e))
-
-    except Exception as e:
-        log_installer_error("DIALOG_FAILED", "Failed to show installation dialog", str(e))
-        # Fallback to console
-        print(f"{title}: {message}")
+        dialog = QDialog()
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.resize(760, 520)
+        layout = QVBoxLayout()
+        summary_label = QLabel(title)
+        summary_label.setWordWrap(True)
+        layout.addWidget(summary_label)
+        status_block = QPlainTextEdit()
+        status_block.setReadOnly(True)
+        status_block.setPlainText(message)
+        status_block.setMinimumSize(700, 360)
+        layout.addWidget(status_block, 1)
+        launch_button = QPushButton("Launch Flowgrid")
+        close_button = QPushButton("Close")
+        launch_button.clicked.connect(dialog.accept)
+        close_button.clicked.connect(dialog.reject)
+        layout.addWidget(launch_button)
+        layout.addWidget(close_button)
+        dialog.setLayout(layout)
+        result = dialog.exec()
+        if result == QDialog.Accepted and paths is not None:
+            _launch_local_flowgrid(paths)
+    except Exception as exc:
+        log_installer_error("DIALOG_FAILED", "Failed showing the installer dialog.", str(exc))
+        if os.name == "nt":
+            try:
+                ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x10 | 0x1000 if is_error else 0x40 | 0x1000)
+                return
+            except Exception:
+                pass
+        _safe_print(f"{title}: {message}")
 
 
-# ============================================================================
-# MAIN INSTALLATION FUNCTION
-# ============================================================================
+def _launch_local_flowgrid(paths: Dict[str, Path]) -> bool:
+    try:
+        launcher_path = _preferred_gui_python_executable()
+        script_path = paths["local_app"]
+        if not launcher_path.exists() or not launcher_path.is_file():
+            raise RuntimeError(f"Python launcher not found: {launcher_path}")
+        if not script_path.exists() or not script_path.is_file():
+            raise RuntimeError(f"Flowgrid script not found: {script_path}")
+        subprocess.Popen([str(launcher_path), str(script_path)], cwd=str(script_path.parent))
+        return True
+    except Exception as exc:
+        log_installer_error("POST_INSTALL_LAUNCH_FAILED", "Failed launching Flowgrid after install/update.", str(exc))
+        return False
 
-def run_installer() -> int:
-    """Main installer function."""
+
+def _wait_for_parent_exit(parent_pid: int) -> None:
+    if parent_pid <= 0 or os.name != "nt":
+        return
+    synchronize = 0x00100000
+    wait_timeout = 0x00000102
+    handle = None
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, int(parent_pid))
+        if not handle:
+            return
+        result = ctypes.windll.kernel32.WaitForSingleObject(handle, 30000)
+        if result == wait_timeout:
+            log_installer_error(
+                "PARENT_WAIT_TIMEOUT",
+                "Timed out waiting for the parent Flowgrid process to exit before update.",
+                f"Parent PID: {parent_pid}",
+            )
+    except Exception as exc:
+        log_installer_error(
+            "PARENT_WAIT_FAILED",
+            "Failed waiting for the parent Flowgrid process before update.",
+            f"Parent PID: {parent_pid}\nReason: {type(exc).__name__}: {exc}",
+        )
+    finally:
+        if handle:
+            try:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+
+
+def _parse_cli_options() -> Dict[str, Any]:
+    options: Dict[str, Any] = {
+        "apply_update": False,
+        "sync_assets_only": False,
+        "launch_after_install": True,
+        "relaunch_after_update": False,
+        "parent_pid": 0,
+    }
+    argv = list(sys.argv[1:])
+    idx = 0
+    while idx < len(argv):
+        raw = str(argv[idx] or "").strip()
+        lowered = raw.lower()
+        if lowered == "--apply-update":
+            options["apply_update"] = True
+        elif lowered == "--sync-assets-only":
+            options["sync_assets_only"] = True
+        elif lowered == "--no-launch":
+            options["launch_after_install"] = False
+        elif lowered == "--relaunch":
+            options["relaunch_after_update"] = True
+        elif lowered == "--parent-pid" and idx + 1 < len(argv):
+            idx += 1
+            try:
+                options["parent_pid"] = int(str(argv[idx] or "").strip())
+            except Exception:
+                options["parent_pid"] = 0
+        elif lowered.startswith("--parent-pid="):
+            try:
+                options["parent_pid"] = int(lowered.split("=", 1)[1].strip())
+            except Exception:
+                options["parent_pid"] = 0
+        idx += 1
+    return options
+
+
+def run_installer(
+    *,
+    apply_update: bool = False,
+    sync_assets_only: bool = False,
+    launch_after_install: bool = True,
+    relaunch_after_update: bool = False,
+    parent_pid: int = 0,
+) -> int:
     install_steps: List[Dict[str, str]] = []
-    print("Flowgrid Installer")
-    print(f"Python: {sys.executable}")
-    print(f"Version: {sys.version}")
-    print()
+    _safe_print("Flowgrid Installer")
+    _safe_print(f"Python: {sys.executable}")
+    _safe_print(f"Version: {sys.version}")
+    _safe_print()
 
-    # Step 1: Check Python version
-    print("Step 1: Checking Python version...")
+    if apply_update:
+        _wait_for_parent_exit(int(parent_pid))
+
+    _safe_print("Step 1: Checking Python version...")
     version_ok, version_error = check_python_version()
     if not version_ok:
         error_msg = f"Python version check failed: {version_error}"
@@ -1262,30 +1893,39 @@ def run_installer() -> int:
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
     _record_step(install_steps, "Python version", "ok", f"Python {'.'.join(map(str, MIN_PYTHON_VERSION))}+ detected.", sys.executable)
-    print(f"✓ Python {'.'.join(map(str, MIN_PYTHON_VERSION))}+ detected")
-    print()
+    _safe_print(f"[OK] Python {'.'.join(map(str, MIN_PYTHON_VERSION))}+ detected")
+    _safe_print()
 
-    # Step 2: Ensure dependencies
-    print("Step 2: Checking dependencies...")
-    deps_ok, deps_error = ensure_dependencies()
-    if not deps_ok:
-        error_msg = f"Dependency installation failed: {deps_error}"
-        _record_step(install_steps, "Dependencies", "failed", deps_error)
-        log_installer_error("DEPENDENCIES", error_msg)
+    if sync_assets_only:
+        _record_step(install_steps, "Dependencies", "ok", "Dependency bootstrap skipped for asset-only sync.")
+    else:
+        _safe_print("Step 2: Checking dependencies...")
+        deps_ok, deps_error = ensure_dependencies()
+        if not deps_ok:
+            error_msg = f"Dependency installation failed: {deps_error}"
+            _record_step(install_steps, "Dependencies", "failed", deps_error)
+            log_installer_error("DEPENDENCIES", error_msg)
+            show_installation_dialog("Installation Failed", error_msg, is_error=True)
+            return 1
+        _record_step(install_steps, "Dependencies", "ok", "Required dependencies are installed and importable.")
+        _safe_print("[OK] All dependencies installed")
+        _safe_print()
+
+    _safe_print("Step 3: Preparing installation paths...")
+    try:
+        paths = get_installation_paths()
+    except Exception as exc:
+        error_msg = f"Failed resolving installer paths: {type(exc).__name__}: {exc}"
+        _record_step(install_steps, "Installation paths", "failed", error_msg)
+        log_installer_error("INSTALL_PATHS_FAILED", "Failed resolving installer path/channel context.", error_msg)
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
-    _record_step(install_steps, "Dependencies", "ok", "Required dependencies are installed and importable.")
-    print("✓ All dependencies installed")
-    print()
-
-    # Step 3: Get installation paths
-    print("Step 3: Preparing installation paths...")
-    paths = get_installation_paths()
-    print(f"Source root: {paths['source_root']}")
-    print(f"Shared root: {paths['shared_root']}")
-    print(f"Local app folder: {paths['local_app_folder']}")
-    print(f"Local package folder: {paths['local_package']}")
-    print(f"Local assets folder: {paths['local_assets']}")
+    _safe_print(f"Source root: {paths['source_root']}")
+    _safe_print(f"Shared root: {paths['shared_root']}")
+    _safe_print(f"Channel: {paths['channel_display_name']}")
+    _safe_print(f"Local app folder: {paths['local_app_folder']}")
+    _safe_print(f"Local package folder: {paths['local_package']}")
+    _safe_print(f"Local assets folder: {paths['local_assets']}")
     is_update_install = detect_existing_local_install(paths)
     log_installer_status(
         "INSTALL_CONTEXT",
@@ -1294,144 +1934,245 @@ def run_installer() -> int:
             [
                 f"source_root={paths['source_root']}",
                 f"shared_root={paths['shared_root']}",
+                f"channel_id={paths['channel_id']}",
+                f"channel_label={paths['channel_label']}",
+                f"channel_display_name={paths['channel_display_name']}",
+                f"read_only_db={bool(paths.get('read_only_db', False))}",
+                f"repo_url={paths['repo_url']}",
+                f"branch={paths['branch']}",
+                f"snapshot_source_root={paths.get('snapshot_source_root') or ''}",
                 f"shared_db={paths['shared_db']}",
                 f"local_app={paths['local_app']}",
+                f"local_installer={paths['local_installer']}",
                 f"local_package={paths['local_package']}",
                 f"local_manifest={paths['local_paths_config']}",
+                f"install_state={paths['install_state']}",
                 "workflow_db_source_of_truth=shared_root/Flowgrid_depot.db",
             ]
         ),
     )
-    print()
+    _safe_print()
 
-    # Step 4: Verify source materials are available
-    print(f"Step 4: Verifying source materials exist at {paths['shared_root']}...")
+    _safe_print(f"Step 4: Verifying shared bootstrap source at {paths['shared_root']}...")
     source_warnings, source_errors = assess_source_materials(paths)
     for warning in source_warnings:
-        print(f"⚠ {warning}")
+        _safe_print(f"[WARN] {warning}")
     if source_warnings:
         log_installer_error("SHARED_ROOT_WARNING", "Shared drive visibility issue", "\n".join(source_warnings))
     if source_errors:
-        error_msg = (
-            "Installer cannot continue because source materials are unavailable. "
-            "Please ensure Flowgrid.pyw, flowgrid_app, and the Assets folder are visible from the shared drive or the downloaded package."
-        )
+        error_msg = "Installer cannot continue because the shared Flowgrid location is missing required channel/bootstrap inputs."
         details = "\n".join(source_errors)
-        _record_step(install_steps, "Source materials", "failed", details, str(paths["shared_root"]))
+        _record_step(install_steps, "Shared bootstrap source", "failed", details, str(paths["shared_root"]))
         log_installer_error("SOURCE_MATERIALS_UNAVAILABLE", error_msg, details)
         show_installation_dialog("Installation Failed", f"{error_msg}\n\n{details}", is_error=True)
         return 1
     _record_step(
         install_steps,
-        "Source materials",
+        "Shared bootstrap source",
         "warning" if source_warnings else "ok",
-        "Required source files are available." if not source_warnings else f"Required source files are available with warnings: {'; '.join(source_warnings)}",
+        "Required shared bootstrap inputs are available."
+        if not source_warnings
+        else f"Shared bootstrap inputs are available with warnings: {'; '.join(source_warnings)}",
         str(paths["shared_root"]),
     )
-    print("✓ Source materials verified")
-    print()
+    _safe_print("[OK] Shared bootstrap source verified")
+    _safe_print()
 
-    # Step 5: Create local folders
-    print("Step 5: Creating local folders...")
+    _safe_print("Step 5: Creating local folders...")
     if not create_local_folders(paths):
         error_msg = "Failed to create local installation folders"
         _record_step(install_steps, "Local folders", "failed", error_msg, str(paths["local_app_folder"]))
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
     _record_step(install_steps, "Local folders", "ok", "Local app/config/data/queue folders prepared.", str(paths["local_app_folder"]))
-    print("✓ Local folders created")
-    print()
+    _safe_print("[OK] Local folders created")
+    _safe_print()
 
-    # Step 6: Remove managed runtime artifacts from prior installs
-    print("Step 6: Removing stale managed runtime files...")
-    if not purge_managed_local_runtime(paths):
-        error_msg = "Failed to remove stale managed local runtime files"
-        show_installation_dialog("Installation Failed", error_msg, is_error=True)
-        return 1
-    print("âœ“ Managed local runtime cleaned")
-    print()
-
-    # Step 7: Copy application
-    print("Step 7: Installing Flowgrid application...")
-    if not copy_app_files(paths):
-        error_msg = "Failed to copy Flowgrid application"
-        _record_step(install_steps, "Flowgrid.pyw install", "failed", error_msg, str(paths["local_app"]))
-        show_installation_dialog("Installation Failed", error_msg, is_error=True)
-        return 1
-    _record_step(install_steps, "Flowgrid.pyw install", "ok", "Local Flowgrid.pyw copied successfully.", str(paths["local_app"]))
-    print("[OK] Application installed")
-    print()
-
-    # Step 8: Copy support package
-    print("Step 8: Installing support package...")
-    if not copy_app_package(paths):
-        error_msg = "Failed to copy flowgrid_app package"
-        _record_step(install_steps, "flowgrid_app install", "failed", error_msg, str(paths["local_package"]))
-        show_installation_dialog("Installation Failed", error_msg, is_error=True)
-        return 1
-    _record_step(install_steps, "flowgrid_app install", "ok", "Local flowgrid_app package copied successfully.", str(paths["local_package"]))
-    print("[OK] Support package installed")
-    print()
-
-    # Step 9: Copy assets
-    print("Step 9: Installing assets...")
-    if not copy_assets(paths):
-        error_msg = "Failed to copy assets folder"
-        _record_step(install_steps, "Packaged Assets install", "failed", error_msg, str(paths["local_assets"]))
-        show_installation_dialog("Installation Failed", error_msg, is_error=True)
-        return 1
-    _record_step(install_steps, "Packaged Assets install", "ok", "Local packaged Assets folder copied successfully.", str(paths["local_assets"]))
-    print("[OK] Assets installed")
-    print()
-
-    # Step 10: Initialize database
-    print("Step 10: Initializing database...")
+    _safe_print("Step 6: Initializing shared/local metadata...")
     if not initialize_database(paths):
-        error_msg = "Failed to initialize database"
+        error_msg = "Failed to initialize shared/local install metadata."
         _record_step(install_steps, "Shared DB initialization", "failed", error_msg, str(paths["shared_db"]))
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
     _record_step(install_steps, "Local Flowgrid_paths.json", "ok", "Local shared-root manifest written and verified.", str(paths["local_paths_config"]))
     _record_step(install_steps, "Local user config", "ok", "Per-user local config file is ready.", str(paths["local_config"]))
-    _record_step(install_steps, "Shared DB initialization", "ok", "Shared DB validated and bootstrap completed.", str(paths["shared_db"]))
-    _record_step(install_steps, "Shared editable icon folders", "ok", "Shared editable icon folders were prepared.", str(paths["shared_db"].parent / "Assets"))
-    print("[OK] Database initialized")
-    print()
+    _record_step(
+        install_steps,
+        "Shared DB initialization",
+        "ok",
+        "Shared DB validated and bootstrap completed."
+        if not bool(paths.get("read_only_db", False))
+        else "Read-only shared snapshot validated and local bootstrap completed.",
+        str(paths["shared_db"]),
+    )
+    _record_step(
+        install_steps,
+        "Shared editable icon folders",
+        "ok",
+        "Shared editable icon folders were prepared.",
+        str(paths["shared_assets"]),
+    )
+    _safe_print("[OK] Shared/local metadata initialized")
+    _safe_print()
 
-    # Step 11: Create desktop shortcut
-    print("Step 11: Creating desktop shortcut...")
+    state = load_install_state(paths)
+    state.update(_channel_metadata_for_state(paths))
+    snapshot_state = paths.get("_snapshot_sync_state")
+    if isinstance(snapshot_state, dict):
+        state.update(snapshot_state)
+
+    if sync_assets_only:
+        asset_result = sync_shared_assets(paths, state)
+        save_install_state(paths, asset_result["state"])
+        _record_step(install_steps, "Shared assets pull", asset_result["status"], asset_result["summary"], str(paths["local_assets"]))
+        _safe_print(f"{_step_marker(asset_result['status'])} {asset_result['summary']}")
+        return 0
+
+    repo_url = str(state.get("repo_url", DEFAULT_REPO_URL) or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL
+    branch = str(state.get("branch", DEFAULT_REPO_BRANCH) or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+
+    remote_label = _channel_remote_label(paths)
+    _safe_print(f"Step 7: Checking {remote_label}...")
+    try:
+        remote_info = fetch_remote_commit_info(repo_url, branch)
+    except Exception as exc:
+        error_msg = str(exc) or "GitHub update check failed."
+        log_installer_error("REMOTE_CHECK_FAILED", f"Failed checking {remote_label}.", error_msg)
+        _record_step(install_steps, f"{remote_label} check", "failed", error_msg, repo_url)
+        show_installation_dialog("Installation Failed", error_msg, is_error=True)
+        return 1
+    _record_step(install_steps, f"{remote_label} check", "ok", f"Remote commit {_short_sha(remote_info['sha'])} resolved successfully.", remote_info["repo_url"])
+    _safe_print(f"[OK] {remote_label} resolved to {remote_info['short_sha']}")
+    _safe_print()
+
+    installed_sha = str(state.get("installed_commit_sha") or "").strip()
+    runtime_bootstrap_needed = (
+        not paths["local_app"].exists()
+        or not paths["local_installer"].exists()
+        or not paths["local_package"].exists()
+        or not paths["install_state"].exists()
+        or not _normalize_hash_mapping(state.get(REPO_MANAGED_HASHES_KEY))
+    )
+    needs_code_refresh = runtime_bootstrap_needed or installed_sha != remote_info["sha"]
+    shared_asset_seed_source: Path | None = paths["local_assets"] if paths["local_assets"].exists() else None
+
+    if needs_code_refresh:
+        _safe_print(f"Step 8: Downloading and applying the {remote_label} runtime snapshot...")
+        try:
+            temp_dir, snapshot_root = _download_and_extract_snapshot(remote_info)
+            try:
+                apply_result = _apply_repo_manifest(paths, snapshot_root, state, remote_info)
+                shared_asset_seed_source = paths["local_assets"]
+            finally:
+                temp_dir.cleanup()
+        except Exception as exc:
+            error_msg = f"Failed applying GitHub snapshot: {type(exc).__name__}: {exc}"
+            log_installer_error("GITHUB_SNAPSHOT_APPLY_FAILED", f"Failed installing Flowgrid from {remote_label}.", error_msg)
+            _record_step(install_steps, f"{remote_label} runtime install", "failed", error_msg, remote_info["repo_url"])
+            show_installation_dialog("Installation Failed", error_msg, is_error=True)
+            return 1
+        state = apply_result["state"]
+        _record_step(
+            install_steps,
+            f"{remote_label} runtime install",
+            "ok",
+            f"Copied {apply_result['copied']}, unchanged {apply_result['unchanged']}, removed stale {apply_result['removed']}.",
+            str(paths["local_app_folder"]),
+        )
+        _safe_print(
+            f"[OK] Runtime applied from GitHub: copied {apply_result['copied']}, "
+            f"unchanged {apply_result['unchanged']}, removed {apply_result['removed']}"
+        )
+        _safe_print()
+    else:
+        state.update(
+            {
+                "last_check_at_utc": _utc_now_iso(),
+                "last_check_status": "up_to_date",
+                "last_check_summary": (
+                    f"{str(paths.get('channel_display_name') or APP_TITLE)} already matched "
+                    f"{remote_label} at {remote_info['short_sha']}."
+                ),
+                "last_remote_commit_sha": remote_info["sha"],
+            }
+        )
+        _record_step(
+            install_steps,
+            f"{remote_label} runtime install",
+            "ok",
+            f"Local runtime already matched {remote_label} at {remote_info['short_sha']}; no code files changed.",
+            str(paths["local_app_folder"]),
+        )
+        _safe_print(f"[OK] Local runtime already matched {remote_label} at {remote_info['short_sha']}")
+        _safe_print()
+
+    _safe_print("Step 9: Seeding missing packaged assets into the shared Assets tree...")
+    shared_seed_result = _seed_missing_shared_assets_from_source(paths, shared_asset_seed_source)
+    _record_step(
+        install_steps,
+        "Shared Assets seed",
+        shared_seed_result["status"],
+        shared_seed_result["summary"],
+        str(paths["shared_assets"]),
+    )
+    _safe_print(f"{_step_marker(shared_seed_result['status'])} {shared_seed_result['summary']}")
+    _safe_print()
+
+    _safe_print("Step 10: Pulling shared assets into the local runtime...")
+    asset_result = sync_shared_assets(paths, state)
+    state = asset_result["state"]
+    _record_step(install_steps, "Shared assets pull", asset_result["status"], asset_result["summary"], str(paths["local_assets"]))
+    _safe_print(f"{_step_marker(asset_result['status'])} {asset_result['summary']}")
+    _safe_print()
+
+    if not save_install_state(paths, state):
+        _record_step(install_steps, "Install state manifest", "warning", "Flowgrid_install_state.json could not be written.", str(paths["install_state"]))
+    else:
+        _record_step(install_steps, "Install state manifest", "ok", "Flowgrid_install_state.json updated successfully.", str(paths["install_state"]))
+
+    _safe_print("Step 11: Creating desktop shortcut...")
     if not create_desktop_shortcut(paths):
         _record_step(install_steps, "Desktop shortcut", "warning", "Desktop shortcut could not be created.", str(paths["local_app_folder"]))
-        print("[WARN] Desktop shortcut creation failed, but installation continues")
+        _safe_print("[WARN] Desktop shortcut creation failed, but installation continues")
     else:
         _record_step(install_steps, "Desktop shortcut", "ok", "Desktop shortcut created.", str(paths["local_app_folder"]))
-        print("[OK] Desktop shortcut created")
-    print()
+        _safe_print("[OK] Desktop shortcut created")
+    _safe_print()
 
-    # Step 12: Show completion dialog
     completion_msg = build_installation_report(
         paths,
         [*install_steps, *verify_installed_state(paths)],
-        is_update_install=is_update_install,
+        is_update_install=is_update_install or apply_update,
     )
-    completion_title = "Flowgrid Updated" if is_update_install else "Flowgrid Installed Successfully"
+    completion_title = (
+        f"{str(paths.get('channel_display_name') or APP_TITLE)} Updated"
+        if (is_update_install or apply_update)
+        else f"{str(paths.get('channel_display_name') or APP_TITLE)} Installed Successfully"
+    )
 
-    show_installation_dialog(completion_title, completion_msg, False, paths)
+    if apply_update:
+        if relaunch_after_update or launch_after_install:
+            _launch_local_flowgrid(paths)
+    else:
+        show_installation_dialog(completion_title, completion_msg, False, paths if launch_after_install else None)
 
-    print("Update completed successfully!" if is_update_install else "Installation completed successfully!")
+    _safe_print("Update completed successfully!" if (is_update_install or apply_update) else "Installation completed successfully!")
     return 0
 
 
-# ============================================================================
-# ENTRY POINT
-# ============================================================================
-
 if __name__ == "__main__":
     try:
-        exit_code = run_installer()
+        cli_options = _parse_cli_options()
+        exit_code = run_installer(
+            apply_update=bool(cli_options.get("apply_update", False)),
+            sync_assets_only=bool(cli_options.get("sync_assets_only", False)),
+            launch_after_install=bool(cli_options.get("launch_after_install", True)),
+            relaunch_after_update=bool(cli_options.get("relaunch_after_update", False)),
+            parent_pid=int(cli_options.get("parent_pid", 0) or 0),
+        )
         sys.exit(exit_code)
-    except Exception as e:
-        error_msg = f"Installer crashed: {e}"
+    except Exception as exc:
+        error_msg = f"Installer crashed: {exc}"
         log_installer_error("INSTALLER_CRASH", error_msg, traceback.format_exc())
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         sys.exit(1)

@@ -252,6 +252,26 @@ class DepotRefreshCoordinator:
         return payload
 
 class DepotDB:
+    _READ_ONLY_WRITE_PREFIXES: tuple[str, ...] = (
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "REPLACE",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "VACUUM",
+        "REINDEX",
+        "ATTACH",
+        "DETACH",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "ANALYZE",
+    )
+
     def __init__(self, db_path: Path, *, read_only: bool = False, ensure_schema: bool = True):
         self.db_path = db_path
         self.read_only = bool(read_only)
@@ -259,7 +279,9 @@ class DepotDB:
         self._transaction_depth = 0
         self._connection_unhealthy = False
         self._last_reopen_attempt_ms = 0.0
-        self.conn = self._open_connection()
+        self._closed = False
+        self._close_reason = ""
+        self.conn: sqlite3.Connection | None = self._open_connection()
         self._create_tables()
 
     def _read_only_connection_target(self) -> str:
@@ -291,8 +313,79 @@ class DepotDB:
         if not read_only:
             connection.execute("PRAGMA journal_mode = DELETE")
 
+    def _closed_database_error(self, operation_name: str) -> RuntimeError:
+        close_reason = str(self._close_reason or "").strip() or "shutdown"
+        message = (
+            "Shared workflow database connection is closed; "
+            f"blocked {operation_name} after {close_reason}."
+        )
+        _runtime_log_event(
+            "depot.db.use_after_close_blocked",
+            severity="warning",
+            summary="Blocked a database operation because the shared workflow database connection is closed.",
+            context={
+                "db_path": str(self.db_path),
+                "operation": str(operation_name or ""),
+                "close_reason": close_reason,
+                "read_only": bool(self.read_only),
+            },
+        )
+        return RuntimeError(message)
+
+    def close(self, reason: str = "shutdown") -> bool:
+        if self._closed:
+            return True
+        close_reason = str(reason or "").strip() or "shutdown"
+        self._closed = True
+        self._close_reason = close_reason
+        connection = self.conn
+        self.conn = None
+        self._connection_unhealthy = False
+        if connection is None:
+            _runtime_log_event(
+                "depot.db.close_succeeded",
+                severity="info",
+                summary="The shared workflow database connection was already released during close.",
+                context={
+                    "db_path": str(self.db_path),
+                    "reason": close_reason,
+                    "read_only": bool(self.read_only),
+                    "already_closed": True,
+                },
+            )
+            return True
+        try:
+            connection.close()
+        except Exception as exc:
+            _runtime_log_event(
+                "depot.db.close_failed",
+                severity="error",
+                summary="Closing the shared workflow database connection failed.",
+                exc=exc,
+                context={
+                    "db_path": str(self.db_path),
+                    "reason": close_reason,
+                    "read_only": bool(self.read_only),
+                },
+            )
+            return False
+        _runtime_log_event(
+            "depot.db.close_succeeded",
+            severity="info",
+            summary="The shared workflow database connection was closed successfully.",
+            context={
+                "db_path": str(self.db_path),
+                "reason": close_reason,
+                "read_only": bool(self.read_only),
+                "already_closed": False,
+            },
+        )
+        return True
+
     def _should_reopen_for_error(self, exc: BaseException, *, lock_retry_exhausted: bool = False) -> bool:
         if self._transaction_depth > 0:
+            return False
+        if self._closed:
             return False
         if lock_retry_exhausted:
             return True
@@ -308,6 +401,8 @@ class DepotDB:
 
     def reopen_connection(self, reason: str) -> bool:
         if self._transaction_depth > 0:
+            return False
+        if self._closed:
             return False
         now_ms = time.monotonic() * 1000.0
         if (now_ms - float(self._last_reopen_attempt_ms or 0.0)) < DEPOT_DB_REOPEN_COOLDOWN_MS:
@@ -364,8 +459,11 @@ class DepotDB:
         attempt = 0
         reopened = False
         while True:
+            connection = self.conn
+            if self._closed or connection is None:
+                raise self._closed_database_error(operation_name)
             try:
-                cursor = self.conn.cursor()
+                cursor = connection.cursor()
                 result = runner(cursor)
                 self._connection_unhealthy = False
                 return result
@@ -400,6 +498,8 @@ class DepotDB:
                 raise
             except (sqlite3.ProgrammingError, sqlite3.DatabaseError) as exc:
                 self._connection_unhealthy = True
+                if self._closed or self.conn is None:
+                    raise self._closed_database_error(operation_name) from exc
                 if allow_reopen and not reopened and self._should_reopen_for_error(exc):
                     reopened = self.reopen_connection(f"{operation_name}:connection_recovery")
                     if reopened:
@@ -414,12 +514,46 @@ class DepotDB:
             lambda cursor: cursor.execute(command),
         )
 
+    @staticmethod
+    def _normalize_query_for_intent(query: str) -> str:
+        text = str(query or "")
+        text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+        text = re.sub(r"^\s*--.*?$", " ", text, flags=re.MULTILINE)
+        return text.strip().upper()
+
+    @classmethod
+    def _query_attempts_write(cls, query: str) -> bool:
+        normalized = cls._normalize_query_for_intent(query)
+        if not normalized:
+            return False
+        if normalized.startswith("PRAGMA"):
+            return "=" in normalized
+        if normalized.startswith("WITH"):
+            return bool(re.search(r"\b(INSERT|UPDATE|DELETE|REPLACE)\b", normalized))
+        return any(normalized.startswith(prefix) for prefix in cls._READ_ONLY_WRITE_PREFIXES)
+
+    def _raise_read_only_write_block(self, *, purpose: str, query: str = "", param_count: int = 0) -> None:
+        query_preview = " ".join(str(query or "").split())[:240]
+        summary = "Blocked a write attempt because the shared workflow database is open read-only."
+        _runtime_log_event(
+            "depot.db.read_only_write_blocked",
+            severity="warning",
+            summary=summary,
+            context={
+                "db_path": str(self.db_path),
+                "purpose": str(purpose or ""),
+                "query_preview": query_preview,
+                "param_count": int(param_count),
+            },
+        )
+        raise RuntimeError(
+            f"Shared workflow database is open read-only; blocked write attempt for {purpose}."
+        )
+
     @contextmanager
     def write_transaction(self, purpose: str = "workflow.write") -> Iterator[None]:
         if self.read_only:
-            raise RuntimeError(
-                f"Shared workflow database is open read-only; write transaction blocked for {purpose}."
-            )
+            self._raise_read_only_write_block(purpose=purpose)
         is_outer = self._transaction_depth == 0
         if is_outer:
             self._execute_transaction_command("BEGIN IMMEDIATE")
@@ -474,6 +608,8 @@ class DepotDB:
         cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
     def execute(self, query: str, params: tuple = ()) -> sqlite3.Cursor:
+        if self.read_only and self._query_attempts_write(query):
+            self._raise_read_only_write_block(purpose="execute", query=query, param_count=len(params))
         return self._run_sql_with_retry(
             "execute",
             query,
@@ -2889,13 +3025,56 @@ class DepotTracker:
             "entry_date": str(row["entry_date"] or "").strip(),
         }
 
-    def get_blocking_work_submission(self, work_order: str) -> dict[str, Any] | None:
+    def _delete_submission_row_and_aux_logs(self, submission: dict[str, Any]) -> None:
+        target_id = int(max(0, safe_int(submission.get("id", 0), 0)))
+        if target_id <= 0:
+            return
+        actor = DepotRules.normalize_user_id(str(submission.get("user_id", "") or ""))
+        work_order = DepotRules.normalize_work_order(str(submission.get("work_order", "") or ""))
+        touch = str(submission.get("touch", "") or "").strip()
+        entry_date = str(submission.get("entry_date", "") or "").strip()
+        client_unit = bool(submission.get("client_unit", False))
+
+        if touch == DepotRules.TOUCH_RTV:
+            self.db.execute(
+                "DELETE FROM rtvs WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
+                (actor, work_order, entry_date),
+            )
+        if client_unit and touch == DepotRules.TOUCH_JUNK:
+            self.db.execute(
+                "DELETE FROM client_jo WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
+                (actor, work_order, entry_date),
+            )
+        self.db.execute("DELETE FROM submissions WHERE id=?", (target_id,))
+
+    def get_blocking_work_submission(
+        self,
+        work_order: str,
+        actor_user_id: str = "",
+        *,
+        next_touch: str = "",
+        submitted_at: datetime | date | str | None = None,
+    ) -> dict[str, Any] | None:
         latest_submission = self.get_latest_work_order_submission(work_order)
         if latest_submission is None:
             return None
         latest_touch = str(latest_submission.get("touch", "") or "").strip()
         if not latest_touch or latest_touch in DepotRules.FOLLOW_UP_TOUCHES:
             return None
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        if actor:
+            entry_date = self._normalize_submission_timestamp(submitted_at).date().isoformat()
+            if self._find_existing_same_day_submission(entry_date, actor, work_order) is not None:
+                return None
+            latest_entry_date = str(latest_submission.get("entry_date", "") or "").strip()
+            requested_touch = str(next_touch or "").strip()
+            if (
+                latest_touch in DepotRules.CLOSING_TOUCHES
+                and requested_touch not in DepotRules.CLOSING_TOUCHES
+                and latest_entry_date
+                and latest_entry_date < entry_date
+            ):
+                return None
         return latest_submission
 
     def delete_user_submission(self, submission_id: int, actor_user_id: str) -> dict[str, Any]:
@@ -2917,7 +3096,8 @@ class DepotTracker:
 
         if touch in DepotRules.CLOSING_TOUCHES:
             raise ValueError(
-                f"{touch} submissions cannot be removed from Recent submissions because closing touches clear queue state."
+                f"{touch} submissions cannot be removed from Recent submissions because closing touches clear queue state. "
+                "Resubmit the same work order on the same day to overwrite it."
             )
 
         fallback_part_order = None
@@ -3082,7 +3262,8 @@ class DepotTracker:
         work_order: str,
     ) -> sqlite3.Row | None:
         return self.db.fetchone(
-            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at "
+            "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at, "
+            "COALESCE(touch, '') AS touch, COALESCE(client_unit, 0) AS client_unit "
             "FROM submissions "
             "WHERE entry_date=? AND user_id=? AND work_order=? "
             f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
@@ -3190,6 +3371,37 @@ class DepotTracker:
         client_unit_int = 1 if client_unit else 0
 
         with self.db.write_transaction("tracker.submit_work"):
+            existing_same_day_submission = self._find_existing_same_day_submission(entry_date, user_id, work_order)
+            prior_same_day_touch = str(existing_same_day_submission["touch"] or "").strip() if existing_same_day_submission is not None else ""
+            prior_same_day_client_unit = (
+                bool(int(max(0, safe_int(existing_same_day_submission["client_unit"], 0))))
+                if existing_same_day_submission is not None
+                else False
+            )
+            latest_submission = self.get_latest_work_order_submission(work_order)
+            if (
+                existing_same_day_submission is None
+                and touch not in DepotRules.CLOSING_TOUCHES
+                and latest_submission is not None
+            ):
+                latest_touch = str(latest_submission.get("touch", "") or "").strip()
+                latest_entry_date = str(latest_submission.get("entry_date", "") or "").strip()
+                if latest_touch in DepotRules.CLOSING_TOUCHES and latest_entry_date and latest_entry_date < entry_date:
+                    self._delete_submission_row_and_aux_logs(latest_submission)
+                    _runtime_log_event(
+                        "depot.superseded_closing_submission_deleted",
+                        severity="info",
+                        summary="A previous-day closing submission was removed to allow a reopened work-order update.",
+                        context={
+                            "removed_submission_id": int(max(0, safe_int(latest_submission.get("id", 0), 0))),
+                            "removed_touch": latest_touch,
+                            "removed_entry_date": latest_entry_date,
+                            "new_touch": str(touch or "").strip(),
+                            "new_entry_date": entry_date,
+                            "work_order": work_order,
+                            "actor_user_id": user_id,
+                        },
+                    )
             submission_id = self._upsert_same_day_submission(
                 entry_date,
                 user_id,
@@ -3199,6 +3411,27 @@ class DepotTracker:
                 client_unit_int,
                 stamp_text,
             )
+
+            if prior_same_day_touch == DepotRules.TOUCH_RTV and touch != DepotRules.TOUCH_RTV:
+                self.db.execute(
+                    "DELETE FROM rtvs WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
+                    (user_id, work_order, entry_date),
+                )
+            if (
+                prior_same_day_touch == DepotRules.TOUCH_JUNK
+                and prior_same_day_client_unit
+                and not (client_unit and touch == DepotRules.TOUCH_JUNK)
+            ):
+                self.db.execute(
+                    "DELETE FROM client_jo WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
+                    (user_id, work_order, entry_date),
+                )
+            if (
+                prior_same_day_touch in DepotRules.FOLLOW_UP_TOUCHES
+                and prior_same_day_client_unit
+                and not (client_unit and touch in DepotRules.FOLLOW_UP_TOUCHES)
+            ):
+                self.db.execute("DELETE FROM client_parts WHERE work_order=?", (work_order,))
 
             if touch == DepotRules.TOUCH_PART_ORDER and submission_id > 0:
                 self.db.execute(

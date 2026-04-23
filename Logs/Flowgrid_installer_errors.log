@@ -1,0 +1,86 @@
+[2026-04-21 23:58:33] [INFO:INSTALL_CONTEXT] Resolved installer path context.
+Python: C:\Users\kidds\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe
+Version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: source_root=\\casa\Root\DATA\Flowgrid
+shared_root=\\casa\Root\DATA\Flowgrid
+shared_db=\\casa\Root\DATA\Flowgrid\Flowgrid_depot.db
+local_app=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid.pyw
+local_package=C:\Users\kidds\OneDrive\Documents\Flowgrid\flowgrid_app
+local_manifest=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid_paths.json
+workflow_db_source_of_truth=shared_root/Flowgrid_depot.db
+--------------------------------------------------------------------------------
+[2026-04-22 00:03:07] [INFO:INSTALL_CONTEXT] Resolved installer path context.
+Python: C:\Users\kidds\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe
+Version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: source_root=\\casa\Root\DATA\Flowgrid
+shared_root=\\casa\Root\DATA\Flowgrid
+shared_db=\\casa\Root\DATA\Flowgrid\Flowgrid_depot.db
+local_app=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid.pyw
+local_package=C:\Users\kidds\OneDrive\Documents\Flowgrid\flowgrid_app
+local_manifest=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid_paths.json
+workflow_db_source_of_truth=shared_root/Flowgrid_depot.db
+--------------------------------------------------------------------------------
+[2026-04-22 00:12:22] [INFO:INSTALL_CONTEXT] Resolved installer path context.
+Python: C:\Users\kidds\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe
+Version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: source_root=\\casa\Root\DATA\Flowgrid
+shared_root=\\casa\Root\DATA\Flowgrid
+shared_db=\\casa\Root\DATA\Flowgrid\Flowgrid_depot.db
+local_app=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid.pyw
+local_package=C:\Users\kidds\OneDrive\Documents\Flowgrid\flowgrid_app
+local_manifest=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid_paths.json
+workflow_db_source_of_truth=shared_root/Flowgrid_depot.db
+--------------------------------------------------------------------------------
+[2026-04-22 00:12:30] [INFO:INSTALL_CONTEXT] Resolved installer path context.
+Python: C:\Users\kidds\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe
+Version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: source_root=\\casa\Root\DATA\Flowgrid
+shared_root=\\casa\Root\DATA\Flowgrid
+shared_db=\\casa\Root\DATA\Flowgrid\Flowgrid_depot.db
+local_app=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid.pyw
+local_package=C:\Users\kidds\OneDrive\Documents\Flowgrid\flowgrid_app
+local_manifest=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid_paths.json
+workflow_db_source_of_truth=shared_root/Flowgrid_depot.db
+--------------------------------------------------------------------------------
+[2026-04-22 00:16:23] [INFO:INSTALL_CONTEXT] Resolved installer path context.
+Python: C:\Users\kidds\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe
+Version: 3.14.3 (tags/v3.14.3:323c59a, Feb  3 2026, 16:04:56) [MSC v.1944 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: source_root=\\casa\Root\DATA\Flowgrid
+shared_root=\\casa\Root\DATA\Flowgrid
+shared_db=\\casa\Root\DATA\Flowgrid\Flowgrid_depot.db
+local_app=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid.pyw
+local_package=C:\Users\kidds\OneDrive\Documents\Flowgrid\flowgrid_app
+local_manifest=C:\Users\kidds\OneDrive\Documents\Flowgrid\Flowgrid_paths.json
+workflow_db_source_of_truth=shared_root/Flowgrid_depot.db
+--------------------------------------------------------------------------------
+[2026-04-22T10:35:04.247930Z] [INFO:SHARED_ASSETS_SYNC] Shared asset sync completed.
+Python: C:\Users\kidds\AppData\Local\Programs\Python\Python312\python.exe
+Version: 3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: Shared assets synced: added 1, updated 1, unchanged 0.
+--------------------------------------------------------------------------------
+[2026-04-23T02:16:28.413024Z] [INFO:SNAPSHOT_SYNC_OK] Read-only shared snapshot refreshed.
+Python: C:\Users\kidds\AppData\Local\Programs\Python\Python312\python.exe
+Version: 3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: Read-only shared snapshot refreshed from C:\Users\kidds\AppData\Local\Temp\flowgrid_installer_verify_493qoy0a\shared-main: assets added 9, updated 0, unchanged 0, removed stale 0.
+--------------------------------------------------------------------------------
+[2026-04-23T02:18:38.269264Z] [INFO:SNAPSHOT_SYNC_OK] Read-only shared snapshot refreshed.
+Python: C:\Users\kidds\AppData\Local\Programs\Python\Python312\python.exe
+Version: 3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]
+User: kidds
+Computer: STRAZZY-RIG
+Details: Read-only shared snapshot refreshed from C:\Users\kidds\AppData\Local\Temp\flowgrid_installer_verify_keep_wn6g18k4\shared-main: assets added 9, updated 0, unchanged 0, removed stale 0.
+--------------------------------------------------------------------------------

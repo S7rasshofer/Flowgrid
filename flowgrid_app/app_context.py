@@ -10,6 +10,12 @@ class RuntimeOptions:
     skip_shortcut_sync: bool = False
     skip_startup_repairs: bool = False
     skip_shared_icon_reconcile: bool = False
+    channel_id: str = "main"
+    channel_label: str = "Main"
+    channel_display_name: str = ""
+    repo_url: str = ""
+    branch: str = ""
+    snapshot_source_root: str = ""
     message_sink: Callable[[dict[str, Any]], None] | None = None
 
 

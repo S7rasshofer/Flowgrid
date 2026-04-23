@@ -182,9 +182,33 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.recent_submissions_label.setWordWrap(True)
         self.recent_submissions_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.root_layout.addWidget(self.recent_submissions_label)
+        self._apply_read_only_ui_state()
 
         if self.app_window is not None:
             self.apply_theme_styles()
+
+    def _apply_read_only_ui_state(self) -> None:
+        if not self.is_read_only_mode():
+            return
+        self._disable_widgets_for_read_only(
+            [
+                getattr(self, "qa_work_order", None),
+                getattr(self, "qa_client_check", None),
+                getattr(self, "qa_comments", None),
+                getattr(self, "qa_flag_combo", None),
+                getattr(self, "qa_bulk_parts_input", None),
+                getattr(self, "qa_bulk_import_btn", None),
+                getattr(self, "qa_assigned_open_notes_btn", None),
+                getattr(self, "qa_delivered_open_notes_btn", None),
+                getattr(self, "qa_cat_open_notes_btn", None),
+                getattr(self, "qa_rtv_open_notes_btn", None),
+                getattr(self, "qa_client_jo_open_notes_btn", None),
+                getattr(self, "qa_missing_po_reassign_btn", None),
+                getattr(self, "qa_missing_po_resolve_btn", None),
+                getattr(self, "qa_missing_po_open_notes_btn", None),
+            ],
+            "QA data updates",
+        )
 
     def apply_theme_styles(self) -> None:
         super().apply_theme_styles()
@@ -621,6 +645,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_flag_combo.blockSignals(False)
 
     def _submit_qa_part(self):
+        if self._warn_if_read_only("QA submission"):
+            return
         wo = self.qa_work_order.text().strip()
         bulk_text = str(self.qa_bulk_parts_input.toPlainText() or "").strip() if hasattr(self, "qa_bulk_parts_input") else ""
         if not wo:
@@ -748,6 +774,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         return True
 
     def _submit_qa_bulk_parts(self) -> None:
+        if self._warn_if_read_only("QA bulk import"):
+            return
         if not hasattr(self, "qa_bulk_parts_input"):
             return
         raw_text = str(self.qa_bulk_parts_input.toPlainText() or "")
@@ -1688,6 +1716,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._open_selected_qa_rtv_comment()
 
     def _open_selected_qa_rtv_comment(self) -> None:
+        if self._warn_if_read_only("RTV comment updates"):
+            return
         if not hasattr(self, "qa_rtv_table"):
             return
         if not _edit_aux_queue_comment(
@@ -1806,6 +1836,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._open_selected_qa_client_jo_comment()
 
     def _open_selected_qa_client_jo_comment(self) -> None:
+        if self._warn_if_read_only("Client JO comment updates"):
+            return
         if not hasattr(self, "qa_client_jo_table"):
             return
         if not _edit_aux_queue_comment(
@@ -1972,6 +2004,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._refresh_qa_client_followup(force=True, reason="qa_followup_action", ttl_ms=0)
 
     def _reassign_selected_missing_po_followup(self) -> None:
+        if self._warn_if_read_only("Missing PO reassignment"):
+            return
         if not hasattr(self, "qa_missing_po_table"):
             return
         _reassign_missing_po_followup(
@@ -1984,6 +2018,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         )
 
     def _resolve_selected_missing_po_followup(self) -> None:
+        if self._warn_if_read_only("Missing PO resolution"):
+            return
         if not hasattr(self, "qa_missing_po_table"):
             return
         _resolve_missing_po_followup(
@@ -2001,6 +2037,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._open_selected_qa_notes_for_table(table)
 
     def _open_selected_qa_notes_for_table(self, table: QTableWidget) -> None:
+        if self._warn_if_read_only("Notes and flag updates"):
+            return
         changed, _part_id = _edit_part_notes(self, self.tracker, role="qa", table=table)
         if not changed:
             return

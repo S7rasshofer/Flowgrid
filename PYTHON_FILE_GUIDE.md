@@ -8,7 +8,7 @@ This guide gives a simple description of what each Python file in Flowgrid does.
 This is the tiny file that starts Flowgrid. It does almost no work by itself and simply hands control to the main startup code in `flowgrid_app/bootstrap.py`.
 
 ### `Flowgrid_installer.pyw`
-This is the standalone installer for Flowgrid. It checks the Python setup, installs missing packages if needed, copies the app to the local machine, writes config data, creates shortcuts, and shows install results.
+This is the standalone installer and updater for Flowgrid. It runs from the shared drive, checks Python and package requirements, downloads the runtime from GitHub `main`, writes local install metadata, overlays shared Assets into the local runtime, creates shortcuts, and can relaunch the app after updates.
 
 ## `flowgrid_app`
 
@@ -52,10 +52,13 @@ This file contains shared installer helper logic. It focuses on local install ta
 This is the old giant all-in-one version of much of Flowgrid. It appears to keep older runtime code in one place, likely for legacy support, fallback behavior, or comparing old behavior to the newer split-up modules.
 
 ### `flowgrid_app/paths.py`
-This file is the central path and file-location manager. It figures out where shared data, local config files, databases, icons, and migrated older files should live.
+This file is the central path and file-location manager. It figures out where shared data, local config files, the local standalone installer, install-state metadata, databases, icons, and migrated older files should live.
 
 ### `flowgrid_app/runtime_logging.py`
 This file is the main runtime logging system. It figures out where logs should go, writes log entries, rotates old logs, and records useful user and machine details for troubleshooting.
+
+### `flowgrid_app/update_manager.py`
+This file contains the app-side update and shared-asset sync logic. It reads and writes the install-state manifest, checks GitHub `main` for new commits, downloads and stages snapshots when needed, and syncs shared Assets into the local runtime.
 
 ### `flowgrid_app/ui_utils.py`
 This file holds small helper functions for the UI. Most of them deal with safe number handling, color math, contrast checks, and building theme palettes.

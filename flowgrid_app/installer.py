@@ -13,6 +13,8 @@ from flowgrid_app.paths import (
     ASSETS_DIR_NAME,
     FLOWGRID_ICON_PACK_DIR_NAME,
     FLOWGRID_PROJECT_ROOT,
+    _channel_shortcut_filename,
+    _current_channel_display_name,
     _get_shared_root_from_config,
     _paths_equal,
 )
@@ -59,6 +61,13 @@ DESKTOP_SHORTCUT_FILENAME = f"{APP_TITLE}.lnk"
 MANAGED_SHORTCUT_ICON_FILENAME = "Flowgrid_shortcut.ico"
 
 WINDOWS_SHORTCUT_DESCRIPTION = "Launch Flowgrid"
+
+
+def _desktop_shortcut_filename() -> str:
+    try:
+        return _channel_shortcut_filename()
+    except Exception:
+        return DESKTOP_SHORTCUT_FILENAME
 
 def _format_pip_failure(stderr_text: str, stdout_text: str) -> str:
     stderr_clean = (stderr_text or "").strip()
@@ -159,7 +168,8 @@ def _managed_shortcut_icon_path(*, create_dir: bool = True) -> Path:
 
 def _shortcut_contract() -> dict[str, str]:
     desktop_dir = _resolve_windows_desktop_directory()
-    shortcut_path = desktop_dir / DESKTOP_SHORTCUT_FILENAME if desktop_dir is not None else Path(DESKTOP_SHORTCUT_FILENAME)
+    shortcut_filename = _desktop_shortcut_filename()
+    shortcut_path = desktop_dir / shortcut_filename if desktop_dir is not None else Path(shortcut_filename)
     launcher_path = _preferred_gui_python_executable()
     script_path = _flowgrid_script_path()
     managed_icon_path = _managed_shortcut_icon_path(create_dir=False)
@@ -300,7 +310,7 @@ def _sync_desktop_shortcut(
         )
         return "failed", detail
 
-    shortcut_path = desktop_dir / DESKTOP_SHORTCUT_FILENAME
+    shortcut_path = desktop_dir / _desktop_shortcut_filename()
     already_exists = shortcut_path.exists()
     if not create_if_missing and not already_exists:
         return "missing", ""
@@ -404,7 +414,8 @@ def _launch_flowgrid_detached() -> tuple[bool, str]:
         return False, f"{type(exc).__name__}: {exc}"
 
 def _run_installer_mode(*, launch_after_install: bool) -> int:
-    _safe_print(f"{APP_TITLE} shortcut setup")
+    channel_display_name = _current_channel_display_name()
+    _safe_print(f"{channel_display_name or APP_TITLE} shortcut setup")
     _safe_print(f"Interpreter: {sys.executable}")
     _safe_print("Legacy CLI alias: synchronizing local desktop shortcut.")
 

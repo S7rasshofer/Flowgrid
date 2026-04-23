@@ -477,6 +477,35 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.refresh_roles()
         self.refresh_users()
         self.refresh_qa_flags()
+        self._apply_read_only_ui_state()
+
+    def _apply_read_only_ui_state(self) -> None:
+        if not self.is_read_only_mode():
+            return
+        self._disable_widgets_for_read_only(
+            [
+                getattr(self, "user_id_input", None),
+                getattr(self, "user_name_input", None),
+                getattr(self, "user_location_input", None),
+                getattr(self, "user_role_combo", None),
+                getattr(self, "user_access_combo", None),
+                getattr(self, "user_icon_input", None),
+                getattr(self, "user_icon_browse", None),
+                getattr(self, "user_save_btn", None),
+                getattr(self, "user_remove_btn", None),
+                getattr(self, "role_name_input", None),
+                getattr(self, "role_behavior_combo", None),
+                getattr(self, "role_save_btn", None),
+                getattr(self, "role_remove_btn", None),
+                getattr(self, "qa_flag_name_input", None),
+                getattr(self, "qa_flag_severity_combo", None),
+                getattr(self, "qa_flag_icon_input", None),
+                getattr(self, "qa_flag_icon_browse", None),
+                getattr(self, "qa_flag_save_btn", None),
+                getattr(self, "qa_flag_remove_btn", None),
+            ],
+            "User Setup changes",
+        )
 
     def apply_theme_styles(self) -> None:
         if self.app_window is None:
@@ -1172,6 +1201,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
             self.user_icon_input.setText(selected)
 
     def _save_user(self) -> None:
+        if self._warn_if_read_only("User updates"):
+            return
         user_id = DepotRules.normalize_user_id(self.user_id_input.text())
         name = str(self.user_name_input.text() or "").strip()
         location = str(self.user_location_input.text() or "").strip()
@@ -1224,6 +1255,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"User {user_id} updated.")
 
     def _remove_selected_user(self) -> None:
+        if self._warn_if_read_only("User removal"):
+            return
         row = self.users_table.currentRow()
         if row < 0:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a user to remove.")
@@ -1257,6 +1290,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"User {user_id} removed.")
 
     def _save_role(self) -> None:
+        if self._warn_if_read_only("Role updates"):
+            return
         role_name = str(self.role_name_input.text() or "").strip()
         role_slot = DepotRules.normalize_role_slot(
             self.role_behavior_combo.currentData(),
@@ -1282,6 +1317,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"Role {role_name} updated.")
 
     def _remove_selected_role(self) -> None:
+        if self._warn_if_read_only("Role removal"):
+            return
         row = self.roles_table.currentRow()
         if row < 0:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a role to remove.")
@@ -1308,6 +1345,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"Role {role_name} removed.")
 
     def _save_qa_flag(self) -> None:
+        if self._warn_if_read_only("Action-flag updates"):
+            return
         flag_name = str(self.qa_flag_name_input.text() or "").strip()
         severity = str(self.qa_flag_severity_combo.currentText() or "Medium").strip()
         icon_path = str(self.qa_flag_icon_input.text() or "").strip()
@@ -1345,6 +1384,8 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"QA flag '{flag_name}' updated.")
 
     def _remove_selected_qa_flag(self) -> None:
+        if self._warn_if_read_only("Action-flag removal"):
+            return
         row = self.qa_flags_table.currentRow()
         if row < 0:
             self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a QA flag to remove.")
@@ -1849,6 +1890,19 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.refresh_combo_popup_width()
         self.refresh_dashboard()
         self.refresh_notes_rows()
+        self._apply_read_only_ui_state()
+
+    def _apply_read_only_ui_state(self) -> None:
+        if not self.is_read_only_mode():
+            return
+        self._disable_widgets_for_read_only(
+            [
+                getattr(self, "notes_editor", None),
+                getattr(self, "notes_save_btn", None),
+                getattr(self, "completed_open_notes_btn", None),
+            ],
+            "Dashboard note updates",
+        )
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.app_window.config.setdefault("popup_positions", {})["depot_dashboard"] = {
@@ -2124,6 +2178,8 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self._open_selected_completed_notes()
 
     def _open_selected_completed_notes(self) -> None:
+        if self._warn_if_read_only("Completed-part note updates"):
+            return
         saved, _part_id = _edit_part_notes(
             self,
             self.app_window.depot_tracker,
@@ -2359,9 +2415,9 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         user_text = user_item.text().strip() if user_item is not None else ""
 
         self._notes_selected_row_id = row_id if row_id > 0 else None
-        self.notes_editor.setEnabled(self._notes_selected_row_id is not None)
+        self.notes_editor.setEnabled(self._notes_selected_row_id is not None and not self.is_read_only_mode())
         self.notes_editor.setPlainText(note_text)
-        self.notes_save_btn.setEnabled(self._notes_selected_row_id is not None)
+        self.notes_save_btn.setEnabled(self._notes_selected_row_id is not None and not self.is_read_only_mode())
         if self._notes_selected_row_id is not None:
             self.notes_selected_label.setText(
                 f"Editing row #{self._notes_selected_row_id} | Work Order: {work_order_text or '(none)'} | User: {user_text or '(none)'}"
@@ -2371,6 +2427,8 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_status_label.setText("")
 
     def _save_selected_note(self) -> None:
+        if self._warn_if_read_only("Dashboard note updates"):
+            return
         target_key = str(self.notes_target_combo.currentData() or "").strip()
         row_id = self._notes_selected_row_id
         if not target_key or row_id is None:

@@ -725,6 +725,21 @@ class DepotFramelessToolWindow(QDialog):
         header_row.setSpacing(UI_SPACING_FRAMELESS_TOOL)
         self.header_title = QLabel(window_title)
         self.header_title.setProperty("section", True)
+        self.header_mode_badge = QLabel(self._read_only_badge_text())
+        self.header_mode_badge.setObjectName("DepotReadOnlyBadge")
+        self.header_mode_badge.setVisible(bool(self.header_mode_badge.text()))
+        self.header_mode_badge.setStyleSheet(
+            "QLabel#DepotReadOnlyBadge {"
+            "background-color: rgba(166, 75, 42, 0.92);"
+            "color: #FFF8ED;"
+            "border: 1px solid rgba(255, 225, 192, 0.85);"
+            "border-radius: 9px;"
+            "padding: 2px 8px;"
+            "font-size: 10px;"
+            "font-weight: 900;"
+            "letter-spacing: 0.4px;"
+            "}"
+        )
         self.header_close_btn = QPushButton("x")
         self.header_close_btn.setFixedSize(HEADER_CLOSE_BUTTON_WIDTH, HEADER_CLOSE_BUTTON_HEIGHT)
         self.header_close_btn.setObjectName("DepotFramelessCloseButton")
@@ -733,12 +748,65 @@ class DepotFramelessToolWindow(QDialog):
         self.header_close_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.header_close_btn.clicked.connect(self.close)
         header_row.addWidget(self.header_title)
+        header_row.addWidget(self.header_mode_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         header_row.addStretch(1)
         header_row.addWidget(self.header_close_btn)
         self.root_layout.addLayout(header_row)
         app = QApplication.instance()
         if app is not None:
             app.installEventFilter(self)
+
+    def is_read_only_mode(self) -> bool:
+        if self.app_window is None:
+            return False
+        runtime_options = getattr(self.app_window, "runtime_options", None)
+        if runtime_options is not None:
+            return bool(getattr(runtime_options, "read_only_db", False))
+        depot_db = getattr(self.app_window, "depot_db", None)
+        return bool(getattr(depot_db, "read_only", False))
+
+    def _read_only_badge_text(self) -> str:
+        if not self.is_read_only_mode():
+            return ""
+        if self.app_window is None:
+            return "READ ONLY"
+        runtime_options = getattr(self.app_window, "runtime_options", None)
+        channel_label = str(getattr(runtime_options, "channel_label", "") or "").strip()
+        if channel_label:
+            return f"{channel_label.upper()} READ ONLY"
+        return "READ ONLY"
+
+    def _read_only_message_text(self, action_label: str = "") -> str:
+        action = str(action_label or "That action").strip() or "That action"
+        return f"{action} is unavailable while this channel is running in read-only mode."
+
+    def _show_read_only_message(self, action_label: str = "") -> None:
+        self._show_themed_message(QMessageBox.Icon.Information, "Read Only", self._read_only_message_text(action_label))
+
+    def _warn_if_read_only(self, action_label: str = "") -> bool:
+        if not self.is_read_only_mode():
+            return False
+        _runtime_log_event(
+            "ui.read_only_action_blocked",
+            severity="info",
+            summary="A read-only channel blocked a write-capable UI action.",
+            context={
+                "window_title": str(self.windowTitle()),
+                "action_label": str(action_label or "").strip(),
+            },
+        )
+        self._show_read_only_message(action_label)
+        return True
+
+    def _disable_widgets_for_read_only(self, widgets: list[QWidget], action_label: str) -> None:
+        if not self.is_read_only_mode():
+            return
+        tooltip = self._read_only_message_text(action_label)
+        for widget in widgets:
+            if widget is None:
+                continue
+            widget.setEnabled(False)
+            widget.setToolTip(tooltip)
 
     def apply_theme_styles(self) -> None:
         if self.app_window is None:
