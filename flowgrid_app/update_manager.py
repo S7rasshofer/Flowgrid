@@ -552,6 +552,93 @@ def _prune_empty_parents(target_path: Path, stop_root: Path) -> None:
         parent = parent.parent
 
 
+def _seed_missing_shared_assets_from_local_runtime(
+    *,
+    shared_root: Path,
+    local_root: Path,
+) -> dict[str, Any]:
+    source_assets_root = local_root / ASSETS_DIR_NAME
+    target_assets_root = shared_root / ASSETS_DIR_NAME
+    if not source_assets_root.exists() or not source_assets_root.is_dir():
+        summary = f"Local packaged Assets folder is unavailable at {source_assets_root}; shared asset seeding was skipped."
+        _runtime_log_event(
+            "update.shared_assets_seed_source_missing",
+            severity="warning",
+            summary="Shared asset baseline seeding was skipped because the local packaged Assets folder is unavailable.",
+            context={"source_assets_root": str(source_assets_root), "target_assets_root": str(target_assets_root)},
+        )
+        return {
+            "status": "warning",
+            "summary": summary,
+            "added": 0,
+            "skipped": 0,
+            "errors": 0,
+        }
+
+    added = 0
+    skipped = 0
+    errors = 0
+    try:
+        target_assets_root.mkdir(parents=True, exist_ok=True)
+        for source_path in sorted(source_assets_root.rglob("*")):
+            relative = source_path.relative_to(source_assets_root)
+            target_path = target_assets_root / relative
+            if source_path.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+                continue
+            if target_path.exists():
+                skipped += 1
+                continue
+            try:
+                _copy_file_atomic(source_path, target_path)
+                added += 1
+            except Exception as exc:
+                errors += 1
+                _runtime_log_event(
+                    "update.shared_assets_seed_copy_failed",
+                    severity="warning",
+                    summary="A packaged asset file could not be copied into the shared Assets tree.",
+                    exc=exc,
+                    context={"source_path": str(source_path), "target_path": str(target_path)},
+                )
+    except Exception as exc:
+        summary = f"Shared asset seed failed: {type(exc).__name__}: {exc}"
+        _runtime_log_event(
+            "update.shared_assets_seed_failed",
+            severity="warning",
+            summary="Shared asset baseline seeding failed.",
+            exc=exc,
+            context={"source_assets_root": str(source_assets_root), "target_assets_root": str(target_assets_root)},
+        )
+        return {
+            "status": "warning",
+            "summary": summary,
+            "added": added,
+            "skipped": skipped,
+            "errors": errors + 1,
+        }
+
+    status = "ok" if errors == 0 else "warning"
+    summary = (
+        f"Shared asset baseline ensured: added {added}, existing {skipped}."
+        if errors == 0
+        else f"Shared asset baseline ensured with warnings: added {added}, existing {skipped}, errors {errors}."
+    )
+    _runtime_log_event(
+        "update.shared_assets_seed_complete",
+        severity="info" if errors == 0 else "warning",
+        summary=summary,
+        context={"source_assets_root": str(source_assets_root), "target_assets_root": str(target_assets_root)},
+    )
+    return {
+        "status": status,
+        "summary": summary,
+        "added": added,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
 def _iter_managed_source_files(snapshot_root: Path) -> Iterator[tuple[str, Path]]:
     for filename in REPO_MANAGED_ROOT_FILES:
         source_path = snapshot_root / filename
@@ -735,6 +822,16 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
         bootstrap_ok, bootstrap_summary = _bootstrap_shared_database_with_local_runtime(state=state, local_root=local_root)
         if not bootstrap_ok:
             raise RuntimeError(bootstrap_summary)
+        try:
+            shared_seed_result = _seed_missing_shared_assets_from_local_runtime(
+                shared_root=_get_shared_root_from_config(),
+                local_root=local_root,
+            )
+        except Exception as exc:
+            shared_seed_result = {
+                "status": "warning",
+                "summary": f"Shared asset baseline seed skipped: {type(exc).__name__}: {exc}",
+            }
         pre_sync_summary = (
             f"{str(state.get('channel_display_name') or 'Flowgrid')} already matched "
             f"{_update_source_label(state)} at {remote.get('short_sha', '')}. {bootstrap_summary}"
@@ -750,7 +847,10 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
         save_install_state(state)
         asset_result = sync_shared_assets()
         final_state = load_install_state()
-        final_summary = f"{pre_sync_summary} {str(asset_result.get('summary') or '').strip()}".strip()
+        final_summary = (
+            f"{pre_sync_summary} {str(shared_seed_result.get('summary') or '').strip()} "
+            f"{str(asset_result.get('summary') or '').strip()}"
+        ).strip()
         final_state.update(
             {
                 "last_check_at_utc": str(state.get("last_check_at_utc") or "").strip(),
@@ -788,12 +888,23 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
     if not bootstrap_ok:
         raise RuntimeError(bootstrap_summary)
     save_install_state(updated_state)
+    try:
+        shared_seed_result = _seed_missing_shared_assets_from_local_runtime(
+            shared_root=_get_shared_root_from_config(),
+            local_root=local_root,
+        )
+    except Exception as exc:
+        shared_seed_result = {
+            "status": "warning",
+            "summary": f"Shared asset baseline seed skipped: {type(exc).__name__}: {exc}",
+        }
     asset_result = sync_shared_assets()
     final_state = load_install_state()
     summary = (
         f"Runtime updated from {_update_source_label(updated_state)}: copied {apply_result['copied']}, "
         f"unchanged {apply_result['unchanged']}, removed {apply_result['removed']}. "
-        f"{bootstrap_summary} {str(asset_result.get('summary') or '').strip()}"
+        f"{bootstrap_summary} {str(shared_seed_result.get('summary') or '').strip()} "
+        f"{str(asset_result.get('summary') or '').strip()}"
     )
     final_state.update({"last_check_summary": summary, "last_check_status": "up_to_date"})
     save_install_state(final_state)

@@ -118,6 +118,7 @@ from flowgrid_app.paths import (
     SHARED_SYNC_REFRESH_INTERVAL_MS,
     _data_file_path,
     _get_local_updater_path,
+    _local_data_root,
     _migrate_legacy_agent_icons,
     _resolve_data_root,
     _shared_workflow_db_path,
@@ -1196,6 +1197,9 @@ class QuickInputsWindow(QMainWindow):
                 self._ui_icon_dir() / clean,
                 _resolve_data_root() / ASSETS_DIR_NAME / ASSET_UI_ICON_COMPAT_DIR_NAME / clean,
                 _resolve_data_root() / "ui_icons" / clean,
+                _local_data_root() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME / clean,
+                _local_data_root() / ASSETS_DIR_NAME / ASSET_UI_ICON_COMPAT_DIR_NAME / clean,
+                _local_data_root() / "ui_icons" / clean,
             ]
             for path in search_paths:
                 if not path.exists() or not path.is_file():

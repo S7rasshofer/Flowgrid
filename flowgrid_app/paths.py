@@ -506,57 +506,59 @@ def _migrate_legacy_agent_icons(target_db_path: Path) -> None:
         ASSET_QA_FLAG_ICON_DIR_NAME: ASSET_QA_FLAG_ICON_DIR_NAME,
         ASSET_PART_FLAG_IMAGE_DIR_NAME: ASSET_PART_FLAG_IMAGE_DIR_NAME,
         "ui_icons": ASSET_UI_ICON_COMPAT_DIR_NAME,
+        FLOWGRID_ICON_PACK_DIR_NAME: FLOWGRID_ICON_PACK_DIR_NAME,
     }
 
     for root in unique_roots:
         for legacy_folder, asset_folder in legacy_to_assets.items():
-            source_dir = root / legacy_folder
             target_dir = assets_root / asset_folder
-            if not source_dir.exists() or not source_dir.is_dir():
-                continue
-            try:
-                if _paths_equal(source_dir, target_dir):
+            source_dir_candidates = [root / legacy_folder, root / ASSETS_DIR_NAME / legacy_folder]
+            for source_dir in source_dir_candidates:
+                if not source_dir.exists() or not source_dir.is_dir():
                     continue
-            except Exception as exc:
-                _runtime_log_event(
-                    "bootstrap.legacy_asset_path_compare_failed",
-                    severity="warning",
-                    summary="Failed comparing legacy and target asset directories; continuing migration scan.",
-                    exc=exc,
-                    context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
-                )
-            try:
-                for source_file in source_dir.rglob("*"):
-                    if not source_file.is_file():
+                try:
+                    if _paths_equal(source_dir, target_dir):
                         continue
-                    rel = source_file.relative_to(source_dir)
-                    target_file = target_dir / rel
-                    if target_file.exists():
-                        continue
-                    target_file.parent.mkdir(parents=True, exist_ok=True)
-                    try:
-                        shutil.copy2(source_file, target_file)
-                    except Exception as exc:
-                        _runtime_log_event(
-                            "bootstrap.legacy_asset_copy_failed",
-                            severity="warning",
-                            summary="Failed copying a legacy asset file into Assets.",
-                            exc=exc,
-                            context={
-                                "source_file": str(source_file),
-                                "target_file": str(target_file),
-                            },
-                        )
-                        continue
-            except Exception as exc:
-                _runtime_log_event(
-                    "bootstrap.legacy_asset_root_scan_failed",
-                    severity="warning",
-                    summary="Failed scanning a legacy asset source directory.",
-                    exc=exc,
-                    context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
-                )
-                continue
+                except Exception as exc:
+                    _runtime_log_event(
+                        "bootstrap.legacy_asset_path_compare_failed",
+                        severity="warning",
+                        summary="Failed comparing legacy and target asset directories; continuing migration scan.",
+                        exc=exc,
+                        context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
+                    )
+                try:
+                    for source_file in source_dir.rglob("*"):
+                        if not source_file.is_file():
+                            continue
+                        rel = source_file.relative_to(source_dir)
+                        target_file = target_dir / rel
+                        if target_file.exists():
+                            continue
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        try:
+                            shutil.copy2(source_file, target_file)
+                        except Exception as exc:
+                            _runtime_log_event(
+                                "bootstrap.legacy_asset_copy_failed",
+                                severity="warning",
+                                summary="Failed copying a legacy asset file into Assets.",
+                                exc=exc,
+                                context={
+                                    "source_file": str(source_file),
+                                    "target_file": str(target_file),
+                                },
+                            )
+                            continue
+                except Exception as exc:
+                    _runtime_log_event(
+                        "bootstrap.legacy_asset_root_scan_failed",
+                        severity="warning",
+                        summary="Failed scanning a legacy asset source directory.",
+                        exc=exc,
+                        context={"source_dir": str(source_dir), "target_dir": str(target_dir)},
+                    )
+                    continue
 
 __all__ = [
     "APP_TITLE",

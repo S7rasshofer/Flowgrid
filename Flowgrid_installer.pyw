@@ -957,6 +957,9 @@ def _ensure_shared_storage_contract(paths: Dict[str, Any]) -> bool:
     try:
         paths["shared_root"].mkdir(parents=True, exist_ok=True)
         Path(paths["shared_db"]).parent.mkdir(parents=True, exist_ok=True)
+        paths["shared_assets"].mkdir(parents=True, exist_ok=True)
+        for folder_name in MANAGED_SHARED_ASSET_DIRS:
+            (paths["shared_assets"] / folder_name).mkdir(parents=True, exist_ok=True)
         return True
     except Exception as exc:
         log_installer_error(
@@ -1852,7 +1855,7 @@ def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str
     if not shared_assets.exists() or not shared_assets.is_dir():
         warnings.append(
             "Shared Assets folder is not present at "
-            f"{shared_assets}; local packaged assets will remain in use until the launch updater can sync them."
+            f"{shared_assets}; installer will seed the baseline packaged assets into the shared drive without overwriting existing files."
         )
 
     return warnings, errors
@@ -1907,7 +1910,8 @@ def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]
                 if not bool(paths.get("read_only_db", False))
                 else f"- Shared workflow DB: read-only snapshot at {paths['shared_db']}"
             ),
-            "- Shared Assets overlay onto the local packaged Assets folder",
+            f"- Shared Assets source of truth: {paths['shared_assets']}",
+            f"- Local packaged Assets cache: {paths['local_assets']}",
             f"- Code/runtime source: {_channel_remote_label(paths)}",
         ]
     )
@@ -1946,6 +1950,13 @@ def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
         "ok" if paths["local_assets"].exists() and paths["local_assets"].is_dir() else "failed",
         "Local packaged Assets folder present." if paths["local_assets"].exists() and paths["local_assets"].is_dir() else "Local Assets folder missing after install.",
         str(paths["local_assets"]),
+    )
+    _record_step(
+        results,
+        "Shared Assets tree ready",
+        "ok" if paths["shared_assets"].exists() and paths["shared_assets"].is_dir() else "failed",
+        "Shared Assets folder present for app-wide icons and uploads." if paths["shared_assets"].exists() and paths["shared_assets"].is_dir() else "Shared Assets folder missing after install.",
+        str(paths["shared_assets"]),
     )
     manifest_ok = paths["local_paths_config"].exists() and verify_local_paths_config(paths)
     _record_step(
@@ -2385,8 +2396,12 @@ def run_installer(
     _safe_print(f"[OK] {shared_bootstrap_summary}")
     _safe_print()
 
-    _safe_print("Step 10: Deferring shared asset sync to the startup updater...")
-    shared_seed_summary = "Installer left shared asset updates to the standalone updater that runs during normal Flowgrid launch."
+    _safe_print("Step 10: Seeding baseline shared assets...")
+    asset_seed_source = paths["local_assets"] if paths["local_assets"].exists() and paths["local_assets"].is_dir() else (paths["source_root"] / "Assets")
+    asset_seed_result = _seed_missing_shared_assets_from_source(paths, asset_seed_source)
+    shared_seed_summary = (
+        f"{asset_seed_result['summary']} The standalone updater will still mirror shared assets into the local install on launch."
+    )
     state.update(
         {
             "last_shared_asset_sync_at_utc": "",
@@ -2396,12 +2411,12 @@ def run_installer(
     )
     _record_step(
         install_steps,
-        "Shared assets deferred",
-        "ok",
+        "Shared assets seed",
+        asset_seed_result["status"],
         shared_seed_summary,
-        str(paths["local_assets"]),
+        str(paths["shared_assets"]),
     )
-    _safe_print(f"[OK] {shared_seed_summary}")
+    _safe_print(f"{_step_marker(asset_seed_result['status'])} {shared_seed_summary}")
     _safe_print()
 
     if not save_install_state(paths, state):
