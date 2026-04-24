@@ -60,6 +60,8 @@ INSTALL_STATE_FILENAME = "Flowgrid_install_state.json"
 
 LOCAL_INSTALLER_FILENAME = "Flowgrid_installer.pyw"
 
+LOCAL_UPDATER_FILENAME = "Flowgrid_updater.pyw"
+
 DEPOT_DB_FILENAME = "Flowgrid_depot.db"
 
 DEFAULT_CHANNEL_ID = "main"
@@ -319,6 +321,11 @@ def _get_local_installer_path() -> Path:
     """Get the locally installed standalone installer path."""
     return _local_data_root() / LOCAL_INSTALLER_FILENAME
 
+
+def _get_local_updater_path() -> Path:
+    """Get the locally installed standalone updater path."""
+    return _local_data_root() / LOCAL_UPDATER_FILENAME
+
 def _shared_workflow_db_path() -> Path:
     """Return the authoritative shared workflow database path."""
     shared_root = _resolve_data_root()
@@ -577,6 +584,7 @@ __all__ = [
     "FLOWGRID_PROJECT_ROOT",
     "FLOWGRID_SCRIPT_PATH",
     "LOCAL_INSTALLER_FILENAME",
+    "LOCAL_UPDATER_FILENAME",
     "LOGS_DIR_NAME",
     "MIN_PYTHON_VERSION",
     "SHARED_SYNC_REFRESH_INTERVAL_MS",
@@ -595,6 +603,7 @@ __all__ = [
     "_get_local_config_folder",
     "_get_local_config_path",
     "_get_local_installer_path",
+    "_get_local_updater_path",
     "_get_shared_root_from_config",
     "_legacy_data_candidates",
     "_load_paths_config",

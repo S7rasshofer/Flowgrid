@@ -22,6 +22,7 @@ from flowgrid_app.paths import (
     _current_channel_settings,
     _find_local_paths_config,
     _get_local_config_folder,
+    _get_local_updater_path,
     _get_shared_root_from_config,
     _local_data_root,
     _paths_equal,
@@ -38,6 +39,7 @@ LAUNCH_LOG_FILENAME = "Flowgrid_launch_errors.log"
 _CLI_FLAGS = {str(arg or "").strip().lower() for arg in sys.argv[1:] if str(arg or "").strip()}
 _SHORTCUT_MODE_FLAGS = {"--install", "--create-shortcut"}
 _DIAGNOSTIC_MODE_FLAGS = {"--diagnose-install", "--smoke-ui"}
+_STARTUP_UPDATE_SKIP_FLAGS = {"--skip-startup-update"}
 _COMMAND_LINE_FLAGS_ACTIVE = bool((_SHORTCUT_MODE_FLAGS | _DIAGNOSTIC_MODE_FLAGS) & _CLI_FLAGS)
 _BASE_STARTUP_INITIALIZED = False
 _DEPENDENCIES_INITIALIZED = False
@@ -393,6 +395,83 @@ def _ensure_pyside6() -> None:
         )
 
 
+def _preferred_gui_python_executable() -> Path:
+    candidates: list[Path] = []
+    for raw in (getattr(sys, "_base_executable", ""), sys.executable):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        candidates.append(path)
+        candidates.append(path.parent / "pythonw.exe")
+        if path.name.lower() == "python.exe":
+            candidates.append(path.with_name("pythonw.exe"))
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    for candidate in unique:
+        if candidate.name.lower() == "pythonw.exe" and candidate.exists() and candidate.is_file():
+            return candidate
+    for candidate in unique:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return Path(sys.executable)
+
+
+def _handoff_to_startup_updater() -> bool:
+    if _CLI_FLAGS & _STARTUP_UPDATE_SKIP_FLAGS:
+        return False
+
+    config_path = _find_local_paths_config()
+    if config_path is None or not _paths_equal(config_path.parent, _local_data_root()):
+        return False
+
+    updater_path = _get_local_updater_path()
+    if not updater_path.exists() or not updater_path.is_file():
+        return False
+
+    launcher_path = _preferred_gui_python_executable()
+    if not launcher_path.exists() or not launcher_path.is_file():
+        _runtime_log_event(
+            "bootstrap.startup_update_launcher_missing",
+            severity="warning",
+            summary="Startup updater handoff was skipped because the Python launcher could not be resolved.",
+            context={"launcher_path": str(launcher_path), "updater_path": str(updater_path)},
+        )
+        return False
+
+    try:
+        subprocess.Popen(
+            [
+                str(launcher_path),
+                str(updater_path),
+                "--parent-pid",
+                str(os.getpid()),
+                "--relaunch",
+                "--launch-on-failure",
+            ],
+            cwd=str(updater_path.parent),
+        )
+    except Exception as exc:
+        _runtime_log_event(
+            "bootstrap.startup_update_handoff_failed",
+            severity="warning",
+            summary="Startup updater handoff failed; Flowgrid will continue launching without the pre-launch updater pass.",
+            exc=exc,
+            context={"launcher_path": str(launcher_path), "updater_path": str(updater_path)},
+        )
+        return False
+
+    _runtime_log_event(
+        "bootstrap.startup_update_handoff_started",
+        severity="info",
+        summary="Flowgrid launch was handed off to the standalone updater before opening the main window.",
+        context={"launcher_path": str(launcher_path), "updater_path": str(updater_path), "parent_pid": int(os.getpid())},
+    )
+    return True
+
+
 def _run_base_startup_initialization(
     *,
     create_shared_root: bool,
@@ -518,6 +597,8 @@ def run_entrypoint() -> None:
         cli_result = _run_command_line_mode()
         if cli_result is not None:
             raise SystemExit(cli_result)
+        if _handoff_to_startup_updater():
+            raise SystemExit(0)
         _run_base_startup_initialization(
             create_shared_root=True,
             require_dependencies=True,

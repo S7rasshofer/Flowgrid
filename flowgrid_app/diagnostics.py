@@ -18,7 +18,7 @@ from flowgrid_app.paths import (
     FLOWGRID_PROJECT_ROOT,
     _find_local_paths_config,
     _get_install_state_path,
-    _get_local_installer_path,
+    _get_local_updater_path,
     _get_shared_root_from_config,
     _local_data_root,
     _paths_equal,
@@ -199,7 +199,7 @@ def collect_install_preflight_results() -> list[DiagnosticEntry]:
 
     required_runtime_paths = (
         (runtime_dir / "Flowgrid.pyw", "Flowgrid.pyw"),
-        (_get_local_installer_path(), "Flowgrid_installer.pyw"),
+        (_get_local_updater_path(), "Flowgrid_updater.pyw"),
         (runtime_dir / "flowgrid_app" / "__init__.py", "flowgrid_app package"),
         (runtime_dir / "Assets", "Assets folder"),
     )

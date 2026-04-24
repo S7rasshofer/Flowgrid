@@ -397,7 +397,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_bulk_parts_headers_layout.setContentsMargins(6, 0, 6, 0)
         self.qa_bulk_parts_headers_layout.setHorizontalSpacing(10)
         self.qa_bulk_parts_headers_layout.setVerticalSpacing(0)
-        for col_idx, header_text in enumerate(("LPN", "Part #", "Part Description", "Shipping Info")):
+        for col_idx, header_text in enumerate(("LPN", "Part Description", "Part #", "Shipping Info")):
             header_label = QLabel(header_text, self.qa_bulk_parts_headers)
             header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.qa_bulk_parts_headers_layout.addWidget(header_label, 0, col_idx)
@@ -410,7 +410,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_bulk_parts_input.setMinimumHeight(116)
         self.qa_bulk_parts_input.setPlaceholderText(
             "Paste tab-separated rows here:\n"
-            "LPN<TAB>Part#<TAB>Part Description<TAB>Shipping Info\n"
+            "LPN<TAB>Part Description<TAB>Part #<TAB>Shipping Info\n"
             "Only rows with shipping info containing 'delivered' are imported."
         )
         self.qa_bulk_parts_input.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -1052,8 +1052,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
                 "Repair Owner",
                 "Category",
                 "LPN",
-                "Part #",
                 "Part Description",
+                "Part #",
                 "Shipping Info",
                 "QA Note",
             ],
@@ -1311,7 +1311,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
 
     def _build_qa_client_followup_tab(self) -> None:
         layout = QVBoxLayout(self.qa_client_tab)
-        summary = QLabel("Client follow-up queue for all agents (Client + Other daily, Part Order after 21 days).")
+        summary = QLabel("Client follow-up queue for all agents (Client + Other, submitted).")
         summary.setWordWrap(True)
         summary.setProperty("muted", True)
         layout.addWidget(summary)

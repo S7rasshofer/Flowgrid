@@ -117,7 +117,7 @@ from flowgrid_app.paths import (
     FLOWGRID_ICON_PACK_DIR_NAME,
     SHARED_SYNC_REFRESH_INTERVAL_MS,
     _data_file_path,
-    _get_local_installer_path,
+    _get_local_updater_path,
     _migrate_legacy_agent_icons,
     _resolve_data_root,
     _shared_workflow_db_path,
@@ -408,7 +408,7 @@ class QuickInputsWindow(QMainWindow):
             self.depot_db = DepotDB(
                 _shared_workflow_db_path(),
                 read_only=self.runtime_options.read_only_db,
-                ensure_schema=not self.runtime_options.read_only_db,
+                ensure_schema=False,
             )
         except Exception as exc:
             db_path = _shared_workflow_db_path()
@@ -4921,7 +4921,7 @@ class QuickInputsWindow(QMainWindow):
             self._install_status_cache.get("snapshot_source_root") or self.runtime_options.snapshot_source_root or ""
         ).strip()
         installed_short = str(self._install_status_cache.get("installed_short_sha") or "").strip() or "-"
-        installer_path = str(self._install_status_cache.get("local_installer_path") or "").strip()
+        updater_path = str(self._install_status_cache.get("local_updater_path") or "").strip()
         update_summary = str(self._install_status_cache.get("last_check_summary") or "").strip() or "Not checked yet."
         asset_summary = str(self._install_status_cache.get("last_shared_asset_sync_summary") or "").strip() or "Not synced yet."
 
@@ -4935,10 +4935,10 @@ class QuickInputsWindow(QMainWindow):
             if snapshot_source_root and read_only_db:
                 mode_text += f" | Snapshot source: {snapshot_source_root}"
             self.channel_mode_status_label.setText(mode_text)
-            self.channel_mode_status_label.setToolTip(installer_path or mode_text)
+            self.channel_mode_status_label.setToolTip(updater_path or mode_text)
         if hasattr(self, "update_commit_status_label"):
             self.update_commit_status_label.setText(f"Installed commit: {installed_short}")
-            self.update_commit_status_label.setToolTip(installer_path or "Local installer path unavailable.")
+            self.update_commit_status_label.setToolTip(updater_path or "Local updater path unavailable.")
         if hasattr(self, "update_check_status_label"):
             self.update_check_status_label.setText(f"Update status: {update_summary}")
         if hasattr(self, "shared_assets_status_label"):
@@ -5064,12 +5064,12 @@ class QuickInputsWindow(QMainWindow):
             self._show_shell_message(QMessageBox.Icon.Information, "Install Update", f"No {source_label} update is currently pending.")
             return
 
-        installer_path = _get_local_installer_path()
-        if not installer_path.exists() or not installer_path.is_file():
+        updater_path = _get_local_updater_path()
+        if not updater_path.exists() or not updater_path.is_file():
             self._show_shell_message(
                 QMessageBox.Icon.Warning,
                 "Install Update",
-                f"Local installer copy is missing:\n{installer_path}",
+                f"Local updater copy is missing:\n{updater_path}",
             )
             return
 
@@ -5086,21 +5086,20 @@ class QuickInputsWindow(QMainWindow):
             subprocess.Popen(
                 [
                     str(launcher_path),
-                    str(installer_path),
-                    "--apply-update",
+                    str(updater_path),
                     "--parent-pid",
                     str(os.getpid()),
                     "--relaunch",
                 ],
-                cwd=str(installer_path.parent),
+                cwd=str(updater_path.parent),
             )
         except Exception as exc:
             _runtime_log_event(
                 "update.apply_launch_failed",
                 severity="error",
-                summary="Failed launching the standalone installer for an app update.",
+                summary="Failed launching the standalone updater for an app update.",
                 exc=exc,
-                context={"installer_path": str(installer_path), "launcher_path": str(launcher_path)},
+                context={"updater_path": str(updater_path), "launcher_path": str(launcher_path)},
             )
             self._show_shell_message(
                 QMessageBox.Icon.Warning,
@@ -5114,7 +5113,7 @@ class QuickInputsWindow(QMainWindow):
             severity="info",
             summary="Flowgrid update install was requested from Settings.",
             context={
-                "installer_path": str(installer_path),
+                "updater_path": str(updater_path),
                 "remote_commit_sha": str(pending.get("remote_commit_sha") or ""),
             },
         )

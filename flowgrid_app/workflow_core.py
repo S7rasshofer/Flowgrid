@@ -293,13 +293,29 @@ class DepotDB:
         except Exception:
             return f"file:{str(self.db_path).replace(os.sep, '/')}?mode=ro"
 
+    def _read_write_existing_connection_target(self) -> str:
+        raw_path = str(self.db_path)
+        if raw_path.startswith("\\\\"):
+            return f"file:{raw_path}?mode=rw"
+        try:
+            return f"{self.db_path.absolute().as_uri()}?mode=rw"
+        except Exception:
+            return f"file:{str(self.db_path).replace(os.sep, '/')}?mode=rw"
+
     def _open_connection(self) -> sqlite3.Connection:
-        connect_target = self._read_only_connection_target() if self.read_only else str(self.db_path)
+        use_uri = self.read_only
+        if self.read_only:
+            connect_target = self._read_only_connection_target()
+        elif self.ensure_schema_on_open:
+            connect_target = str(self.db_path)
+        else:
+            connect_target = self._read_write_existing_connection_target()
+            use_uri = True
         connection = sqlite3.connect(
             connect_target,
             timeout=30.0,
             isolation_level=None,
-            uri=self.read_only,
+            uri=use_uri,
         )
         connection.row_factory = sqlite3.Row
         self._apply_connection_pragmas(connection, read_only=self.read_only)

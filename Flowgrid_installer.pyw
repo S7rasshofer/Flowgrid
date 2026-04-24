@@ -22,12 +22,12 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
-import zipfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 APP_TITLE = "Flowgrid"
@@ -35,6 +35,7 @@ CONFIG_FILENAME = "Flowgrid_config.json"
 CHANNEL_CONFIG_FILENAME = "Flowgrid_channel.json"
 INSTALL_STATE_FILENAME = "Flowgrid_install_state.json"
 LOCAL_INSTALLER_FILENAME = "Flowgrid_installer.pyw"
+LOCAL_UPDATER_FILENAME = "Flowgrid_updater.pyw"
 LOCAL_APP_FOLDER_NAME = APP_TITLE
 LOGS_DIR_NAME = "Logs"
 DEPOT_DB_FILENAME = "Flowgrid_depot.db"
@@ -46,11 +47,13 @@ DEFAULT_REPO_URL = "https://github.com/S7rasshofer/Flowgrid.git"
 DEFAULT_REPO_BRANCH = "main"
 GITHUB_USER_AGENT = "Flowgrid-Installer/1.0"
 GITHUB_API_ACCEPT = "application/vnd.github+json"
-GITHUB_ARCHIVE_ACCEPT = "application/zip"
 GITHUB_TIMEOUT_SECONDS = 20.0
+GITHUB_RETRY_ATTEMPTS = 3
 DESKTOP_SHORTCUT_FILENAME = f"{APP_TITLE}.lnk"
 MANAGED_SHORTCUT_ICON_FILENAME = "Flowgrid_shortcut.ico"
 WINDOWS_SHORTCUT_DESCRIPTION = "Launch Flowgrid"
+REPO_MANAGED_ROOT_FILES = ("Flowgrid.pyw", LOCAL_UPDATER_FILENAME)
+REPO_MANAGED_DIRS = ("flowgrid_app", "Assets")
 REPO_MANAGED_HASHES_KEY = "repo_managed_files"
 SHARED_ASSET_HASHES_KEY = "shared_asset_files"
 DEFAULT_CHANNEL_ID = "main"
@@ -348,7 +351,7 @@ def get_installation_paths() -> Dict[str, Any]:
         "documents_folder": documents_folder,
         "local_app_folder": local_app_folder,
         "local_app": local_app_folder / "Flowgrid.pyw",
-        "local_installer": local_app_folder / LOCAL_INSTALLER_FILENAME,
+        "local_updater": local_app_folder / LOCAL_UPDATER_FILENAME,
         "local_package": local_app_folder / "flowgrid_app",
         "local_config_folder": local_config_folder,
         "local_config": local_config_folder / CONFIG_FILENAME,
@@ -361,13 +364,35 @@ def get_installation_paths() -> Dict[str, Any]:
 
 
 def get_installer_error_log_path() -> Path:
+    candidates: List[Path] = []
+    try:
+        paths = get_installation_paths()
+        candidates.append(paths["local_config_folder"] / LOGS_DIR_NAME / "Flowgrid_installer_errors.log")
+    except Exception:
+        pass
     try:
         shared_root = find_actual_shared_root()
-        log_path = shared_root / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
+        candidates.append(shared_root / LOGS_DIR_NAME / "Flowgrid_installer_errors.log")
     except Exception:
-        log_path = get_script_root() / LOGS_DIR_NAME / "Flowgrid_installer_errors.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    return log_path
+        pass
+    candidates.append(get_script_root() / LOGS_DIR_NAME / "Flowgrid_installer_errors.log")
+    candidates.append(Path(tempfile.gettempdir()) / "Flowgrid_installer_errors.log")
+
+    unique_candidates: List[Path] = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+
+    for log_path in unique_candidates:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            return log_path
+        except Exception:
+            continue
+
+    fallback = Path(tempfile.gettempdir()) / "Flowgrid_installer_errors.log"
+    fallback.parent.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def log_installer_error(error_code: str, summary: str, details: str = "") -> None:
@@ -437,39 +462,29 @@ def check_package_import(module_name: str) -> Tuple[bool, str]:
 
 
 def install_package(package_name: str) -> Tuple[bool, str]:
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "--disable-pip-version-check", "install", package_name],
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if result.returncode == 0:
-            return True, ""
-        detail = (str(result.stderr or "").strip() or str(result.stdout or "").strip() or "No pip output.")[-2000:]
-        return False, detail
-    except subprocess.TimeoutExpired:
-        return False, "pip install timed out after 300 seconds."
-    except Exception as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+    _ = package_name
+    return False, "Automatic package installation is disabled; only preinstalled standard-library/runtime dependencies are supported."
 
 
 def ensure_dependencies() -> Tuple[bool, str]:
-    failed_packages: List[str] = []
+    warnings: List[str] = []
     for package_name, module_name, required in DEPENDENCY_SPECS:
+        _ = required
         ok, reason = check_package_import(module_name)
         if ok:
             continue
-        installed, install_detail = install_package(package_name)
-        if installed:
-            ok, reason = check_package_import(module_name)
-            if ok:
-                continue
-            install_detail = reason
-        if required:
-            failed_packages.append(f"{package_name}: {install_detail}")
-    if failed_packages:
-        return False, "; ".join(failed_packages)
+        install_detail = (
+            f"{package_name} is not importable ({reason}). "
+            "The installer will continue, but launching Flowgrid on this machine will still require that runtime dependency."
+        )
+        log_installer_status(
+            "DEPENDENCY_WARNING",
+            "A runtime dependency is missing from the current Python environment.",
+            install_detail,
+        )
+        warnings.append(f"{package_name}: {install_detail}")
+    if warnings:
+        return True, "; ".join(warnings)
     return True, ""
 
 
@@ -500,6 +515,102 @@ def _preferred_gui_python_executable() -> Path:
         if candidate.exists() and candidate.is_file():
             return candidate
     return Path(sys.executable)
+
+
+def _preferred_cli_python_executable() -> Path:
+    candidates: List[Path] = []
+    for raw in (getattr(sys, "_base_executable", ""), sys.executable):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        candidates.append(path)
+        if path.name.lower() == "pythonw.exe":
+            candidates.append(path.with_name("python.exe"))
+    unique: List[Path] = []
+    for candidate in candidates:
+        if candidate in unique:
+            continue
+        unique.append(candidate)
+    for candidate in unique:
+        if candidate.name.lower() == "python.exe" and candidate.exists() and candidate.is_file():
+            return candidate
+    for candidate in unique:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return Path(getattr(sys, "_base_executable", "") or sys.executable)
+
+
+def _bootstrap_shared_runtime_storage(paths: Dict[str, Any]) -> Tuple[bool, str]:
+    if not _ensure_shared_storage_contract(paths):
+        return False, "Failed preparing the shared workflow location."
+
+    if bool(paths.get("read_only_db", False)):
+        if not _refresh_read_only_snapshot(paths):
+            return False, "Failed refreshing the read-only shared snapshot."
+        if not _verify_read_only_snapshot(paths):
+            return False, "Failed verifying the read-only shared snapshot."
+        snapshot_state = paths.get("_snapshot_sync_state")
+        if isinstance(snapshot_state, dict):
+            return True, str(snapshot_state.get(LAST_SNAPSHOT_SYNC_SUMMARY_KEY) or "").strip() or "Read-only shared snapshot refreshed."
+        return True, "Read-only shared snapshot refreshed."
+
+    launcher_path = _preferred_cli_python_executable()
+    local_root = Path(paths["local_app_folder"])
+    shared_db = Path(paths["shared_db"])
+    shared_db_existed = shared_db.exists() and shared_db.is_file()
+    if not launcher_path.exists() or not launcher_path.is_file():
+        detail = f"Python launcher not found: {launcher_path}"
+        log_installer_error("SHARED_DB_BOOTSTRAP_LAUNCHER_MISSING", "Failed locating the Python launcher for shared DB bootstrap.", detail)
+        return False, detail
+    if not local_root.exists() or not local_root.is_dir():
+        detail = f"Local runtime root is missing: {local_root}"
+        log_installer_error("SHARED_DB_BOOTSTRAP_RUNTIME_MISSING", "Failed locating the local runtime for shared DB bootstrap.", detail)
+        return False, detail
+
+    script = "\n".join(
+        [
+            "import sys",
+            "from pathlib import Path",
+            "from flowgrid_app.workflow_core import DepotDB",
+            "db_path = Path(sys.argv[1])",
+            "db = DepotDB(db_path, read_only=False, ensure_schema=True)",
+            "try:",
+            "    db.fetchone('SELECT 1')",
+            "finally:",
+            "    db.close('installer.shared_db_bootstrap')",
+        ]
+    )
+    env = os.environ.copy()
+    existing_pythonpath = str(env.get("PYTHONPATH", "") or "").strip()
+    env["PYTHONPATH"] = str(local_root) if not existing_pythonpath else str(local_root) + os.pathsep + existing_pythonpath
+
+    try:
+        result = subprocess.run(
+            [str(launcher_path), "-c", script, str(shared_db)],
+            cwd=str(local_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        log_installer_error("SHARED_DB_BOOTSTRAP_RUN_FAILED", "Failed running shared DB bootstrap from the local runtime.", detail)
+        return False, detail
+
+    if result.returncode != 0:
+        detail = (str(result.stderr or "").strip() or str(result.stdout or "").strip() or "Unknown shared DB bootstrap failure.")[-2000:]
+        log_installer_error(
+            "SHARED_DB_BOOTSTRAP_FAILED",
+            "Failed creating or migrating the shared workflow DB from the local runtime.",
+            f"DB path: {shared_db}\nRuntime root: {local_root}\nDetail: {detail}",
+        )
+        return False, detail
+
+    if shared_db_existed:
+        return True, f"Shared workflow DB already existed and was verified at {shared_db}."
+    return True, f"Shared workflow DB created at {shared_db}."
 
 
 def _create_or_update_windows_shortcut(
@@ -601,7 +712,39 @@ def _create_shortcut_icon(source_icon: Path, target_ico: Path) -> Path:
 
 
 def _managed_shortcut_icon_path(paths: Dict[str, Path]) -> Path:
-    return paths["shared_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME
+    return paths["local_config_folder"] / MANAGED_SHORTCUT_ICON_FILENAME
+
+
+def _find_default_shortcut_ico(paths: Dict[str, Path]) -> Path | None:
+    candidates = [
+        paths["local_assets"] / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME,
+        paths["shared_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME,
+        paths["source_root"] / "Assets" / "Flowgrid Icons" / MANAGED_SHORTCUT_ICON_FILENAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def _prepare_shortcut_icon(paths: Dict[str, Path], launcher_path: Path) -> Path:
+    ico_source = _find_default_shortcut_ico(paths)
+    if ico_source is not None:
+        return ico_source
+
+    icon_source = _find_default_wrench_icon(paths)
+    if icon_source is None:
+        return launcher_path
+
+    try:
+        return _create_shortcut_icon(icon_source, _managed_shortcut_icon_path(paths))
+    except Exception as exc:
+        log_installer_status(
+            "SHORTCUT_ICON_FALLBACK",
+            "Falling back to the Python launcher icon for the desktop shortcut.",
+            f"Source icon: {icon_source}\nReason: {type(exc).__name__}: {exc}",
+        )
+        return launcher_path
 
 
 def _find_default_wrench_icon(paths: Dict[str, Path]) -> Path | None:
@@ -622,19 +765,13 @@ def create_desktop_shortcut(paths: Dict[str, Path]) -> bool:
         if desktop_path is None:
             raise RuntimeError("Unable to resolve desktop folder.")
 
-        icon_source = _find_default_wrench_icon(paths)
-        if icon_source is None:
-            raise RuntimeError("Unable to locate the default wrench icon for desktop shortcut creation.")
-
-        managed_icon_path = _managed_shortcut_icon_path(paths)
-        _create_shortcut_icon(icon_source, managed_icon_path)
-
         launcher_path = _preferred_gui_python_executable()
         script_path = paths["local_app"]
         if not launcher_path.exists() or not launcher_path.is_file():
             raise RuntimeError(f"Python launcher not found: {launcher_path}")
         if not script_path.exists() or not script_path.is_file():
             raise RuntimeError(f"Installed Flowgrid.pyw not found: {script_path}")
+        managed_icon_path = _prepare_shortcut_icon(paths, launcher_path)
 
         shortcut_path = desktop_path / str(paths.get("shortcut_filename") or DESKTOP_SHORTCUT_FILENAME)
         ok, detail = _create_or_update_windows_shortcut(
@@ -819,16 +956,13 @@ def _channel_remote_label(paths: Dict[str, Any]) -> str:
 def _ensure_shared_storage_contract(paths: Dict[str, Any]) -> bool:
     try:
         paths["shared_root"].mkdir(parents=True, exist_ok=True)
-        paths["shared_logs"].mkdir(parents=True, exist_ok=True)
-        paths["shared_assets"].mkdir(parents=True, exist_ok=True)
-        for folder_name in MANAGED_SHARED_ASSET_DIRS:
-            (paths["shared_assets"] / folder_name).mkdir(parents=True, exist_ok=True)
+        Path(paths["shared_db"]).parent.mkdir(parents=True, exist_ok=True)
         return True
     except Exception as exc:
         log_installer_error(
             "SHARED_STORAGE_CONTRACT_FAILED",
-            "Failed preparing the shared Flowgrid storage contract.",
-            f"Shared root: {paths['shared_root']}\nReason: {type(exc).__name__}: {exc}",
+            "Failed preparing the shared workflow location.",
+            f"Shared root: {paths['shared_root']}\nShared DB: {paths['shared_db']}\nReason: {type(exc).__name__}: {exc}",
         )
         return False
 
@@ -1053,89 +1187,33 @@ def _verify_read_only_snapshot(paths: Dict[str, Any]) -> bool:
 
 
 def initialize_database(paths: Dict[str, Any]) -> bool:
+    return initialize_local_install_metadata(paths)
+
+
+def initialize_local_install_metadata(paths: Dict[str, Any]) -> bool:
     if not write_local_paths_config(paths):
         return False
     if not verify_local_paths_config(paths):
         return False
     if not initialize_local_user_config(paths):
         return False
-    if not _ensure_shared_storage_contract(paths):
-        return False
 
     if bool(paths.get("read_only_db", False)):
-        if not _refresh_read_only_snapshot(paths):
-            return False
-        return _verify_read_only_snapshot(paths)
-
-    current_user = _detect_installer_user()
-    shared_db = paths["shared_db"]
-    try:
-        shared_db.parent.mkdir(parents=True, exist_ok=True)
-        shared_assets_root = paths["shared_assets"]
-        for folder in MANAGED_SHARED_ASSET_DIRS:
-            (shared_assets_root / folder).mkdir(parents=True, exist_ok=True)
-
-        with sqlite3.connect(str(shared_db), timeout=30.0) as conn:
-            conn.execute("PRAGMA foreign_keys = ON")
-            conn.execute("PRAGMA busy_timeout = 20000")
-            conn.execute("PRAGMA journal_mode = DELETE")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS admin_users (
-                    id INTEGER PRIMARY KEY,
-                    user_id TEXT NOT NULL UNIQUE,
-                    admin_name TEXT NOT NULL DEFAULT '',
-                    position TEXT NOT NULL DEFAULT '',
-                    location TEXT NOT NULL DEFAULT '',
-                    icon_path TEXT NOT NULL DEFAULT '',
-                    access_level TEXT NOT NULL DEFAULT 'admin'
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS role_definitions (
-                    id INTEGER PRIMARY KEY,
-                    role_name TEXT NOT NULL UNIQUE,
-                    role_slot TEXT NOT NULL,
-                    sort_order INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            default_roles = (
-                ("Tech 1", "tech1", 1),
-                ("Tech 2", "tech2", 2),
-                ("Tech 3", "tech3", 3),
-                ("MP", "mp", 4),
-                ("QA", "qa", 5),
-                ("Other", "none", 6),
-            )
-            for role_name, role_slot, sort_order in default_roles:
-                conn.execute(
-                    "INSERT OR IGNORE INTO role_definitions (role_name, role_slot, sort_order) VALUES (?, ?, ?)",
-                    (role_name, role_slot, int(sort_order)),
-                )
-            row = conn.execute("SELECT COUNT(*) FROM admin_users").fetchone()
-            admin_count = int(row[0] if row is not None else 0)
-            if admin_count == 0:
-                conn.execute(
-                    "INSERT INTO admin_users (user_id, admin_name, position, location, icon_path, access_level) VALUES (?, ?, 'Other', '', '', 'admin')",
-                    (current_user, current_user),
-                )
-            conn.commit()
+        paths["_snapshot_sync_state"] = {
+            LAST_SNAPSHOT_SYNC_AT_KEY: "",
+            LAST_SNAPSHOT_SYNC_STATUS_KEY: "skipped",
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: (
+                "Installer skipped shared snapshot refresh by design; "
+                "runtime will use the configured shared DB path directly."
+            ),
+        }
+    else:
         paths["_snapshot_sync_state"] = {
             LAST_SNAPSHOT_SYNC_AT_KEY: "",
             LAST_SNAPSHOT_SYNC_STATUS_KEY: "not_applicable",
-            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: "Main channel uses the production shared root directly.",
+            LAST_SNAPSHOT_SYNC_SUMMARY_KEY: "Installer wrote only local bootstrap metadata; runtime will use the production shared root directly.",
         }
-        return True
-    except Exception as exc:
-        log_installer_error(
-            "VERIFY_SHARED_DB_FAILED",
-            "Failed verifying shared database access.",
-            f"Shared DB path: {shared_db}\nReason: {type(exc).__name__}: {exc}",
-        )
-        return False
+    return True
 
 
 def _default_install_state(paths: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -1261,59 +1339,158 @@ def _split_github_repo_parts(repo_url: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 
+def safe_request(
+    url: str,
+    *,
+    timeout_seconds: float = GITHUB_TIMEOUT_SECONDS,
+    accept: str = GITHUB_API_ACCEPT,
+) -> bytes:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": GITHUB_USER_AGENT,
+            "Accept": str(accept or "*/*"),
+        },
+    )
+    last_error: Exception | None = None
+    for attempt in range(1, GITHUB_RETRY_ATTEMPTS + 1):
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                return response.read()
+        except HTTPError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if attempt >= GITHUB_RETRY_ATTEMPTS:
+                break
+            time.sleep(min(1.0, 0.25 * attempt))
+    if last_error is None:
+        raise RuntimeError(f"Request to {url} failed without an exception payload.")
+    raise last_error
+
+
 def _json_request(url: str, *, timeout_seconds: float = GITHUB_TIMEOUT_SECONDS) -> Any:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": GITHUB_USER_AGENT,
-            "Accept": GITHUB_API_ACCEPT,
-        },
-    )
-    with urlopen(request, timeout=timeout_seconds) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def _download_file(url: str, target_path: Path, *, timeout_seconds: float = GITHUB_TIMEOUT_SECONDS) -> Path:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": GITHUB_USER_AGENT,
-            "Accept": GITHUB_ARCHIVE_ACCEPT,
-        },
-    )
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target_path.with_name(f"{target_path.name}.tmp")
-    with urlopen(request, timeout=timeout_seconds) as response, temp_path.open("wb") as handle:
-        shutil.copyfileobj(response, handle)
-    os.replace(temp_path, target_path)
-    return target_path
-
-
-def fetch_remote_commit_info(repo_url: str, branch: str) -> Dict[str, str]:
-    owner, repo_name = _split_github_repo_parts(repo_url)
-    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/commits/{branch}"
+    payload = safe_request(url, timeout_seconds=timeout_seconds, accept=GITHUB_API_ACCEPT)
     try:
-        payload = _json_request(api_url)
-    except HTTPError as exc:
-        raise RuntimeError(f"GitHub update check failed: HTTP {exc.code}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"GitHub update check failed: {exc.reason}") from exc
+        return json.loads(payload.decode("utf-8"))
     except Exception as exc:
-        raise RuntimeError(f"GitHub update check failed: {type(exc).__name__}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("GitHub update check returned an unexpected payload.")
-    sha = str(payload.get("sha") or "").strip()
-    if not sha:
-        raise RuntimeError("GitHub update check returned no commit SHA.")
-    zipball_url = str(payload.get("zipball_url") or "").strip()
-    if not zipball_url:
-        zipball_url = f"https://api.github.com/repos/{owner}/{repo_name}/zipball/{sha}"
+        raise RuntimeError(f"Invalid JSON payload from {url}: {type(exc).__name__}: {exc}") from exc
+
+
+def _normalize_repo_relative_path(raw_path: Any) -> str:
+    return str(raw_path or "").replace("\\", "/").strip().strip("/")
+
+
+def _is_repo_managed_path(relative_path: str) -> bool:
+    normalized = _normalize_repo_relative_path(relative_path)
+    if not normalized:
+        return False
+    if normalized in REPO_MANAGED_ROOT_FILES:
+        return True
+    return any(normalized.startswith(f"{dirname}/") for dirname in REPO_MANAGED_DIRS)
+
+
+def _build_github_contents_url(owner: str, repo_name: str, relative_path: str, branch: str) -> str:
+    normalized_path = _normalize_repo_relative_path(relative_path)
+    encoded_branch = quote(str(branch or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH, safe="")
+    if normalized_path:
+        encoded_path = quote(normalized_path, safe="/")
+        return f"https://api.github.com/repos/{owner}/{repo_name}/contents/{encoded_path}?ref={encoded_branch}"
+    return f"https://api.github.com/repos/{owner}/{repo_name}/contents?ref={encoded_branch}"
+
+
+def fetch_repo_tree(repo_url: str, branch: str) -> List[Dict[str, Any]]:
+    owner, repo_name = _split_github_repo_parts(repo_url)
+    pending_dirs: List[str] = [""]
+    visited_dirs: set[str] = set()
+    files: List[Dict[str, Any]] = []
+
+    while pending_dirs:
+        current_dir = pending_dirs.pop()
+        api_url = _build_github_contents_url(owner, repo_name, current_dir, branch)
+        try:
+            payload = _json_request(api_url)
+        except HTTPError as exc:
+            raise RuntimeError(
+                f"Repository listing failed for {current_dir or '/'}: HTTP {exc.code}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(
+                f"Repository listing failed for {current_dir or '/'}: {exc.reason}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Repository listing failed for {current_dir or '/'}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+        entries = payload if isinstance(payload, list) else [payload]
+        if not isinstance(entries, list):
+            raise RuntimeError(f"Repository listing returned an unexpected payload for {current_dir or '/'}")
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            entry_type = str(entry.get("type") or "").strip().lower()
+            relative_path = _normalize_repo_relative_path(entry.get("path") or current_dir)
+            if entry_type == "dir":
+                if relative_path and relative_path not in visited_dirs:
+                    visited_dirs.add(relative_path)
+                    pending_dirs.append(relative_path)
+                continue
+            if entry_type != "file":
+                log_installer_status(
+                    "REPO_ENTRY_SKIPPED",
+                    "Skipped a non-file repository entry during sync discovery.",
+                    f"Type: {entry_type or 'unknown'}\nPath: {relative_path or '/'}",
+                )
+                continue
+            download_url = str(entry.get("download_url") or "").strip()
+            if not relative_path or not download_url:
+                log_installer_error(
+                    "REPO_ENTRY_INVALID",
+                    "Repository listing returned an invalid file entry.",
+                    f"Path: {relative_path or '/'}\nDownload URL: {download_url or '<missing>'}",
+                )
+                continue
+            files.append(
+                {
+                    "path": relative_path,
+                    "download_url": download_url,
+                    "sha": str(entry.get("sha") or "").strip().lower(),
+                    "size": int(entry.get("size") or 0),
+                }
+            )
+
+    return sorted(files, key=lambda item: str(item.get("path") or ""))
+
+
+def _calculate_repo_revision(files: List[Dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for entry in sorted(files, key=lambda item: str(item.get("path") or "")):
+        digest.update(str(entry.get("path") or "").encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry.get("sha") or "").encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(entry.get("size") or 0).encode("ascii", "ignore"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def fetch_remote_commit_info(repo_url: str, branch: str) -> Dict[str, Any]:
+    resolved_repo_url = str(repo_url or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL
+    resolved_branch = str(branch or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH
+    repo_files = fetch_repo_tree(resolved_repo_url, resolved_branch)
+    managed_files = [entry for entry in repo_files if _is_repo_managed_path(str(entry.get("path") or ""))]
+    if not managed_files:
+        raise RuntimeError("Repository listing returned no managed runtime files.")
+    sha = _calculate_repo_revision(managed_files)
     return {
-        "repo_url": repo_url,
-        "branch": branch,
+        "repo_url": resolved_repo_url,
+        "branch": resolved_branch,
         "sha": sha,
         "short_sha": _short_sha(sha),
-        "zipball_url": zipball_url,
+        "files": managed_files,
+        "file_count": len(managed_files),
     }
 
 
@@ -1332,19 +1509,60 @@ def _copy_file_atomic(source_path: Path, target_path: Path) -> None:
     os.replace(temp_path, target_path)
 
 
-def _locate_snapshot_project_root(extracted_root: Path) -> Path:
-    for child in extracted_root.iterdir():
-        if child.is_dir() and (child / "Flowgrid.pyw").exists() and (child / "flowgrid_app").is_dir():
-            return child
-    raise RuntimeError("GitHub snapshot did not contain Flowgrid.pyw and flowgrid_app at the expected root.")
+def _write_bytes_atomic(target_path: Path, payload: bytes) -> Path:
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f"{target_path.name}.tmp")
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(payload)
+        os.replace(temp_path, target_path)
+        return target_path
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception:
+            pass
+        raise
+
+
+def download_file(
+    remote_url: str,
+    local_path: Path,
+    *,
+    timeout_seconds: float = GITHUB_TIMEOUT_SECONDS,
+    payload: bytes | None = None,
+) -> Path:
+    try:
+        resolved_payload = payload
+        if resolved_payload is None:
+            resolved_payload = safe_request(
+                remote_url,
+                timeout_seconds=timeout_seconds,
+                accept="application/octet-stream",
+            )
+        written_path = _write_bytes_atomic(local_path, resolved_payload)
+        log_installer_status(
+            "DOWNLOAD_OK",
+            "Downloaded a repository file successfully.",
+            f"URL: {remote_url}\nPath: {written_path}\nBytes: {len(resolved_payload)}",
+        )
+        return written_path
+    except Exception as exc:
+        log_installer_error(
+            "DOWNLOAD_FAILED",
+            "Failed downloading a repository file.",
+            f"URL: {remote_url}\nPath: {local_path}\nReason: {type(exc).__name__}: {exc}",
+        )
+        raise
 
 
 def _iter_repo_source_files(snapshot_root: Path) -> Iterator[Tuple[str, Path]]:
-    for filename in ("Flowgrid.pyw", LOCAL_INSTALLER_FILENAME):
+    for filename in REPO_MANAGED_ROOT_FILES:
         source_path = snapshot_root / filename
         if source_path.exists() and source_path.is_file():
             yield filename, source_path
-    for dirname in ("flowgrid_app", "Assets"):
+    for dirname in REPO_MANAGED_DIRS:
         root = snapshot_root / dirname
         if not root.exists() or not root.is_dir():
             continue
@@ -1356,16 +1574,31 @@ def _iter_repo_source_files(snapshot_root: Path) -> Iterator[Tuple[str, Path]]:
             yield source_path.relative_to(snapshot_root).as_posix(), source_path
 
 
-def _download_and_extract_snapshot(remote_info: Dict[str, str]) -> Tuple[Any, Path]:
-    temp_dir = tempfile.TemporaryDirectory(prefix="flowgrid_snapshot_")
-    temp_root = Path(temp_dir.name)
-    archive_path = temp_root / "flowgrid_snapshot.zip"
-    extract_root = temp_root / "extracted"
-    extract_root.mkdir(parents=True, exist_ok=True)
-    _download_file(str(remote_info.get("zipball_url") or "").strip(), archive_path)
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        archive.extractall(extract_root)
-    return temp_dir, _locate_snapshot_project_root(extract_root)
+def _stage_repo_snapshot(remote_info: Dict[str, Any]) -> Tuple[Any, Path]:
+    temp_dir = tempfile.TemporaryDirectory(prefix="flowgrid_repo_sync_")
+    staging_root = Path(temp_dir.name) / "snapshot"
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    files = remote_info.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Remote repository metadata did not include any files to stage.")
+
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        relative_path = _normalize_repo_relative_path(entry.get("path"))
+        download_url = str(entry.get("download_url") or "").strip()
+        if not relative_path or not download_url:
+            raise RuntimeError(f"Remote repository entry is missing path or download URL: {entry!r}")
+        target_path = staging_root / Path(relative_path.replace("/", os.sep))
+        payload = safe_request(
+            download_url,
+            timeout_seconds=GITHUB_TIMEOUT_SECONDS,
+            accept="application/octet-stream",
+        )
+        download_file(download_url, target_path, timeout_seconds=GITHUB_TIMEOUT_SECONDS, payload=payload)
+
+    return temp_dir, staging_root
 
 
 def _apply_repo_manifest(
@@ -1405,7 +1638,7 @@ def _apply_repo_manifest(
         relative_obj = Path(relative_path)
         if relative_obj.is_absolute() or ".." in relative_obj.parts:
             continue
-        if relative_path not in {"Flowgrid.pyw", LOCAL_INSTALLER_FILENAME} and not (
+        if relative_path not in {"Flowgrid.pyw", LOCAL_INSTALLER_FILENAME, LOCAL_UPDATER_FILENAME} and not (
             relative_path.startswith("flowgrid_app/") or relative_path.startswith("Assets/")
         ):
             continue
@@ -1472,6 +1705,39 @@ def _apply_repo_manifest(
         "removed": removed,
         "state": updated_state,
     }
+
+
+def sync_repo_to_local(
+    paths: Dict[str, Path],
+    state: Dict[str, Any],
+    repo_url: str,
+    branch: str,
+    *,
+    remote_info: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    resolved_remote = remote_info if isinstance(remote_info, dict) else fetch_remote_commit_info(repo_url, branch)
+    temp_dir = None
+    try:
+        temp_dir, snapshot_root = _stage_repo_snapshot(resolved_remote)
+        result = _apply_repo_manifest(paths, snapshot_root, state, resolved_remote)
+    finally:
+        if temp_dir is not None:
+            temp_dir.cleanup()
+
+    log_installer_status(
+        "REPO_SYNC_OK",
+        "Repository runtime sync completed.",
+        (
+            f"Source: {resolved_remote.get('repo_url', repo_url)}\n"
+            f"Branch: {resolved_remote.get('branch', branch)}\n"
+            f"Revision: {resolved_remote.get('short_sha', '')}\n"
+            f"Files staged: {resolved_remote.get('file_count', 0)}\n"
+            f"Copied: {result.get('copied', 0)}\n"
+            f"Unchanged: {result.get('unchanged', 0)}\n"
+            f"Removed: {result.get('removed', 0)}"
+        ),
+    )
+    return result
 
 
 def sync_shared_assets(paths: Dict[str, Path], state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1569,32 +1835,25 @@ def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str
     elif not shared_root.is_dir():
         errors.append(f"Expected shared drive root is not a directory: {shared_root}")
 
+    shared_db = paths["shared_db"]
     if bool(paths.get("read_only_db", False)):
-        snapshot_source_root = paths.get("snapshot_source_root_path")
-        if snapshot_source_root is None:
-            errors.append(
-                f"Read-only channel requires snapshot_source_root in {paths['shared_channel_config']}."
-            )
-        else:
-            source_root = Path(snapshot_source_root)
-            if not source_root.exists() or not source_root.is_dir():
-                errors.append(f"Snapshot source root is unavailable: {source_root}")
-            elif source_root.resolve() == Path(paths["shared_root"]).resolve():
-                errors.append(f"Snapshot source root cannot match the target shared root: {source_root}")
-            source_db = source_root / DEPOT_DB_FILENAME
-            if not source_db.exists() or not source_db.is_file():
-                errors.append(f"Snapshot source workflow DB missing: {source_db}")
-            source_assets = source_root / "Assets"
-            if not source_assets.exists() or not source_assets.is_dir():
-                errors.append(f"Snapshot source Assets folder missing: {source_assets}")
-    else:
-        shared_db = paths["shared_db"]
         if not shared_db.exists() or not shared_db.is_file():
-            warnings.append(f"Shared workflow DB will be created at first run: {shared_db}")
+            warnings.append(
+                "Read-only channel expects an existing readable shared DB snapshot at "
+                f"{shared_db}; installer will attempt to prepare it during install."
+            )
+    elif not shared_db.exists() or not shared_db.is_file():
+        warnings.append(
+            "Shared workflow DB is not present yet; the installer will create or connect to "
+            f"{shared_db} before launch if the user has shared write access."
+        )
 
     shared_assets = paths["shared_assets"]
     if not shared_assets.exists() or not shared_assets.is_dir():
-        warnings.append(f"Shared Assets folder will be created at first run: {shared_assets}")
+        warnings.append(
+            "Shared Assets folder is not present at "
+            f"{shared_assets}; local packaged assets will remain in use until the launch updater can sync them."
+        )
 
     return warnings, errors
 
@@ -1602,7 +1861,7 @@ def assess_source_materials(paths: Dict[str, Path]) -> Tuple[List[str], List[str
 def detect_existing_local_install(paths: Dict[str, Path]) -> bool:
     targets = (
         paths["local_app"],
-        paths["local_installer"],
+        paths["local_updater"],
         paths["local_package"],
         paths["local_paths_config"],
         paths["install_state"],
@@ -1621,7 +1880,7 @@ def build_installation_report(paths: Dict[str, Path], steps: List[Dict[str, str]
         f"Channel: {channel_display_name}",
         f"Local install: {paths['local_app_folder']}",
         f"Local package: {paths['local_package']}",
-        f"Local installer: {paths['local_installer']}",
+        f"Local updater: {paths['local_updater']}",
         f"Shared root: {paths['shared_root']}",
         f"Shared DB: {paths['shared_db']}",
         f"Installed commit: {_short_sha(state.get('installed_commit_sha', '')) or '-'}",
@@ -1676,10 +1935,10 @@ def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
     )
     _record_step(
         results,
-        "Local standalone installer installed",
-        "ok" if paths["local_installer"].exists() and paths["local_installer"].is_file() else "failed",
-        "Local Flowgrid installer copy present." if paths["local_installer"].exists() and paths["local_installer"].is_file() else "Local Flowgrid installer copy missing.",
-        str(paths["local_installer"]),
+        "Local standalone updater installed",
+        "ok" if paths["local_updater"].exists() and paths["local_updater"].is_file() else "failed",
+        "Local Flowgrid updater copy present." if paths["local_updater"].exists() and paths["local_updater"].is_file() else "Local Flowgrid updater copy missing.",
+        str(paths["local_updater"]),
     )
     _record_step(
         results,
@@ -1711,13 +1970,23 @@ def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
         str(paths["install_state"]),
     )
 
-    shared_db_ok = False
+    shared_db_status = "failed"
+    shared_db_detail = (
+        "Shared workflow DB missing or not reachable."
+        if not bool(paths.get("read_only_db", False))
+        else "Shared read-only workflow DB snapshot missing or not reachable."
+    )
     if paths["shared_db"].exists() and paths["shared_db"].is_file():
         try:
             connect_target = _read_only_sqlite_uri(paths["shared_db"]) if bool(paths.get("read_only_db", False)) else str(paths["shared_db"])
             with sqlite3.connect(connect_target, uri=bool(paths.get("read_only_db", False)), timeout=10.0) as conn:
-                conn.execute("SELECT 1")
-            shared_db_ok = True
+                conn.execute("SELECT 1").fetchone()
+            shared_db_status = "ok"
+            shared_db_detail = (
+                "Shared workflow DB exists and opened successfully."
+                if not bool(paths.get("read_only_db", False))
+                else "Shared read-only workflow DB snapshot exists and opened successfully."
+            )
         except Exception as exc:
             log_installer_error(
                 "VERIFY_SHARED_DB_POST_INSTALL_FAILED",
@@ -1727,8 +1996,8 @@ def verify_installed_state(paths: Dict[str, Path]) -> List[Dict[str, str]]:
     _record_step(
         results,
         "Shared DB reachable",
-        "ok" if shared_db_ok else "failed",
-        "Shared workflow DB exists and opened successfully." if shared_db_ok else "Shared workflow DB missing or not reachable.",
+        shared_db_status,
+        shared_db_detail,
         str(paths["shared_db"]),
     )
     return results
@@ -1907,8 +2176,14 @@ def run_installer(
             log_installer_error("DEPENDENCIES", error_msg)
             show_installation_dialog("Installation Failed", error_msg, is_error=True)
             return 1
-        _record_step(install_steps, "Dependencies", "ok", "Required dependencies are installed and importable.")
-        _safe_print("[OK] All dependencies installed")
+        deps_status = "warning" if deps_error else "ok"
+        deps_detail = (
+            deps_error
+            if deps_error
+            else "Installer prerequisites are satisfied with standard-library networking and local file writes."
+        )
+        _record_step(install_steps, "Dependencies", deps_status, deps_detail)
+        _safe_print(f"{_step_marker(deps_status)} {deps_detail}")
         _safe_print()
 
     _safe_print("Step 3: Preparing installation paths...")
@@ -1943,7 +2218,7 @@ def run_installer(
                 f"snapshot_source_root={paths.get('snapshot_source_root') or ''}",
                 f"shared_db={paths['shared_db']}",
                 f"local_app={paths['local_app']}",
-                f"local_installer={paths['local_installer']}",
+                f"local_updater={paths['local_updater']}",
                 f"local_package={paths['local_package']}",
                 f"local_manifest={paths['local_paths_config']}",
                 f"install_state={paths['install_state']}",
@@ -1988,31 +2263,24 @@ def run_installer(
     _safe_print("[OK] Local folders created")
     _safe_print()
 
-    _safe_print("Step 6: Initializing shared/local metadata...")
-    if not initialize_database(paths):
-        error_msg = "Failed to initialize shared/local install metadata."
-        _record_step(install_steps, "Shared DB initialization", "failed", error_msg, str(paths["shared_db"]))
+    _safe_print("Step 6: Writing local install metadata...")
+    if not initialize_local_install_metadata(paths):
+        error_msg = "Failed to initialize local install metadata."
+        _record_step(install_steps, "Local install metadata", "failed", error_msg, str(paths["local_paths_config"]))
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
     _record_step(install_steps, "Local Flowgrid_paths.json", "ok", "Local shared-root manifest written and verified.", str(paths["local_paths_config"]))
     _record_step(install_steps, "Local user config", "ok", "Per-user local config file is ready.", str(paths["local_config"]))
     _record_step(
         install_steps,
-        "Shared DB initialization",
+        "Shared DB reference",
         "ok",
-        "Shared DB validated and bootstrap completed."
+        "Installer wrote only the local shared-root reference."
         if not bool(paths.get("read_only_db", False))
-        else "Read-only shared snapshot validated and local bootstrap completed.",
+        else "Installer wrote only the local shared DB reference for the read-only channel.",
         str(paths["shared_db"]),
     )
-    _record_step(
-        install_steps,
-        "Shared editable icon folders",
-        "ok",
-        "Shared editable icon folders were prepared.",
-        str(paths["shared_assets"]),
-    )
-    _safe_print("[OK] Shared/local metadata initialized")
+    _safe_print("[OK] Local install metadata written")
     _safe_print()
 
     state = load_install_state(paths)
@@ -2041,32 +2309,32 @@ def run_installer(
         _record_step(install_steps, f"{remote_label} check", "failed", error_msg, repo_url)
         show_installation_dialog("Installation Failed", error_msg, is_error=True)
         return 1
-    _record_step(install_steps, f"{remote_label} check", "ok", f"Remote commit {_short_sha(remote_info['sha'])} resolved successfully.", remote_info["repo_url"])
+    _record_step(
+        install_steps,
+        f"{remote_label} check",
+        "ok",
+        f"Remote revision {_short_sha(remote_info['sha'])} resolved successfully across {remote_info.get('file_count', 0)} files.",
+        remote_info["repo_url"],
+    )
     _safe_print(f"[OK] {remote_label} resolved to {remote_info['short_sha']}")
     _safe_print()
 
     installed_sha = str(state.get("installed_commit_sha") or "").strip()
     runtime_bootstrap_needed = (
         not paths["local_app"].exists()
-        or not paths["local_installer"].exists()
+        or not paths["local_updater"].exists()
         or not paths["local_package"].exists()
         or not paths["install_state"].exists()
         or not _normalize_hash_mapping(state.get(REPO_MANAGED_HASHES_KEY))
     )
     needs_code_refresh = runtime_bootstrap_needed or installed_sha != remote_info["sha"]
-    shared_asset_seed_source: Path | None = paths["local_assets"] if paths["local_assets"].exists() else None
 
     if needs_code_refresh:
-        _safe_print(f"Step 8: Downloading and applying the {remote_label} runtime snapshot...")
+        _safe_print(f"Step 8: Syncing the {remote_label} runtime into the local user-space install...")
         try:
-            temp_dir, snapshot_root = _download_and_extract_snapshot(remote_info)
-            try:
-                apply_result = _apply_repo_manifest(paths, snapshot_root, state, remote_info)
-                shared_asset_seed_source = paths["local_assets"]
-            finally:
-                temp_dir.cleanup()
+            apply_result = sync_repo_to_local(paths, state, repo_url, branch, remote_info=remote_info)
         except Exception as exc:
-            error_msg = f"Failed applying GitHub snapshot: {type(exc).__name__}: {exc}"
+            error_msg = f"Failed syncing repository files: {type(exc).__name__}: {exc}"
             log_installer_error("GITHUB_SNAPSHOT_APPLY_FAILED", f"Failed installing Flowgrid from {remote_label}.", error_msg)
             _record_step(install_steps, f"{remote_label} runtime install", "failed", error_msg, remote_info["repo_url"])
             show_installation_dialog("Installation Failed", error_msg, is_error=True)
@@ -2080,7 +2348,7 @@ def run_installer(
             str(paths["local_app_folder"]),
         )
         _safe_print(
-            f"[OK] Runtime applied from GitHub: copied {apply_result['copied']}, "
+            f"[OK] Runtime synced from GitHub: copied {apply_result['copied']}, "
             f"unchanged {apply_result['unchanged']}, removed {apply_result['removed']}"
         )
         _safe_print()
@@ -2106,23 +2374,34 @@ def run_installer(
         _safe_print(f"[OK] Local runtime already matched {remote_label} at {remote_info['short_sha']}")
         _safe_print()
 
-    _safe_print("Step 9: Seeding missing packaged assets into the shared Assets tree...")
-    shared_seed_result = _seed_missing_shared_assets_from_source(paths, shared_asset_seed_source)
-    _record_step(
-        install_steps,
-        "Shared Assets seed",
-        shared_seed_result["status"],
-        shared_seed_result["summary"],
-        str(paths["shared_assets"]),
-    )
-    _safe_print(f"{_step_marker(shared_seed_result['status'])} {shared_seed_result['summary']}")
+    _safe_print("Step 9: Preparing shared workflow storage...")
+    shared_bootstrap_ok, shared_bootstrap_summary = _bootstrap_shared_runtime_storage(paths)
+    if not shared_bootstrap_ok:
+        error_msg = f"Failed preparing shared workflow storage: {shared_bootstrap_summary}"
+        _record_step(install_steps, "Shared workflow storage", "failed", shared_bootstrap_summary, str(paths["shared_db"]))
+        show_installation_dialog("Installation Failed", error_msg, is_error=True)
+        return 1
+    _record_step(install_steps, "Shared workflow storage", "ok", shared_bootstrap_summary, str(paths["shared_db"]))
+    _safe_print(f"[OK] {shared_bootstrap_summary}")
     _safe_print()
 
-    _safe_print("Step 10: Pulling shared assets into the local runtime...")
-    asset_result = sync_shared_assets(paths, state)
-    state = asset_result["state"]
-    _record_step(install_steps, "Shared assets pull", asset_result["status"], asset_result["summary"], str(paths["local_assets"]))
-    _safe_print(f"{_step_marker(asset_result['status'])} {asset_result['summary']}")
+    _safe_print("Step 10: Deferring shared asset sync to the startup updater...")
+    shared_seed_summary = "Installer left shared asset updates to the standalone updater that runs during normal Flowgrid launch."
+    state.update(
+        {
+            "last_shared_asset_sync_at_utc": "",
+            "last_shared_asset_sync_status": "pending",
+            "last_shared_asset_sync_summary": shared_seed_summary,
+        }
+    )
+    _record_step(
+        install_steps,
+        "Shared assets deferred",
+        "ok",
+        shared_seed_summary,
+        str(paths["local_assets"]),
+    )
+    _safe_print(f"[OK] {shared_seed_summary}")
     _safe_print()
 
     if not save_install_state(paths, state):
