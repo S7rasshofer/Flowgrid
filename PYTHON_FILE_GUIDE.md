@@ -49,10 +49,16 @@ This file handles icon image work. It loads icon files, cleans up transparency, 
 This file contains shared installer helper logic. It focuses on local install tasks like shortcut creation, finding the right Python executable, and launching the app after setup.
 
 ### `flowgrid_app/legacy_runtime.py`
-This is the old giant all-in-one version of much of Flowgrid. It appears to keep older runtime code in one place, likely for legacy support, fallback behavior, or comparing old behavior to the newer split-up modules.
+This is the old giant all-in-one version of much of Flowgrid. It is not used by the current `Flowgrid.pyw` entrypoint or exported runtime flow; keep it as inactive legacy/reference code unless a future cleanup confirms it can be archived or removed safely.
+
+### `flowgrid_app/networking.py`
+This file contains shared app-side verified HTTPS helpers for update checks and downloads. It keeps SSL setup lazy, uses `certifi` when already available, falls back to the system trust store, and logs network failures with transport and URL details.
 
 ### `flowgrid_app/paths.py`
 This file is the central path and file-location manager. It figures out where shared data, local config files, the local standalone installer, install-state metadata, databases, icons, and migrated older files should live.
+
+### `flowgrid_app/render_types.py`
+This file holds small shared render data types used by the shell and design tools, including `LayerRenderInfo` for background image-layer previews.
 
 ### `flowgrid_app/runtime_logging.py`
 This file is the main runtime logging system. It figures out where logs should go, writes log entries, rotates old logs, and records useful user and machine details for troubleshooting.

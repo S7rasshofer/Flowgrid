@@ -10,12 +10,10 @@ from typing import Any
 
 from flowgrid_app.paths import (
     APP_TITLE,
-    ASSETS_DIR_NAME,
-    FLOWGRID_ICON_PACK_DIR_NAME,
     FLOWGRID_PROJECT_ROOT,
     _channel_shortcut_filename,
     _current_channel_display_name,
-    _get_shared_root_from_config,
+    _get_local_config_folder,
     _paths_equal,
 )
 from flowgrid_app.runtime_logging import _runtime_log_event
@@ -161,7 +159,7 @@ def _powershell_single_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 def _managed_shortcut_icon_path(*, create_dir: bool = True) -> Path:
-    icon_dir = _get_shared_root_from_config() / ASSETS_DIR_NAME / FLOWGRID_ICON_PACK_DIR_NAME
+    icon_dir = _get_local_config_folder()
     if create_dir:
         icon_dir.mkdir(parents=True, exist_ok=True)
     return icon_dir / MANAGED_SHORTCUT_ICON_FILENAME
@@ -317,34 +315,6 @@ def _sync_desktop_shortcut(
 
     from flowgrid_app.icon_io import _resolve_active_app_icon_path, _write_managed_shortcut_icon
 
-    managed_icon_path = _managed_shortcut_icon_path()
-    try:
-        icon_source = _resolve_active_app_icon_path(config)
-        if icon_source is None:
-            detail = "Unable to find the default wrench icon or the configured custom icon."
-            _runtime_log_event(
-                "installer.icon_source_unavailable",
-                severity="error",
-                summary="Desktop shortcut sync failed because no usable icon source was available.",
-                context={"shortcut_path": str(shortcut_path)},
-            )
-            return "failed", detail
-        _write_managed_shortcut_icon(icon_source, managed_icon_path)
-    except Exception as exc:
-        detail = f"Failed preparing shortcut icon: {type(exc).__name__}: {exc}"
-        _runtime_log_event(
-            "installer.shortcut_icon_write_failed",
-            severity="error",
-            summary="Desktop shortcut sync failed while preparing the managed shortcut icon file.",
-            exc=exc,
-            context={
-                "icon_source": str(icon_source),
-                "managed_icon_path": str(managed_icon_path),
-                "shortcut_path": str(shortcut_path),
-            },
-        )
-        return "failed", detail
-
     launcher_path = _preferred_gui_python_executable()
     script_path = _flowgrid_script_path()
     if not launcher_path.exists() or not launcher_path.is_file():
@@ -366,13 +336,43 @@ def _sync_desktop_shortcut(
         )
         return "failed", detail
 
+    managed_icon_path = _managed_shortcut_icon_path()
+    shortcut_icon_path = managed_icon_path
+    icon_source: Path | None = None
+    try:
+        icon_source = _resolve_active_app_icon_path(config)
+        if icon_source is None:
+            _runtime_log_event(
+                "installer.icon_source_unavailable",
+                severity="warning",
+                summary="Desktop shortcut sync is falling back to the Python launcher icon because no usable Flowgrid icon source was available.",
+                context={"shortcut_path": str(shortcut_path), "launcher_path": str(launcher_path)},
+            )
+            shortcut_icon_path = launcher_path
+        else:
+            _write_managed_shortcut_icon(icon_source, managed_icon_path)
+    except Exception as exc:
+        _runtime_log_event(
+            "installer.shortcut_icon_write_failed",
+            severity="warning",
+            summary="Desktop shortcut sync is falling back to the Python launcher icon after shortcut icon preparation failed.",
+            exc=exc,
+            context={
+                "icon_source": str(icon_source),
+                "managed_icon_path": str(managed_icon_path),
+                "fallback_icon_path": str(launcher_path),
+                "shortcut_path": str(shortcut_path),
+            },
+        )
+        shortcut_icon_path = launcher_path
+
     arguments = f'"{script_path}"'
     ok, detail = _create_or_update_windows_shortcut(
         shortcut_path,
         launcher_path,
         arguments,
         script_path.parent,
-        managed_icon_path,
+        shortcut_icon_path,
         WINDOWS_SHORTCUT_DESCRIPTION,
     )
     if not ok:
@@ -384,6 +384,7 @@ def _sync_desktop_shortcut(
                 "shortcut_path": str(shortcut_path),
                 "launcher_path": str(launcher_path),
                 "managed_icon_path": str(managed_icon_path),
+                "shortcut_icon_path": str(shortcut_icon_path),
                 "detail": detail,
             },
         )

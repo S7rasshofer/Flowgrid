@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
 
+from flowgrid_app.networking import fetch_url_bytes
 from flowgrid_app.paths import (
     ASSETS_DIR_NAME,
     DEFAULT_CHANNEL_ID,
@@ -228,18 +228,20 @@ def _safe_request(
     timeout_seconds: float = UPDATE_TIMEOUT_SECONDS,
     accept: str = GITHUB_API_ACCEPT,
 ) -> bytes:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": GITHUB_USER_AGENT,
-            "Accept": str(accept or "*/*"),
-        },
-    )
+    headers = {
+        "User-Agent": GITHUB_USER_AGENT,
+        "Accept": str(accept or "*/*"),
+    }
     last_error: Exception | None = None
     for attempt in range(1, GITHUB_RETRY_ATTEMPTS + 1):
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                return response.read()
+            return fetch_url_bytes(
+                url,
+                headers=headers,
+                timeout_seconds=timeout_seconds,
+                log_event=_runtime_log_event,
+                event_key="update.network_download_failed",
+            )
         except HTTPError:
             raise
         except Exception as exc:
@@ -261,10 +263,24 @@ def _download_file(url: str, target_path: Path, *, timeout_seconds: float = UPDA
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = target_path.with_name(f"{target_path.name}.tmp")
     payload = _safe_request(url, timeout_seconds=timeout_seconds, accept="application/octet-stream")
-    with temp_path.open("wb") as handle:
-        handle.write(payload)
-    os.replace(temp_path, target_path)
-    return target_path
+    try:
+        with temp_path.open("wb") as handle:
+            handle.write(payload)
+        os.replace(temp_path, target_path)
+        return target_path
+    except Exception:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except Exception as cleanup_exc:
+            _runtime_log_event(
+                "update.download_temp_cleanup_failed",
+                severity="warning",
+                summary="Failed removing a temporary download file after update download failure.",
+                exc=cleanup_exc,
+                context={"temp_path": str(temp_path), "target_path": str(target_path)},
+            )
+        raise
 
 
 def _normalize_repo_relative_path(raw_path: Any) -> str:

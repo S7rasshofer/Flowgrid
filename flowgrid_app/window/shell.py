@@ -101,6 +101,7 @@ from PySide6.QtWidgets import (
 )
 
 from flowgrid_app import AppContext, PermissionService, RuntimeOptions, UserRepository, WindowManager
+from flowgrid_app.depot_async import DepotAsyncLoadCoordinator
 from flowgrid_app.depot_rules import DepotRules
 from flowgrid_app.icon_io import (
     DEFAULT_WINDOW_ICON_FILENAME,
@@ -124,6 +125,7 @@ from flowgrid_app.paths import (
     _shared_workflow_db_path,
 )
 from flowgrid_app.runtime_logging import _runtime_log_event, detect_current_user_id
+from flowgrid_app.render_types import LayerRenderInfo
 from flowgrid_app.update_manager import check_for_updates, current_install_status, sync_shared_assets
 from flowgrid_app.workflow_core import DepotDB, DepotRefreshCoordinator, DepotTracker
 
@@ -433,6 +435,7 @@ class QuickInputsWindow(QMainWindow):
         self.permission_service = PermissionService(self.user_repository)
         self.depot_tracker.user_repository = self.user_repository
         self.depot_tracker.permission_service = self.permission_service
+        self.depot_async_loader = DepotAsyncLoadCoordinator(self.depot_db.db_path, parent=self)
         self.app_context = AppContext(
             current_user=self.current_user,
             config=self.config,
@@ -1418,6 +1421,52 @@ class QuickInputsWindow(QMainWindow):
         if coordinator is None:
             return
         coordinator.invalidate_views(*sections, reason=reason)
+        async_loader = getattr(self, "depot_async_loader", None)
+        if async_loader is not None:
+            for section in sections:
+                normalized_section = str(section or "").strip()
+                if normalized_section in {"dashboard_metrics", "dashboard_completed", "dashboard_notes"}:
+                    async_loader.cancel_view(normalized_section, reason=f"invalidate:{reason}")
+
+    def start_depot_read(
+        self,
+        view_key: str,
+        state_key: Any,
+        *,
+        reason: str = "",
+        force: bool = False,
+        loader,
+        on_success,
+        on_error,
+    ):
+        coordinator = getattr(self, "depot_async_loader", None)
+        if coordinator is None:
+            _runtime_log_event(
+                "depot.async_read_start_failed",
+                severity="warning",
+                summary="Could not start a shared workflow background read because the coordinator is unavailable.",
+                context={"view": str(view_key or ""), "reason": str(reason or "")},
+            )
+            return None
+        return coordinator.start_read(
+            view_key,
+            state_key,
+            reason=reason,
+            force=force,
+            loader=loader,
+            on_success=on_success,
+            on_error=on_error,
+        )
+
+    def cancel_depot_reads(self, reason: str = "", *view_keys: str) -> None:
+        coordinator = getattr(self, "depot_async_loader", None)
+        if coordinator is None:
+            return
+        if view_keys:
+            for view_key in view_keys:
+                coordinator.cancel_view(str(view_key or ""), reason=reason)
+            return
+        coordinator.cancel_all(reason=reason)
 
     def _refresh_visible_depot_views(
         self,
@@ -1481,11 +1530,11 @@ class QuickInputsWindow(QMainWindow):
         dashboard_dialog = getattr(self, "depot_dashboard_dialog", None)
         if dashboard_dialog is not None and dashboard_dialog.isVisible():
             if "dashboard_metrics" in requested:
-                dashboard_dialog.refresh_dashboard()
+                dashboard_dialog.refresh_dashboard(force=force, reason=reason)
             if "dashboard_completed" in requested:
-                dashboard_dialog.refresh_completed_parts()
+                dashboard_dialog.refresh_completed_parts(force=force, reason=reason)
             if "dashboard_notes" in requested:
-                dashboard_dialog.refresh_notes_rows()
+                dashboard_dialog.refresh_notes_rows(force=force, reason=reason)
 
         admin_dialog = getattr(self, "admin_dialog", None)
         if admin_dialog is not None and admin_dialog.isVisible():
@@ -1577,7 +1626,6 @@ class QuickInputsWindow(QMainWindow):
             restore_flowgrid_popup_position(dialog, self.config, "depot_dashboard", queue_save=self.queue_save_config)
         dialog.apply_theme_styles()
         dialog.refresh_combo_popup_width()
-        dialog.refresh_dashboard()
 
     def _prepare_depot_agent_window(self, dialog: DepotAgentWindow) -> None:
         if not dialog.isVisible():
@@ -1629,9 +1677,6 @@ class QuickInputsWindow(QMainWindow):
 
     def _prepare_depot_admin_window(self, dialog: DepotAdminDialog) -> None:
         dialog.apply_theme_styles()
-        dialog.refresh_roles()
-        dialog.refresh_users()
-        dialog.refresh_qa_flags()
 
     def _build_quick_editor_dialog(self) -> None:
         self.quick_editor_dialog = FlowgridThemedDialog(self, self, "main")
@@ -5557,6 +5602,18 @@ class QuickInputsWindow(QMainWindow):
                     "timers",
                     "runtime.shutdown_stop_timers_failed",
                     "Failed stopping one or more shell timers during shutdown.",
+                    exc=exc,
+                )
+
+            try:
+                async_loader = getattr(self, "depot_async_loader", None)
+                if async_loader is not None:
+                    async_loader.cancel_all(reason=f"shell:{shutdown_reason}")
+            except Exception as exc:
+                _log_shutdown_issue(
+                    "depot_async_cancel",
+                    "runtime.shutdown_depot_async_cancel_failed",
+                    "Failed cancelling shared workflow background reads during shutdown.",
                     exc=exc,
                 )
 

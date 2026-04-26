@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -257,11 +256,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
     ],
 }
-
-class LayerRenderInfo:
-    layer: dict[str, Any]
-    rect: QRectF
-    pixmap: QPixmap
 
 def deep_clone(value: Any) -> Any:
     return json.loads(json.dumps(value))
@@ -2121,7 +2115,6 @@ __all__ = [
     "LEGACY_DEFAULT_THEME_ACCENT",
     "LEGACY_DEFAULT_THEME_PRIMARY",
     "LEGACY_DEFAULT_THEME_SURFACE",
-    "LayerRenderInfo",
     "QuickButtonCanvas",
     "QuickButtonCard",
     "QuickLayoutDialog",

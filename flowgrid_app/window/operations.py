@@ -93,12 +93,13 @@ from PySide6.QtWidgets import (
 )
 
 from flowgrid_app import PermissionDeniedError, PermissionService
+from flowgrid_app.depot_async import DepotLoadResult
 from flowgrid_app.depot_rules import DepotRules
 from flowgrid_app.icon_io import _load_icon_image_file
 from flowgrid_app.paths import ASSETS_DIR_NAME
 from flowgrid_app.runtime_logging import _runtime_log_event
 from flowgrid_app.ui_utils import clamp, contrast_ratio, normalize_hex, readable_text, rgba_css, safe_int, shift
-from flowgrid_app.workflow_core import QA_FLAG_SEVERITY_OPTIONS, TRACKER_DASHBOARD_TABLES
+from flowgrid_app.workflow_core import DepotTracker, QA_FLAG_SEVERITY_OPTIONS, TRACKER_DASHBOARD_TABLES
 
 from .agent import DepotAgentWindow
 from .common import TouchDistributionBar, format_working_updated_stamp
@@ -1666,6 +1667,16 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self._window_always_on_top = self._load_window_always_on_top_preference(self._always_on_top_config_key, default=False)
         self.set_window_always_on_top(self._window_always_on_top)
         self._date_sync_in_progress = False
+        self._dashboard_has_loaded = False
+        self._dashboard_loading = False
+        self._completed_loaded = False
+        self._completed_loading = False
+        self._notes_loaded = False
+        self._notes_loading = False
+        self._completed_search_timer = QTimer(self)
+        self._completed_search_timer.setSingleShot(True)
+        self._completed_search_timer.setInterval(250)
+        self._completed_search_timer.timeout.connect(lambda: self.refresh_completed_parts(reason="search"))
         body = QWidget(self)
         self.root_layout.addWidget(body, 1)
         layout = QVBoxLayout(body)
@@ -1867,20 +1878,21 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self._notes_selected_row_id: int | None = None
 
         self.table_combo.currentIndexChanged.connect(self._on_table_changed)
-        self.limit_spin.valueChanged.connect(self.refresh_dashboard)
-        self.refresh_btn.clicked.connect(self.refresh_dashboard)
+        self.limit_spin.valueChanged.connect(lambda _value: self.refresh_dashboard(reason="limit-change"))
+        self.refresh_btn.clicked.connect(lambda _checked=False: self.refresh_dashboard(force=True, reason="manual"))
         self.export_btn.clicked.connect(self.export_csv)
         self.timeframe_combo.currentIndexChanged.connect(self._on_timeframe_changed)
         self.start_date_edit.dateChanged.connect(self._on_custom_date_changed)
         self.end_date_edit.dateChanged.connect(self._on_custom_date_changed)
-        self.user_filter_combo.currentIndexChanged.connect(self.refresh_dashboard)
+        self.user_filter_combo.currentIndexChanged.connect(lambda _index: self.refresh_dashboard(reason="user-filter"))
         self.category_filter_combo.currentIndexChanged.connect(self._on_dashboard_category_changed)
-        self.notes_target_combo.currentIndexChanged.connect(self.refresh_notes_rows)
-        self.notes_limit_spin.valueChanged.connect(self.refresh_notes_rows)
-        self.notes_work_order_filter.returnPressed.connect(self.refresh_notes_rows)
-        self.notes_refresh_btn.clicked.connect(self.refresh_notes_rows)
+        self.notes_target_combo.currentIndexChanged.connect(lambda _index: self._on_notes_filter_changed())
+        self.notes_limit_spin.valueChanged.connect(lambda _value: self._on_notes_filter_changed())
+        self.notes_work_order_filter.returnPressed.connect(lambda: self.refresh_notes_rows(force=True, reason="notes-filter"))
+        self.notes_refresh_btn.clicked.connect(lambda _checked=False: self.refresh_notes_rows(force=True, reason="manual"))
         self.notes_table.itemSelectionChanged.connect(self._on_notes_selection_changed)
         self.notes_save_btn.clicked.connect(self._save_selected_note)
+        self.results_tabs.currentChanged.connect(self._on_results_tab_changed)
 
         self._set_timeframe_key("current_week")
         self._populate_submission_user_filter()
@@ -1888,8 +1900,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self._populate_notes_targets()
         self.apply_theme_styles()
         self.refresh_combo_popup_width()
-        self.refresh_dashboard()
-        self.refresh_notes_rows()
+        QTimer.singleShot(0, lambda: self.refresh_dashboard(reason="window-open"))
         self._apply_read_only_ui_state()
 
     def _apply_read_only_ui_state(self) -> None:
@@ -1905,6 +1916,20 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        try:
+            self.app_window.cancel_depot_reads(
+                "dashboard.close",
+                "dashboard_metrics",
+                "dashboard_completed",
+                "dashboard_notes",
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_async_cancel_failed",
+                severity="warning",
+                summary="Dashboard failed cancelling background reads while closing.",
+                exc=exc,
+            )
         self.app_window.config.setdefault("popup_positions", {})["depot_dashboard"] = {
             "x": int(self.x()),
             "y": int(self.y()),
@@ -1935,18 +1960,21 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
 
     def _on_table_changed(self) -> None:
         self.refresh_combo_popup_width()
-        self.refresh_dashboard()
+        self.refresh_dashboard(reason="table-change")
 
     def _on_dashboard_category_changed(self) -> None:
         self.refresh_combo_popup_width()
-        self.refresh_dashboard()
-        self.refresh_notes_rows()
+        self.refresh_dashboard(reason="category-filter")
+        if self._completed_loaded or self.results_tabs.currentWidget() is self.completed_tab:
+            self.refresh_completed_parts(force=True, reason="category-filter")
+        if self._notes_loaded or self.results_tabs.currentWidget() is self.notes_tab:
+            self.refresh_notes_rows(force=True, reason="category-filter")
 
     def _on_timeframe_changed(self) -> None:
         key = str(self.timeframe_combo.currentData() or "").strip()
         if key:
             self._set_timeframe_key(key)
-        self.refresh_dashboard()
+        self.refresh_dashboard(reason="timeframe-change")
 
     def _on_custom_date_changed(self) -> None:
         if self._date_sync_in_progress:
@@ -1961,7 +1989,19 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
                     self.timeframe_combo.setCurrentIndex(idx)
         finally:
             self._date_sync_in_progress = False
-        self.refresh_dashboard()
+        self.refresh_dashboard(reason="date-change")
+
+    def _on_results_tab_changed(self, _index: int) -> None:
+        current = self.results_tabs.currentWidget()
+        if current is self.completed_tab and not self._completed_loaded:
+            self.refresh_completed_parts(reason="tab-show")
+        elif current is self.notes_tab and not self._notes_loaded:
+            self.refresh_notes_rows(reason="tab-show")
+
+    def _on_notes_filter_changed(self) -> None:
+        self._notes_loaded = False
+        if self.results_tabs.currentWidget() is self.notes_tab:
+            self.refresh_notes_rows(reason="notes-filter")
 
     def _set_timeframe_key(self, key: str) -> None:
         today = QDate.currentDate()
@@ -2019,68 +2059,62 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         selected_category = str(self.category_filter_combo.currentData() or "").strip()
         return selected_category if selected_category else None
 
+    def _apply_dashboard_category_filter_options(self, categories: list[str], selected_category: str = "") -> None:
+        selected_category = str(selected_category or "").strip()
+        self.category_filter_combo.blockSignals(True)
+        try:
+            self.category_filter_combo.clear()
+            self.category_filter_combo.addItem("All Categories", "")
+            seen = {""}
+            for category_text in categories:
+                normalized_text = str(category_text or "").strip()
+                if not normalized_text:
+                    continue
+                key = normalized_text.casefold()
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.category_filter_combo.addItem(normalized_text, normalized_text)
+            if selected_category:
+                selected_index = self.category_filter_combo.findData(selected_category)
+                if selected_index < 0:
+                    self.category_filter_combo.addItem(selected_category, selected_category)
+                    selected_index = self.category_filter_combo.findData(selected_category)
+                if selected_index >= 0:
+                    self.category_filter_combo.setCurrentIndex(selected_index)
+        finally:
+            self.category_filter_combo.blockSignals(False)
+
     def _populate_dashboard_category_filter(self) -> None:
         selected_category = str(self.category_filter_combo.currentData() or "").strip()
-        categories: list[str] = []
-        try:
-            categories = self.app_window.depot_tracker.dashboard_category_options()
-        except Exception as exc:
-            _runtime_log_event(
-                "ui.depot_dashboard_category_filter_query_failed",
-                severity="warning",
-                summary="Dashboard could not refresh category filter options.",
-                exc=exc,
-            )
-            categories = list(DepotRules.CATEGORY_OPTIONS)
+        self._apply_dashboard_category_filter_options(list(DepotRules.CATEGORY_OPTIONS), selected_category)
 
-        self.category_filter_combo.blockSignals(True)
-        self.category_filter_combo.clear()
-        self.category_filter_combo.addItem("All Categories", "")
-        seen = {""}
-        for category_text in categories:
-            normalized_text = str(category_text or "").strip()
-            if not normalized_text:
-                continue
-            key = normalized_text.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            self.category_filter_combo.addItem(normalized_text, normalized_text)
-        if selected_category:
-            selected_index = self.category_filter_combo.findData(selected_category)
-            if selected_index < 0:
-                self.category_filter_combo.addItem(selected_category, selected_category)
-                selected_index = self.category_filter_combo.findData(selected_category)
-            if selected_index >= 0:
-                self.category_filter_combo.setCurrentIndex(selected_index)
-        self.category_filter_combo.blockSignals(False)
+    def _apply_submission_user_filter_options(self, users: list[str], selected_user: str = "") -> None:
+        selected_user = str(selected_user or "").strip()
+        self.user_filter_combo.blockSignals(True)
+        try:
+            self.user_filter_combo.clear()
+            self.user_filter_combo.addItem("All Users", "")
+            seen = {""}
+            for user_id in users:
+                normalized_user = DepotRules.normalize_user_id(str(user_id or ""))
+                if not normalized_user or normalized_user in seen:
+                    continue
+                seen.add(normalized_user)
+                self.user_filter_combo.addItem(normalized_user, normalized_user)
+            if selected_user:
+                idx = self.user_filter_combo.findData(selected_user)
+                if idx < 0:
+                    self.user_filter_combo.addItem(selected_user, selected_user)
+                    idx = self.user_filter_combo.findData(selected_user)
+                if idx >= 0:
+                    self.user_filter_combo.setCurrentIndex(idx)
+        finally:
+            self.user_filter_combo.blockSignals(False)
 
     def _populate_submission_user_filter(self) -> None:
         selected_user = str(self.user_filter_combo.currentData() or "").strip()
-        users: list[str] = []
-        try:
-            rows = self.app_window.depot_db.fetchall(
-                "SELECT DISTINCT user_id FROM submissions WHERE COALESCE(user_id, '') <> '' ORDER BY user_id ASC"
-            )
-            users = [str(row["user_id"]).strip() for row in rows if str(row["user_id"]).strip()]
-        except Exception as exc:
-            _runtime_log_event(
-                "ui.depot_dashboard_user_filter_query_failed",
-                severity="warning",
-                summary="Dashboard could not refresh submission user filter options.",
-                exc=exc,
-            )
-
-        self.user_filter_combo.blockSignals(True)
-        self.user_filter_combo.clear()
-        self.user_filter_combo.addItem("All Users", "")
-        for user_id in users:
-            self.user_filter_combo.addItem(user_id, user_id)
-        if selected_user:
-            idx = self.user_filter_combo.findData(selected_user)
-            if idx >= 0:
-                self.user_filter_combo.setCurrentIndex(idx)
-        self.user_filter_combo.blockSignals(False)
+        self._apply_submission_user_filter_options([], selected_user)
 
     @staticmethod
     def _note_preview_text(value: str, max_len: int = 120) -> str:
@@ -2166,11 +2200,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.completed_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.completed_table.customContextMenuRequested.connect(self._open_completed_notes_from_context)
         layout.addWidget(self.completed_table, 1)
+        self.completed_status_label = QLabel("")
+        self.completed_status_label.setWordWrap(True)
+        self.completed_status_label.setProperty("muted", True)
+        layout.addWidget(self.completed_status_label, 0)
 
-        self.completed_workorder_search.textChanged.connect(self.refresh_completed_parts)
-        self.completed_refresh_btn.clicked.connect(self.refresh_completed_parts)
+        self.completed_workorder_search.textChanged.connect(lambda _text: self._completed_search_timer.start())
+        self.completed_refresh_btn.clicked.connect(lambda _checked=False: self.refresh_completed_parts(force=True, reason="manual"))
         self.completed_open_notes_btn.clicked.connect(self._open_selected_completed_notes)
-        self.refresh_completed_parts()
 
     def _open_completed_notes_from_context(self, pos: QPoint) -> None:
         if not _select_table_row_by_context_pos(self.completed_table, pos):
@@ -2188,9 +2225,52 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         )
         if not saved:
             return
-        self.app_window._refresh_shared_linked_views("dashboard_completed", reason="dashboard_completed_note")
+        self.app_window._refresh_shared_linked_views("dashboard_completed", force=True, reason="dashboard_completed_note")
 
-    def refresh_completed_parts(self) -> None:
+    @staticmethod
+    def _load_dashboard_completed_payload(
+        tracker: DepotTracker,
+        *,
+        search_text: str,
+        category_filter: str | None,
+    ) -> dict[str, Any]:
+        rows = tracker.list_completed_parts(search_text, category_filter=category_filter)
+        fallback_map = {
+            DepotRules.normalize_work_order(str(row["work_order"] or "")): str(row["category"] or "").strip()
+            for row in rows
+            if DepotRules.normalize_work_order(str(row["work_order"] or ""))
+        }
+        category_map = tracker.resolve_work_order_categories_bulk(list(fallback_map.keys()), fallback_map)
+        agent_meta = tracker.agent_display_map()
+        flag_icon_map = {
+            str(row.get("flag_name", "") or "").strip(): str(row.get("icon_path", "") or "").strip()
+            for row in tracker.list_qa_flags()
+            if str(row.get("flag_name", "") or "").strip()
+        }
+        rendered_rows: list[dict[str, Any]] = []
+        for row in rows:
+            row_payload = {str(key): row[key] for key in row.keys()}
+            work_order = DepotRules.normalize_work_order(str(row_payload.get("work_order", "") or ""))
+            row_payload["resolved_category"] = (
+                category_map.get(work_order, "") or str(row_payload.get("category", "") or "").strip() or "Other"
+            )
+            qa_flag = str(row_payload.get("qa_flag", "") or "").strip()
+            legacy_icon = str(row_payload.get("qa_flag_image_path", "") or "").strip()
+            row_payload["resolved_qa_flag_icon"] = flag_icon_map.get(qa_flag, "")
+            if not row_payload["resolved_qa_flag_icon"] and legacy_icon:
+                row_payload["resolved_qa_flag_icon"] = tracker.resolve_part_flag_image_path(legacy_icon)
+            rendered_rows.append(row_payload)
+        return {
+            "rows": rendered_rows,
+            "agent_meta": {
+                str(user_id): {"name": str(meta[0] or ""), "icon_path": str(meta[1] or "")}
+                for user_id, meta in agent_meta.items()
+            },
+            "search_text": str(search_text or ""),
+            "category_filter": str(category_filter or ""),
+        }
+
+    def refresh_completed_parts(self, *, force: bool = False, reason: str = "") -> None:
         if not hasattr(self, "completed_table"):
             return
 
@@ -2198,46 +2278,78 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         if hasattr(self, "completed_workorder_search"):
             search_text = str(self.completed_workorder_search.text() or "").strip()
         category_filter = self._current_dashboard_category_filter()
-        try:
-            rows = self.app_window.depot_tracker.list_completed_parts(search_text, category_filter=category_filter)
-            agent_meta = self.app_window.depot_tracker.agent_display_map()
-        except Exception as exc:
-            _runtime_log_event(
-                "ui.depot_dashboard_completed_query_failed",
-                severity="warning",
-                summary="Dashboard completed queue query failed.",
-                exc=exc,
-                context={"search_text": search_text, "category_filter": category_filter or ""},
-            )
+        state_key = {
+            "search_text": search_text,
+            "category_filter": category_filter or "",
+        }
+        self._completed_loading = True
+        self.completed_refresh_btn.setEnabled(False)
+        if hasattr(self, "completed_status_label"):
+            self.completed_status_label.setText("Loading completed rows...")
+        if self.completed_table.rowCount() <= 0:
             self.completed_table.setRowCount(0)
+
+        def _loader(worker_tracker: DepotTracker) -> dict[str, Any]:
+            return DepotDashboardDialog._load_dashboard_completed_payload(
+                worker_tracker,
+                search_text=search_text,
+                category_filter=category_filter,
+            )
+
+        request = self.app_window.start_depot_read(
+            "dashboard_completed",
+            state_key,
+            reason=reason or "completed-refresh",
+            force=force,
+            loader=_loader,
+            on_success=self._apply_completed_parts_result,
+            on_error=self._handle_completed_parts_error,
+        )
+        if request is None:
+            self._completed_loading = False
+            self.completed_refresh_btn.setEnabled(True)
+            if hasattr(self, "completed_status_label"):
+                self.completed_status_label.setText("Could not start completed-row load. Details were logged for support.")
             return
 
-        self.completed_table.setRowCount(0)
-        for row_idx, r in enumerate(rows):
-            self.completed_table.insertRow(row_idx)
-            part_id = int(r["id"])
-            work_order = str(r["work_order"] or "").strip()
-            assigned = DepotRules.normalize_user_id(str(r["assigned_user_id"] or ""))
-            category = self.app_window.depot_tracker.resolve_work_order_category(work_order, str(r["category"] or "").strip()) or "Other"
-            age_text = DepotAgentWindow._part_age_label(str(r["created_at"] or ""))
-            qa_comment = str(r["qa_comment"] or r["comments"] or "").strip()
-            agent_comment = str(r["agent_comment"] or "").strip()
-            flag = str(r["qa_flag"] or "").strip()
-            working_user = DepotRules.normalize_user_id(str(r["working_user_id"] or ""))
-            working_stamp = str(r["working_updated_at"] or "").strip()
-            outcome_text = str(r["latest_touch"] or "").strip()
-            closed_at_raw = str(r["latest_touch_at"] or "").strip()
+    def _apply_completed_parts_result(self, result: DepotLoadResult) -> None:
+        self._completed_loading = False
+        self._completed_loaded = True
+        if hasattr(self, "completed_refresh_btn"):
+            self.completed_refresh_btn.setEnabled(True)
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        rows = payload.get("rows", [])
+        if not isinstance(rows, list):
+            rows = []
+        agent_meta_raw = payload.get("agent_meta", {})
+        agent_meta = agent_meta_raw if isinstance(agent_meta_raw, dict) else {}
+        valid_rows = [row for row in rows if isinstance(row, dict)]
+        self.completed_table.setRowCount(len(valid_rows))
+        if hasattr(self, "completed_status_label"):
+            self.completed_status_label.setText(f"Loaded {len(valid_rows)} completed row(s).")
+        for row_idx, r in enumerate(valid_rows):
+            part_id = int(max(0, safe_int(r.get("id", 0), 0)))
+            work_order = str(r.get("work_order", "") or "").strip()
+            assigned = DepotRules.normalize_user_id(str(r.get("assigned_user_id", "") or ""))
+            category = str(r.get("resolved_category", "") or r.get("category", "") or "").strip() or "Other"
+            age_text = DepotAgentWindow._part_age_label(str(r.get("created_at", "") or ""))
+            qa_comment = str(r.get("qa_comment", "") or r.get("comments", "") or "").strip()
+            agent_comment = str(r.get("agent_comment", "") or "").strip()
+            flag = str(r.get("qa_flag", "") or "").strip()
+            working_user = DepotRules.normalize_user_id(str(r.get("working_user_id", "") or ""))
+            working_stamp = str(r.get("working_updated_at", "") or "").strip()
+            outcome_text = str(r.get("latest_touch", "") or "").strip()
+            closed_at_raw = str(r.get("latest_touch_at", "") or "").strip()
             closed_at_text = self._normalize_dashboard_datetime(closed_at_raw) if closed_at_raw else "-"
 
-            image_abs = self.app_window.depot_tracker.resolve_qa_flag_icon(
-                str(r["qa_flag"] or "").strip(),
-                str(r["qa_flag_image_path"] or ""),
-            )
-            assigned_name, assigned_icon = agent_meta.get(assigned, ("", ""))
+            image_abs = str(r.get("resolved_qa_flag_icon", "") or "")
+            assigned_meta = agent_meta.get(assigned, {})
+            assigned_name = str(assigned_meta.get("name", "") or "") if isinstance(assigned_meta, dict) else ""
+            assigned_icon = str(assigned_meta.get("icon_path", "") or "") if isinstance(assigned_meta, dict) else ""
 
             client_item = QTableWidgetItem("")
             client_item.setData(Qt.ItemDataRole.UserRole, part_id)
-            if int(r["client_unit"] or 0):
+            if int(max(0, safe_int(r.get("client_unit", 0), 0))):
                 client_item.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
 
             flag_item = QTableWidgetItem("" if image_abs else (flag if flag else ""))
@@ -2283,7 +2395,30 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             self.completed_table.setItem(row_idx, 9, _center_table_item(qa_note_item))
             self.completed_table.setItem(row_idx, 10, _center_table_item(agent_note_item))
 
-    def refresh_notes_rows(self) -> None:
+    def _handle_completed_parts_error(self, result: DepotLoadResult) -> None:
+        self._completed_loading = False
+        if hasattr(self, "completed_refresh_btn"):
+            self.completed_refresh_btn.setEnabled(True)
+        if hasattr(self, "completed_status_label"):
+            self.completed_status_label.setText(
+                f"Load failed: {result.error_type or 'Error'}"
+                + (f": {result.error_message}" if result.error_message else "")
+            )
+        _runtime_log_event(
+            "ui.depot_dashboard_completed_query_failed",
+            severity="warning",
+            summary="Dashboard completed queue query failed.",
+            context={
+                "error_type": result.error_type,
+                "error_message": result.error_message,
+                "view": result.request.view_key,
+                "reason": result.request.reason,
+                "state_key": result.request.state_key[:500],
+                "duration_ms": int(max(0.0, result.duration_ms)),
+            },
+        )
+
+    def _configure_notes_rows_table(self) -> None:
         headers = ["id", "created_at", "user_id", "work_order", "note_preview"]
         resize_modes = {
             0: QHeaderView.ResizeMode.ResizeToContents,
@@ -2294,6 +2429,31 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         }
         configure_standard_table(self.notes_table, headers, resize_modes=resize_modes, stretch_last=True)
 
+    @staticmethod
+    def _load_dashboard_notes_payload(
+        tracker: DepotTracker,
+        *,
+        target_key: str,
+        rows_limit: int,
+        work_order_filter: str,
+        category_filter: str | None,
+    ) -> dict[str, Any]:
+        rows = tracker.fetch_dashboard_note_rows(
+            target_key,
+            limit=rows_limit,
+            work_order_filter=work_order_filter,
+            category_filter=category_filter,
+        )
+        return {
+            "target_key": target_key,
+            "rows": rows,
+            "rows_limit": int(rows_limit),
+            "work_order_filter": work_order_filter,
+            "category_filter": category_filter or "",
+        }
+
+    def refresh_notes_rows(self, *, force: bool = False, reason: str = "") -> None:
+        self._configure_notes_rows_table()
         target_key = str(self.notes_target_combo.currentData() or "").strip()
         if not target_key:
             self.notes_table.setRowCount(0)
@@ -2303,54 +2463,63 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             self.notes_save_btn.setEnabled(False)
             self.notes_selected_label.setText("No editable note fields are currently available.")
             self.notes_status_label.setText("")
+            self._notes_loading = False
+            self._notes_loaded = False
             return
 
         rows_limit = int(self.notes_limit_spin.value())
         work_order_filter = str(self.notes_work_order_filter.text() or "").strip()
         category_filter = self._current_dashboard_category_filter()
-        app = QApplication.instance()
-        if app is not None:
-            app.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            try:
-                rows = self.app_window.depot_tracker.fetch_dashboard_note_rows(
-                    target_key,
-                    limit=rows_limit,
-                    work_order_filter=work_order_filter,
-                    category_filter=category_filter,
-                )
-            except Exception as exc:
-                _runtime_log_event(
-                    "ui.depot_dashboard_notes_query_failed",
-                    severity="error",
-                    summary="Dashboard notes editor query failed.",
-                    exc=exc,
-                    context={
-                        "target_key": target_key,
-                        "limit": rows_limit,
-                        "work_order_filter": work_order_filter,
-                        "category_filter": category_filter or "",
-                    },
-                )
-                self._show_themed_message(
-                    QMessageBox.Icon.Warning,
-                    "Notes load failed",
-                    f"Could not load note rows:\n{type(exc).__name__}: {exc}",
-                )
-                self.notes_table.setRowCount(0)
-                self._notes_selected_row_id = None
-                self.notes_editor.clear()
-                self.notes_editor.setEnabled(False)
-                self.notes_save_btn.setEnabled(False)
-                self.notes_selected_label.setText("Could not load note rows. Details were logged for support.")
-                self.notes_status_label.setText("")
-                return
-        finally:
-            if app is not None:
-                app.restoreOverrideCursor()
+        state_key = {
+            "target_key": target_key,
+            "rows_limit": rows_limit,
+            "work_order_filter": work_order_filter,
+            "category_filter": category_filter or "",
+        }
+        self._notes_loading = True
+        self.notes_refresh_btn.setEnabled(False)
+        self._notes_selected_row_id = None
+        self.notes_editor.clear()
+        self.notes_editor.setEnabled(False)
+        self.notes_save_btn.setEnabled(False)
+        self.notes_selected_label.setText("Select a row to edit.")
+        self.notes_status_label.setText("Loading note rows...")
 
+        def _loader(worker_tracker: DepotTracker) -> dict[str, Any]:
+            return DepotDashboardDialog._load_dashboard_notes_payload(
+                worker_tracker,
+                target_key=target_key,
+                rows_limit=rows_limit,
+                work_order_filter=work_order_filter,
+                category_filter=category_filter,
+            )
+
+        request = self.app_window.start_depot_read(
+            "dashboard_notes",
+            state_key,
+            reason=reason or "notes-refresh",
+            force=force,
+            loader=_loader,
+            on_success=self._apply_notes_rows_result,
+            on_error=self._handle_notes_rows_error,
+        )
+        if request is None:
+            self._notes_loading = False
+            self.notes_refresh_btn.setEnabled(True)
+            self.notes_status_label.setText("Could not start note load. Details were logged for support.")
+
+    def _apply_notes_rows_result(self, result: DepotLoadResult) -> None:
+        self._configure_notes_rows_table()
+        self._notes_loading = False
+        self._notes_loaded = True
+        self.notes_refresh_btn.setEnabled(True)
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        rows_raw = payload.get("rows", [])
+        rows = rows_raw if isinstance(rows_raw, list) else []
         self.notes_table.setRowCount(len(rows))
         for row_idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
             row_id = int(max(0, safe_int(row.get("id"), 0)))
             created_text = self._normalize_dashboard_datetime(str(row.get("created_at", "") or ""))
             user_text = str(row.get("user_id", "") or "").strip()
@@ -2386,6 +2555,28 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_save_btn.setEnabled(False)
         self.notes_selected_label.setText("Select a row to edit.")
         self.notes_status_label.setText(f"Loaded {len(rows)} row(s).")
+
+    def _handle_notes_rows_error(self, result: DepotLoadResult) -> None:
+        self._notes_loading = False
+        self.notes_refresh_btn.setEnabled(True)
+        _runtime_log_event(
+            "ui.depot_dashboard_notes_query_failed",
+            severity="warning",
+            summary="Dashboard notes editor query failed.",
+            context={
+                "error_type": result.error_type,
+                "error_message": result.error_message,
+                "view": result.request.view_key,
+                "reason": result.request.reason,
+                "state_key": result.request.state_key[:500],
+                "duration_ms": int(max(0.0, result.duration_ms)),
+            },
+        )
+        self.notes_selected_label.setText("Could not load note rows. Details were logged for support.")
+        self.notes_status_label.setText(
+            f"Load failed: {result.error_type or 'Error'}"
+            + (f": {result.error_message}" if result.error_message else "")
+        )
 
     def _on_notes_selection_changed(self) -> None:
         selected_rows = self.notes_table.selectionModel().selectedRows() if self.notes_table.selectionModel() is not None else []
@@ -2463,7 +2654,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
                 preview_item.setText(self._note_preview_text(note_text))
                 preview_item.setToolTip(note_text if note_text else "(empty)")
         self.notes_status_label.setText(f"Saved row #{row_id} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.")
-        self.refresh_completed_parts()
+        self.refresh_completed_parts(force=True, reason="notes-save")
 
     def _touch_color(self, touch: str) -> str:
         normalized = str(touch or "").strip()
@@ -2479,33 +2670,35 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         end_date: str | None,
         user_id: str | None,
         category_filter: str | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         latest_workload_mix = self._latest_workload_mix_enabled(user_id)
-        try:
-            metrics = self.app_window.depot_tracker.get_dashboard_metrics(
-                start_date=start_date,
-                end_date=end_date,
-                user_id=user_id,
-                category=category_filter,
-                include_latest_workload_mix=latest_workload_mix,
-            )
-        except Exception as exc:
-            _runtime_log_event(
-                "ui.depot_dashboard_metrics_query_failed",
-                severity="error",
-                summary="Dashboard metrics query failed.",
-                exc=exc,
-                context={
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "user_id": user_id,
-                    "category_filter": category_filter or "",
-                },
-            )
-            self.touch_bar.set_segments([])
-            self.touch_summary_label.setText("Touch metrics unavailable. Details were logged for support.")
-            self.touch_legend_label.setText("")
-            return
+        if metrics is None:
+            try:
+                metrics = self.app_window.depot_tracker.get_dashboard_metrics(
+                    start_date=start_date,
+                    end_date=end_date,
+                    user_id=user_id,
+                    category=category_filter,
+                    include_latest_workload_mix=latest_workload_mix,
+                )
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.depot_dashboard_metrics_query_failed",
+                    severity="error",
+                    summary="Dashboard metrics query failed.",
+                    exc=exc,
+                    context={
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "user_id": user_id,
+                        "category_filter": category_filter or "",
+                    },
+                )
+                self.touch_bar.set_segments([])
+                self.touch_summary_label.setText("Touch metrics unavailable. Details were logged for support.")
+                self.touch_legend_label.setText("")
+                return
 
         by_touch_raw = metrics.get("latest_by_touch" if latest_workload_mix else "by_touch", {})
         by_touch: dict[str, int] = {}
@@ -2627,6 +2820,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         end_date: str | None,
         user_id: str | None,
         category_filter: str | None = None,
+        metrics: dict[str, Any] | None = None,
     ) -> None:
         if not hasattr(self, "table_placeholder_label"):
             return
@@ -2643,29 +2837,30 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         range_label = "All Time" if start_date is None or end_date is None else f"{start_date} to {end_date}"
         user_label = user_id if user_id else "All Users"
         latest_workload_mix = self._latest_workload_mix_enabled(user_id)
-        try:
-            metrics = self.app_window.depot_tracker.get_dashboard_metrics(
-                start_date=start_date,
-                end_date=end_date,
-                user_id=user_id,
-                category=category_filter,
-                include_latest_workload_mix=latest_workload_mix,
-            )
-        except Exception as exc:
-            _runtime_log_event(
-                "ui.depot_dashboard_placeholder_metrics_query_failed",
-                severity="warning",
-                summary="Dashboard placeholder metrics query failed.",
-                exc=exc,
-                context={
-                    "table_name": table_name,
-                    "start_date": start_date,
-                    "end_date": end_date,
-                    "user_id": user_id,
-                    "category_filter": category_filter or "",
-                },
-            )
-            metrics = {}
+        if metrics is None:
+            try:
+                metrics = self.app_window.depot_tracker.get_dashboard_metrics(
+                    start_date=start_date,
+                    end_date=end_date,
+                    user_id=user_id,
+                    category=category_filter,
+                    include_latest_workload_mix=latest_workload_mix,
+                )
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.depot_dashboard_placeholder_metrics_query_failed",
+                    severity="warning",
+                    summary="Dashboard placeholder metrics query failed.",
+                    exc=exc,
+                    context={
+                        "table_name": table_name,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "user_id": user_id,
+                        "category_filter": category_filter or "",
+                    },
+                )
+                metrics = {}
         total_units = int(max(0, safe_int(metrics.get("total_units", 0), 0)))
         total_submissions = int(max(0, safe_int(metrics.get("total_submissions", 0), 0)))
         complete_count = int(max(0, safe_int(metrics.get("complete_count", 0), 0)))
@@ -2712,7 +2907,93 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             view.setTextElideMode(Qt.TextElideMode.ElideNone)
             view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-    def refresh_dashboard(self) -> None:
+    @staticmethod
+    def _dashboard_default_headers(tracker: DepotTracker, table_name: str) -> list[str]:
+        normalized_table = str(table_name or "").strip()
+        if normalized_table == "submissions":
+            return [
+                "id",
+                "created_at",
+                "user_id",
+                "work_order",
+                "touch",
+                "client_unit",
+                "entry_date",
+                "part_order_count",
+            ]
+        info_rows = tracker.db.fetchall(f"PRAGMA table_info({normalized_table})")
+        return [str(row["name"]) for row in info_rows if str(row["name"] or "").strip()]
+
+    @staticmethod
+    def _load_dashboard_payload(
+        tracker: DepotTracker,
+        *,
+        table_name: str,
+        limit: int,
+        start_date: str | None,
+        end_date: str | None,
+        user_id: str | None,
+        category_filter: str | None,
+        latest_workload_mix: bool,
+    ) -> dict[str, Any]:
+        normalized_table = str(table_name or "").strip()
+        allowed_tables = {name for name, _label in TRACKER_DASHBOARD_TABLES}
+        if normalized_table not in allowed_tables:
+            raise ValueError("Invalid dashboard table selection.")
+
+        rows_raw = tracker.fetch_dashboard_table_rows(
+            normalized_table,
+            limit=limit,
+            start_date=start_date,
+            end_date=end_date,
+            user_id=user_id,
+            category_filter=category_filter,
+        )
+        rows: list[dict[str, Any]] = []
+        headers: list[str] = []
+        for row in rows_raw:
+            row_dict = {str(name): row[name] for name in row.keys()}
+            if not headers:
+                headers = list(row_dict.keys())
+            rows.append(row_dict)
+        if not headers:
+            headers = DepotDashboardDialog._dashboard_default_headers(tracker, normalized_table)
+
+        category_options = tracker.dashboard_category_options()
+        user_rows = tracker.db.fetchall(
+            "SELECT DISTINCT TRIM(COALESCE(user_id, '')) AS user_id "
+            "FROM submissions WHERE TRIM(COALESCE(user_id, '')) <> '' "
+            "ORDER BY user_id COLLATE NOCASE ASC"
+        )
+        user_options = [str(row["user_id"] or "").strip() for row in user_rows if str(row["user_id"] or "").strip()]
+
+        metrics: dict[str, Any] = {}
+        if normalized_table == "submissions":
+            metrics = tracker.get_dashboard_metrics(
+                start_date=start_date,
+                end_date=end_date,
+                user_id=user_id,
+                category=category_filter,
+                include_latest_workload_mix=latest_workload_mix,
+            )
+
+        return {
+            "table_name": normalized_table,
+            "submissions_mode": normalized_table == "submissions",
+            "limit": int(limit),
+            "start_date": start_date,
+            "end_date": end_date,
+            "user_id": user_id or "",
+            "category_filter": category_filter or "",
+            "latest_workload_mix": bool(latest_workload_mix),
+            "headers": headers,
+            "rows": rows,
+            "category_options": category_options,
+            "user_options": user_options,
+            "metrics": metrics,
+        }
+
+    def refresh_dashboard(self, *, force: bool = False, reason: str = "") -> None:
         table_name = str(self.table_combo.currentData() or "").strip()
         if not table_name:
             return
@@ -2736,114 +3017,158 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         end_date: str | None = None
         user_id: str | None = None
         category_filter = self._current_dashboard_category_filter()
-        load_failed = False
 
         if submissions_mode:
             start_date, end_date, user_id = self._current_submission_filters()
 
-        app = QApplication.instance()
-        if app is not None:
-            app.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            try:
-                rows = self.app_window.depot_tracker.fetch_dashboard_table_rows(
-                    table_name,
-                    limit=limit,
-                    start_date=start_date,
-                    end_date=end_date,
-                    user_id=user_id,
-                    category_filter=category_filter,
-                )
-            except Exception as exc:
-                _runtime_log_event(
-                    "ui.depot_dashboard_query_failed",
-                    severity="error",
-                    summary="Dashboard table query failed.",
-                    exc=exc,
-                    context={
-                        "table": table_name,
-                        "limit": limit,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "user_id": user_id,
-                        "category_filter": category_filter or "",
-                    },
-                )
-                self._show_themed_message(
-                    QMessageBox.Icon.Critical,
-                    "Data load failed",
-                    f"Could not load table data:\n{type(exc).__name__}: {exc}",
-                )
-                self.empty_hint.setText("Could not load data. Details were logged for support.")
-                self.empty_hint.show()
-                configure_standard_table(self.table, [], stretch_last=True)
-                self.table.setRowCount(0)
-                self._refresh_table_placeholder(table_name, 0, start_date, end_date, user_id, category_filter)
-                load_failed = True
-
-            if not load_failed:
-                headers: list[str]
-                if rows:
-                    headers = [str(name) for name in rows[0].keys()]
-                else:
-                    if table_name == "submissions":
-                        headers = [
-                            "id",
-                            "created_at",
-                            "user_id",
-                            "work_order",
-                            "touch",
-                            "client_unit",
-                            "entry_date",
-                            "part_order_count",
-                        ]
-                    else:
-                        try:
-                            info_rows = self.app_window.depot_db.fetchall(f"PRAGMA table_info({table_name})")
-                        except Exception as exc:
-                            _runtime_log_event(
-                                "ui.depot_dashboard_schema_introspect_failed",
-                                severity="warning",
-                                summary="Dashboard could not read table schema for empty result set.",
-                                exc=exc,
-                                context={"table": table_name},
-                            )
-                            info_rows = []
-                        headers = [str(r["name"]) for r in info_rows] if info_rows else []
-
-                resize_modes: dict[int, QHeaderView.ResizeMode] = {}
-                if headers:
-                    for idx in range(len(headers)):
-                        resize_modes[idx] = QHeaderView.ResizeMode.ResizeToContents
-                    resize_modes[len(headers) - 1] = QHeaderView.ResizeMode.Stretch
-                configure_standard_table(self.table, headers, resize_modes=resize_modes, stretch_last=True)
-
-                self.table.setRowCount(len(rows))
-                for row_idx, row in enumerate(rows):
-                    for col_idx, col_name in enumerate(headers):
-                        raw_value = row[col_name]
-                        text = self._format_dashboard_cell_text(col_name, raw_value)
-                        item = QTableWidgetItem(text)
-                        item.setToolTip(text)
-                        self.table.setItem(row_idx, col_idx, item)
-                self._refresh_table_placeholder(table_name, len(rows), start_date, end_date, user_id, category_filter)
-
-                if not rows:
-                    self.empty_hint.setText("No rows in this table for the current row limit/filter.")
-                    self.empty_hint.show()
-                else:
-                    self.empty_hint.hide()
-        finally:
-            if app is not None:
-                app.restoreOverrideCursor()
-
-        if submissions_mode and not load_failed:
-            self._refresh_touch_distribution(start_date, end_date, user_id, category_filter)
+        latest_workload_mix = self._latest_workload_mix_enabled(user_id)
+        state_key = {
+            "table_name": table_name,
+            "limit": limit,
+            "start_date": start_date,
+            "end_date": end_date,
+            "user_id": user_id or "",
+            "category_filter": category_filter or "",
+            "latest_workload_mix": latest_workload_mix,
+        }
+        self._dashboard_loading = True
+        self.refresh_btn.setEnabled(False)
+        if self.table.rowCount() <= 0:
+            self.empty_hint.setText("Loading dashboard data...")
+            self.empty_hint.show()
+        if submissions_mode:
+            self.touch_bar.set_segments([])
+            self.touch_summary_label.setText("Loading dashboard metrics...")
+            self.touch_legend_label.setText("")
         else:
             self.touch_bar.set_segments([])
             self.touch_summary_label.setText("")
             self.touch_legend_label.setText("")
-        self.refresh_completed_parts()
+
+        def _loader(worker_tracker: DepotTracker) -> dict[str, Any]:
+            return DepotDashboardDialog._load_dashboard_payload(
+                worker_tracker,
+                table_name=table_name,
+                limit=limit,
+                start_date=start_date,
+                end_date=end_date,
+                user_id=user_id,
+                category_filter=category_filter,
+                latest_workload_mix=latest_workload_mix,
+            )
+
+        request = self.app_window.start_depot_read(
+            "dashboard_metrics",
+            state_key,
+            reason=reason or "dashboard-refresh",
+            force=force,
+            loader=_loader,
+            on_success=self._apply_dashboard_result,
+            on_error=self._handle_dashboard_error,
+        )
+        if request is None:
+            self._dashboard_loading = False
+            self.refresh_btn.setEnabled(True)
+            self.empty_hint.setText("Could not start dashboard load. Details were logged for support.")
+            self.empty_hint.show()
+
+    def _apply_dashboard_result(self, result: DepotLoadResult) -> None:
+        self._dashboard_loading = False
+        self._dashboard_has_loaded = True
+        self.refresh_btn.setEnabled(True)
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        table_name = str(payload.get("table_name", "") or "").strip()
+        if not table_name:
+            table_name = str(self.table_combo.currentData() or "").strip()
+        submissions_mode = bool(payload.get("submissions_mode", table_name == "submissions"))
+        start_date = str(payload.get("start_date") or "").strip() or None
+        end_date = str(payload.get("end_date") or "").strip() or None
+        user_id = str(payload.get("user_id") or "").strip() or None
+        category_filter = str(payload.get("category_filter") or "").strip() or None
+        category_options_raw = payload.get("category_options", [])
+        user_options_raw = payload.get("user_options", [])
+        category_options = category_options_raw if isinstance(category_options_raw, list) else []
+        user_options = user_options_raw if isinstance(user_options_raw, list) else []
+        self.submission_filters_wrap.setVisible(submissions_mode)
+        self.touch_summary_label.setVisible(submissions_mode)
+        self.touch_bar.setVisible(submissions_mode)
+        self.touch_legend_label.setVisible(submissions_mode)
+        self._apply_dashboard_category_filter_options([str(item) for item in category_options], category_filter or "")
+        if submissions_mode:
+            self._apply_submission_user_filter_options([str(item) for item in user_options], user_id or "")
+        self.refresh_combo_popup_width()
+
+        headers_raw = payload.get("headers", [])
+        headers = [str(name) for name in headers_raw] if isinstance(headers_raw, list) else []
+        rows_raw = payload.get("rows", [])
+        rows = [row for row in rows_raw if isinstance(row, dict)] if isinstance(rows_raw, list) else []
+        resize_modes: dict[int, QHeaderView.ResizeMode] = {}
+        if headers:
+            for idx in range(len(headers)):
+                resize_modes[idx] = QHeaderView.ResizeMode.ResizeToContents
+            resize_modes[len(headers) - 1] = QHeaderView.ResizeMode.Stretch
+        configure_standard_table(self.table, headers, resize_modes=resize_modes, stretch_last=True)
+
+        self.table.setRowCount(len(rows))
+        for row_idx, row in enumerate(rows):
+            for col_idx, col_name in enumerate(headers):
+                raw_value = row.get(col_name)
+                text = self._format_dashboard_cell_text(col_name, raw_value)
+                item = QTableWidgetItem(text)
+                item.setToolTip(text)
+                self.table.setItem(row_idx, col_idx, item)
+
+        metrics_raw = payload.get("metrics", {})
+        metrics = metrics_raw if isinstance(metrics_raw, dict) else {}
+        self._refresh_table_placeholder(
+            table_name,
+            len(rows),
+            start_date,
+            end_date,
+            user_id,
+            category_filter,
+            metrics=metrics,
+        )
+
+        if submissions_mode:
+            self._refresh_touch_distribution(start_date, end_date, user_id, category_filter, metrics=metrics)
+        else:
+            self.touch_bar.set_segments([])
+            self.touch_summary_label.setText("")
+            self.touch_legend_label.setText("")
+
+        if rows:
+            self.empty_hint.hide()
+        else:
+            self.empty_hint.setText("No rows in this table for the current row limit/filter.")
+            self.empty_hint.show()
+
+        if self._completed_loaded or self.results_tabs.currentWidget() is self.completed_tab:
+            self.refresh_completed_parts(reason="dashboard-refresh")
+        if self._notes_loaded or self.results_tabs.currentWidget() is self.notes_tab:
+            self.refresh_notes_rows(reason="dashboard-refresh")
+
+    def _handle_dashboard_error(self, result: DepotLoadResult) -> None:
+        self._dashboard_loading = False
+        self.refresh_btn.setEnabled(True)
+        _runtime_log_event(
+            "ui.depot_dashboard_query_failed",
+            severity="warning",
+            summary="Dashboard table query failed.",
+            context={
+                "error_type": result.error_type,
+                "error_message": result.error_message,
+                "view": result.request.view_key,
+                "reason": result.request.reason,
+                "state_key": result.request.state_key[:500],
+                "duration_ms": int(max(0.0, result.duration_ms)),
+            },
+        )
+        self.empty_hint.setText("Could not load dashboard data. Details were logged for support.")
+        self.empty_hint.show()
+        self.touch_bar.set_segments([])
+        self.touch_summary_label.setText("Dashboard metrics unavailable. Details were logged for support.")
+        self.touch_legend_label.setText("")
 
     def export_csv(self) -> None:
         table = self.table

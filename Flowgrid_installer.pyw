@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import sqlite3
 import struct
 import subprocess
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+import urllib.request
 
 APP_TITLE = "Flowgrid"
 CONFIG_FILENAME = "Flowgrid_config.json"
@@ -71,6 +72,9 @@ MANAGED_SHARED_ASSET_DIRS = (
     "Flowgrid Icons",
 )
 _FLOWGRID_PATHS_CONFIG: Optional[Dict[str, Any]] = None
+SSL_CA_FILE = ""
+SSL_CA_SOURCE = "system"
+SSL_CONTEXT: ssl.SSLContext | None = None
 
 
 def _normalize_channel_id(value: Any) -> str:
@@ -441,7 +445,89 @@ def log_installer_status(status_code: str, summary: str, details: str = "") -> N
         with get_installer_error_log_path().open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines))
     except Exception:
-        pass
+        try:
+            _safe_print(f"[INSTALLER STATUS] {status_code}: {summary}")
+            if details:
+                _safe_print(details)
+        except Exception:
+            pass
+
+
+def configure_ssl() -> ssl.SSLContext:
+    global SSL_CA_FILE, SSL_CA_SOURCE
+    try:
+        import certifi  # type: ignore[import-not-found]
+        cafile = str(certifi.where())
+        os.environ.setdefault("SSL_CERT_FILE", cafile)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", cafile)
+        SSL_CA_FILE = cafile
+        SSL_CA_SOURCE = "certifi"
+        return ssl.create_default_context(cafile=cafile)
+    except Exception as certifi_exc:
+        SSL_CA_FILE = ""
+        SSL_CA_SOURCE = "system"
+        try:
+            return ssl.create_default_context()
+        except Exception as exc:
+            log_installer_error(
+                "SSL_CONTEXT_FAILED",
+                "Failed creating SSL context for verified HTTPS downloads.",
+                (
+                    f"Reason: {type(exc).__name__}: {exc}\n"
+                    f"Certifi fallback reason: {type(certifi_exc).__name__}: {certifi_exc}"
+                ),
+            )
+            raise
+
+
+def _ssl_context() -> ssl.SSLContext:
+    global SSL_CONTEXT
+    if SSL_CONTEXT is None:
+        SSL_CONTEXT = configure_ssl()
+    return SSL_CONTEXT
+
+
+def _fetch_url_bytes(
+    url: str,
+    *,
+    headers: Dict[str, str] | None = None,
+    timeout_seconds: float = GITHUB_TIMEOUT_SECONDS,
+) -> bytes:
+    resolved_headers = headers or {}
+    requests_error: Exception | None = None
+    context = _ssl_context()
+    try:
+        import requests  # type: ignore[import-not-found]
+
+        response = requests.get(
+            url,
+            headers=resolved_headers,
+            timeout=timeout_seconds,
+            verify=SSL_CA_FILE or True,
+        )
+        response.raise_for_status()
+        return bytes(response.content)
+    except Exception as exc:
+        requests_error = exc
+
+    try:
+        request = urllib.request.Request(url, headers=resolved_headers)
+        with urllib.request.urlopen(request, context=context, timeout=timeout_seconds) as response:
+            return response.read()
+    except Exception as exc:
+        log_installer_error(
+            "NETWORK_DOWNLOAD_FAILED",
+            "Verified HTTPS request failed through requests and urllib.",
+            (
+                f"URL: {url}\n"
+                f"Transport: requests, urllib\n"
+                f"CA source: {SSL_CA_SOURCE}\n"
+                f"CA file: {SSL_CA_FILE}\n"
+                f"Requests error: {type(requests_error).__name__}: {requests_error}\n"
+                f"Urllib error: {type(exc).__name__}: {exc}"
+            ),
+        )
+        raise
 
 
 def check_python_version() -> Tuple[bool, str]:
@@ -730,10 +816,28 @@ def _find_default_shortcut_ico(paths: Dict[str, Path]) -> Path | None:
 def _prepare_shortcut_icon(paths: Dict[str, Path], launcher_path: Path) -> Path:
     ico_source = _find_default_shortcut_ico(paths)
     if ico_source is not None:
-        return ico_source
+        managed_icon_path = _managed_shortcut_icon_path(paths)
+        try:
+            managed_icon_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ico_source, managed_icon_path)
+            return managed_icon_path
+        except Exception as exc:
+            log_installer_status(
+                "SHORTCUT_ICON_COPY_FALLBACK",
+                "Falling back to generated or launcher icon because the managed shortcut ICO could not be copied.",
+                f"Source icon: {ico_source}\nTarget icon: {managed_icon_path}\nReason: {type(exc).__name__}: {exc}",
+            )
 
     icon_source = _find_default_wrench_icon(paths)
     if icon_source is None:
+        log_installer_status(
+            "SHORTCUT_ICON_MISSING",
+            "Falling back to the Python launcher icon because no Flowgrid shortcut icon source was found.",
+            (
+                f"Checked local Assets, shared Assets, and installer source Assets.\n"
+                f"Launcher icon: {launcher_path}"
+            ),
+        )
         return launcher_path
 
     try:
@@ -1348,18 +1452,14 @@ def safe_request(
     timeout_seconds: float = GITHUB_TIMEOUT_SECONDS,
     accept: str = GITHUB_API_ACCEPT,
 ) -> bytes:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": GITHUB_USER_AGENT,
-            "Accept": str(accept or "*/*"),
-        },
-    )
+    headers = {
+        "User-Agent": GITHUB_USER_AGENT,
+        "Accept": str(accept or "*/*"),
+    }
     last_error: Exception | None = None
     for attempt in range(1, GITHUB_RETRY_ATTEMPTS + 1):
         try:
-            with urlopen(request, timeout=timeout_seconds) as response:
-                return response.read()
+            return _fetch_url_bytes(url, headers=headers, timeout_seconds=timeout_seconds)
         except HTTPError:
             raise
         except Exception as exc:
@@ -1529,6 +1629,19 @@ def _write_bytes_atomic(target_path: Path, payload: bytes) -> Path:
         raise
 
 
+def safe_download(
+    url: str,
+    dest_path: str | Path,
+    headers: Dict[str, str] | None = None,
+    timeout: int | float = GITHUB_TIMEOUT_SECONDS,
+) -> Path:
+    accept = "application/octet-stream"
+    if isinstance(headers, dict) and str(headers.get("Accept") or "").strip():
+        accept = str(headers.get("Accept") or "").strip()
+    payload = safe_request(url, timeout_seconds=float(timeout), accept=accept)
+    return _write_bytes_atomic(Path(dest_path), payload)
+
+
 def download_file(
     remote_url: str,
     local_path: Path,
@@ -1539,11 +1652,25 @@ def download_file(
     try:
         resolved_payload = payload
         if resolved_payload is None:
-            resolved_payload = safe_request(
+            written_path = safe_download(
                 remote_url,
-                timeout_seconds=timeout_seconds,
-                accept="application/octet-stream",
+                local_path,
+                headers={
+                    "User-Agent": GITHUB_USER_AGENT,
+                    "Accept": "application/octet-stream",
+                },
+                timeout=timeout_seconds,
             )
+            try:
+                byte_count = written_path.stat().st_size
+            except Exception:
+                byte_count = 0
+            log_installer_status(
+                "DOWNLOAD_OK",
+                "Downloaded a repository file successfully.",
+                f"URL: {remote_url}\nPath: {written_path}\nBytes: {byte_count}",
+            )
+            return written_path
         written_path = _write_bytes_atomic(local_path, resolved_payload)
         log_installer_status(
             "DOWNLOAD_OK",
@@ -1594,12 +1721,7 @@ def _stage_repo_snapshot(remote_info: Dict[str, Any]) -> Tuple[Any, Path]:
         if not relative_path or not download_url:
             raise RuntimeError(f"Remote repository entry is missing path or download URL: {entry!r}")
         target_path = staging_root / Path(relative_path.replace("/", os.sep))
-        payload = safe_request(
-            download_url,
-            timeout_seconds=GITHUB_TIMEOUT_SECONDS,
-            accept="application/octet-stream",
-        )
-        download_file(download_url, target_path, timeout_seconds=GITHUB_TIMEOUT_SECONDS, payload=payload)
+        download_file(download_url, target_path, timeout_seconds=GITHUB_TIMEOUT_SECONDS)
 
     return temp_dir, staging_root
 
