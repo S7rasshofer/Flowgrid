@@ -51,6 +51,7 @@ from .popup_support import (
     _ensure_shell_window_available,
     _visible_flowgrid_shell_window,
     show_flowgrid_themed_input_item,
+    show_flowgrid_themed_input_text,
 )
 from .query_support import (
     _dedupe_part_detail_rows,
@@ -1072,6 +1073,26 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         category = self.work_category.currentText() if hasattr(self, "work_category") else ""
         client_unit = self.work_client_check.isChecked()
         comments = self.work_comments.text().strip()
+        serial_number = ""
+        if touch == DepotRules.TOUCH_JUNK:
+            serial_number, accepted = show_flowgrid_themed_input_text(
+                self,
+                self.app_window,
+                "agent",
+                "Junk Out Serial Number",
+                "Serial Number",
+                "",
+            )
+            serial_number = str(serial_number or "").strip().upper()
+            if not accepted:
+                return
+            if not serial_number:
+                self._show_themed_message(
+                    QMessageBox.Icon.Warning,
+                    "Serial Number Required",
+                    "Junk Out submissions require a serial number.",
+                )
+                return
 
         try:
             blocking_submission = self.tracker.get_blocking_work_submission(
@@ -1091,7 +1112,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 detail_text = " ".join(latest_bits).strip()
                 if latest_touch in DepotRules.CLOSING_TOUCHES:
                     guidance = (
-                        "Closing submissions cannot be removed from Recent submissions because they clear queue state."
+                        "Remove the closing submission from Recent submissions first if this needs to be corrected."
                     )
                 elif latest_user and latest_user != self.current_user:
                     guidance = f"The latest submission belongs to {latest_user} and must be corrected before a new work update is added."
@@ -1105,7 +1126,15 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                     f"This workorder has already been submitted as {latest_touch}.\n\n{guidance}",
                 )
                 return
-            self.tracker.submit_work(self.current_user, wo, touch, client_unit, comments, category)
+            self.tracker.submit_work(
+                self.current_user,
+                wo,
+                touch,
+                client_unit,
+                comments,
+                category,
+                serial_number=serial_number,
+            )
             self.work_order_input.clear()
             self.work_comments.clear()
             self.work_order_input.setFocus()
@@ -1196,7 +1225,10 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setWindowTitle("Remove Submission")
         dialog.setText(f"Remove the recent {touch} submission for {work_order or 'this work order'}?")
-        dialog.setInformativeText("This only removes your recent submission. Queue state cleanup rules still apply.")
+        if touch in DepotRules.CLOSING_TOUCHES:
+            dialog.setInformativeText("Removing a closing submission can reopen the latest closed parts row for this work order.")
+        else:
+            dialog.setInformativeText("This removes your recent submission and restores linked queue state when possible.")
         if self.styleSheet():
             dialog.setStyleSheet(self.styleSheet())
         remove_button = dialog.addButton("Remove Submission", QMessageBox.ButtonRole.YesRole)
@@ -1314,13 +1346,15 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             touch = str(row["touch"] or "").strip()
             category = category_map.get(DepotRules.normalize_work_order(wo), "") or str(row["category"] or "").strip() or "Other"
             client_marker = " | Client" if int(row["client_unit"] or 0) else ""
+            serial_number = str(row_payload.get("serial_number", "") or "").strip()
+            serial_marker = f" | SN {serial_number}" if serial_number else ""
             stamp = self._format_submission_stamp(str(row["latest_stamp"] or ""))
             if index <= len(self._recent_submission_row_widgets):
                 delete_btn, text_label = self._recent_submission_row_widgets[index - 1]
                 delete_btn.show()
                 delete_btn.setProperty("submissionId", submission_id)
                 delete_btn.setToolTip(f"Remove {wo} ({touch})")
-                text_label.setText(f"{index}. {wo} ({touch} | {category}{client_marker}) [{stamp}]")
+                text_label.setText(f"{index}. {wo} ({touch} | {category}{client_marker}{serial_marker}) [{stamp}]")
             rendered_rows.append(row_payload)
 
         for index in range(len(rows) + 1, 4):
@@ -2734,19 +2768,20 @@ class DepotAgentWindow(DepotFramelessToolWindow):
     ):
         if not hasattr(self, "client_followup_table"):
             return
-        state_key = {"user_id": self.current_user, "tech3": self._is_tech3_user}
+        client_scope = "all" if self._is_tech3_user else "own"
+        state_key = {"user_id": self.current_user, "client_scope": client_scope}
         if not self._should_refresh_depot_view("agent_client_followup", state_key, force=force, ttl_ms=ttl_ms, reason=reason):
             return
         started = time.monotonic()
         try:
-            rows = self.tracker.list_team_client_followups() if self._is_tech3_user else self.tracker.list_client_followups(self.current_user)
+            rows = self.tracker.list_client_followups(self.current_user, include_all=self._is_tech3_user)
         except Exception as exc:
             _runtime_log_event(
                 "ui.agent_client_followup_query_failed",
                 severity="warning",
                 summary="Failed loading agent client follow-up rows.",
                 exc=exc,
-                context={"user_id": str(self.current_user)},
+                context={"user_id": str(self.current_user), "client_scope": client_scope},
             )
             self.client_followup_table.setRowCount(0)
             self.client_due_summary.setText("Client follow-up unavailable. Details were logged.")

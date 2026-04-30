@@ -112,7 +112,7 @@ from .popup_support import (
     show_flowgrid_themed_open_file_name,
     show_flowgrid_themed_save_file_name,
 )
-from .table_support import _center_table_item, configure_standard_table
+from .table_support import _center_table_item, _selected_part_id_from_table, configure_standard_table
 
 class IconCropDialog(FlowgridThemedDialog):
     def __init__(self, image: QImage, app_window: "QuickInputsWindow" | None = None, parent: QWidget | None = None):
@@ -1780,9 +1780,10 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.completed_tab = QWidget(self.results_tabs)
         self.notes_tab = QWidget(self.results_tabs)
         self.results_tabs.addTab(self.list_tab, "List")
-        self.results_tabs.addTab(self.table_tab, "Table")
+        self.results_tabs.addTab(self.table_tab, "Chart")
         self.results_tabs.addTab(self.completed_tab, "Completed")
-        self.results_tabs.addTab(self.notes_tab, "Notes")
+        self.results_tabs.addTab(self.notes_tab, "Tables")
+        self.results_tabs.setCurrentWidget(self.table_tab)
         layout.addWidget(self.results_tabs, 1)
 
         list_layout = QVBoxLayout(self.list_tab)
@@ -1809,7 +1810,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         notes_layout.setContentsMargins(0, 0, 0, 0)
         notes_layout.setSpacing(4)
 
-        notes_intro = QLabel("Testing utility: edit note fields on existing rows.")
+        notes_intro = QLabel("Edit dashboard table rows and work-order notes.")
         notes_intro.setWordWrap(True)
         notes_intro.setProperty("muted", True)
         notes_layout.addWidget(notes_intro)
@@ -1817,7 +1818,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         notes_controls = QHBoxLayout()
         notes_controls.setContentsMargins(0, 0, 0, 0)
         notes_controls.setSpacing(6)
-        notes_controls.addWidget(QLabel("Field:"), 0)
+        notes_controls.addWidget(QLabel("Table:"), 0)
         self.notes_target_combo = QComboBox()
         self.notes_target_combo.setMinimumWidth(240)
         notes_controls.addWidget(self.notes_target_combo, 0)
@@ -1865,9 +1866,13 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         notes_actions = QHBoxLayout()
         notes_actions.setContentsMargins(0, 0, 0, 0)
         notes_actions.setSpacing(6)
-        self.notes_save_btn = QPushButton("Save Note")
+        self.notes_delete_btn = QPushButton("Delete Row")
+        self.notes_delete_btn.setProperty("actionRole", "reset")
+        self.notes_delete_btn.setEnabled(False)
+        self.notes_save_btn = QPushButton("Save")
         self.notes_save_btn.setProperty("actionRole", "save")
         self.notes_save_btn.setEnabled(False)
+        notes_actions.addWidget(self.notes_delete_btn, 0)
         notes_actions.addWidget(self.notes_save_btn, 0)
         self.notes_status_label = QLabel("")
         self.notes_status_label.setWordWrap(True)
@@ -1892,12 +1897,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_refresh_btn.clicked.connect(lambda _checked=False: self.refresh_notes_rows(force=True, reason="manual"))
         self.notes_table.itemSelectionChanged.connect(self._on_notes_selection_changed)
         self.notes_save_btn.clicked.connect(self._save_selected_note)
+        self.notes_delete_btn.clicked.connect(self._delete_selected_tables_row)
         self.results_tabs.currentChanged.connect(self._on_results_tab_changed)
 
         self._set_timeframe_key("current_week")
         self._populate_submission_user_filter()
         self._populate_dashboard_category_filter()
         self._populate_notes_targets()
+        self._on_notes_filter_changed()
         self.apply_theme_styles()
         self.refresh_combo_popup_width()
         QTimer.singleShot(0, lambda: self.refresh_dashboard(reason="window-open"))
@@ -1910,7 +1917,9 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             [
                 getattr(self, "notes_editor", None),
                 getattr(self, "notes_save_btn", None),
+                getattr(self, "notes_delete_btn", None),
                 getattr(self, "completed_open_notes_btn", None),
+                getattr(self, "completed_reopen_btn", None),
             ],
             "Dashboard note updates",
         )
@@ -2000,6 +2009,16 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
 
     def _on_notes_filter_changed(self) -> None:
         self._notes_loaded = False
+        target_key = str(self.notes_target_combo.currentData() or "").strip()
+        submissions_mode = self._notes_target_is_submissions(target_key)
+        if hasattr(self, "notes_editor"):
+            self.notes_editor.setVisible(not submissions_mode)
+        if hasattr(self, "notes_save_btn"):
+            self.notes_save_btn.setText("Save Row" if submissions_mode else "Save Note")
+            self.notes_save_btn.setEnabled(False)
+        if hasattr(self, "notes_delete_btn"):
+            self.notes_delete_btn.setVisible(submissions_mode)
+            self.notes_delete_btn.setEnabled(False)
         if self.results_tabs.currentWidget() is self.notes_tab:
             self.refresh_notes_rows(reason="notes-filter")
 
@@ -2173,8 +2192,11 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.completed_refresh_btn.setProperty("actionRole", "pick")
         self.completed_open_notes_btn = QPushButton("Open Notes / Flag")
         self.completed_open_notes_btn.setProperty("actionRole", "pick")
+        self.completed_reopen_btn = QPushButton("Reopen Parts")
+        self.completed_reopen_btn.setProperty("actionRole", "apply")
         controls.addWidget(self.completed_refresh_btn, 0)
         controls.addWidget(self.completed_open_notes_btn, 0)
+        controls.addWidget(self.completed_reopen_btn, 0)
         layout.addLayout(controls)
 
         self.completed_table = QTableWidget()
@@ -2208,6 +2230,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.completed_workorder_search.textChanged.connect(lambda _text: self._completed_search_timer.start())
         self.completed_refresh_btn.clicked.connect(lambda _checked=False: self.refresh_completed_parts(force=True, reason="manual"))
         self.completed_open_notes_btn.clicked.connect(self._open_selected_completed_notes)
+        self.completed_reopen_btn.clicked.connect(self._reopen_selected_completed_part)
 
     def _open_completed_notes_from_context(self, pos: QPoint) -> None:
         if not _select_table_row_by_context_pos(self.completed_table, pos):
@@ -2226,6 +2249,68 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         if not saved:
             return
         self.app_window._refresh_shared_linked_views("dashboard_completed", force=True, reason="dashboard_completed_note")
+
+    def _reopen_selected_completed_part(self) -> None:
+        if self._warn_if_read_only("Completed-part reopen"):
+            return
+        part_id = _selected_part_id_from_table(self.completed_table)
+        if part_id <= 0:
+            self._show_themed_message(
+                QMessageBox.Icon.Information,
+                "Reopen Parts",
+                "Select a completed part row first.",
+            )
+            return
+        work_order = ""
+        for item in self.completed_table.selectedItems():
+            if item.column() == 4:
+                work_order = str(item.text() or "").strip()
+                break
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Reopen Parts")
+        dialog.setText(f"Reopen {work_order or 'this work order'} into the active Part Order queue?")
+        dialog.setInformativeText("This creates a current Part Order submission and removes the selected row from Completed.")
+        if self.styleSheet():
+            dialog.setStyleSheet(self.styleSheet())
+        reopen_button = dialog.addButton("Reopen Parts", QMessageBox.ButtonRole.YesRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        if dialog.clickedButton() != reopen_button:
+            return
+        try:
+            result = self.app_window.depot_tracker.reopen_completed_part(part_id, self.app_window.current_user)
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.dashboard_completed_reopen_failed",
+                severity="warning",
+                summary="Failed reopening a dashboard completed part row.",
+                exc=exc,
+                context={"part_id": int(part_id), "user_id": str(self.app_window.current_user)},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Reopen Failed",
+                f"Could not reopen completed row:\n{type(exc).__name__}: {exc}",
+            )
+            return
+        reopened_work_order = str(result.get("work_order", "") or "").strip()
+        self.app_window._refresh_shared_linked_views(
+            "dashboard_completed",
+            "dashboard_metrics",
+            "agent_parts",
+            "agent_category",
+            "qa_assigned",
+            "qa_category",
+            "qa_owner",
+            "agent_client_followup",
+            "qa_client_followup",
+            force=True,
+            reason="dashboard_completed_reopen",
+        )
+        if hasattr(self, "completed_status_label"):
+            self.completed_status_label.setText(f"Reopened {reopened_work_order or 'selected row'} into active parts.")
 
     @staticmethod
     def _load_dashboard_completed_payload(
@@ -2418,7 +2503,44 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             },
         )
 
-    def _configure_notes_rows_table(self) -> None:
+    @staticmethod
+    def _notes_target_is_submissions(target_key: str) -> bool:
+        return str(target_key or "").strip() == "submissions.rows"
+
+    def _can_manage_dashboard_submissions(self) -> bool:
+        if self.is_read_only_mode():
+            return False
+        current_user = getattr(self.app_window, "current_user", "")
+        permission_service = getattr(getattr(self.app_window, "app_context", None), "permission_service", None)
+        if permission_service is not None:
+            return bool(permission_service.can_access_admin(current_user))
+        return bool(self.app_window.depot_tracker.is_admin_user(current_user))
+
+    @staticmethod
+    def _set_table_item_editable(item: QTableWidgetItem, editable: bool) -> QTableWidgetItem:
+        flags = item.flags()
+        if editable:
+            item.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
+        else:
+            item.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
+        return item
+
+    def _configure_notes_rows_table(self, target_key: str = "") -> None:
+        if self._notes_target_is_submissions(target_key):
+            headers = ["id", "created_at", "updated_at", "user_id", "work_order", "touch", "category", "client_unit", "entry_date"]
+            resize_modes = {
+                0: QHeaderView.ResizeMode.ResizeToContents,
+                1: QHeaderView.ResizeMode.ResizeToContents,
+                2: QHeaderView.ResizeMode.ResizeToContents,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.ResizeToContents,
+                7: QHeaderView.ResizeMode.ResizeToContents,
+                8: QHeaderView.ResizeMode.Stretch,
+            }
+            configure_standard_table(self.notes_table, headers, resize_modes=resize_modes, stretch_last=True)
+            return
         headers = ["id", "created_at", "user_id", "work_order", "note_preview"]
         resize_modes = {
             0: QHeaderView.ResizeMode.ResizeToContents,
@@ -2453,14 +2575,15 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         }
 
     def refresh_notes_rows(self, *, force: bool = False, reason: str = "") -> None:
-        self._configure_notes_rows_table()
         target_key = str(self.notes_target_combo.currentData() or "").strip()
+        self._configure_notes_rows_table(target_key)
         if not target_key:
             self.notes_table.setRowCount(0)
             self._notes_selected_row_id = None
             self.notes_editor.clear()
             self.notes_editor.setEnabled(False)
             self.notes_save_btn.setEnabled(False)
+            self.notes_delete_btn.setEnabled(False)
             self.notes_selected_label.setText("No editable note fields are currently available.")
             self.notes_status_label.setText("")
             self._notes_loading = False
@@ -2470,6 +2593,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         rows_limit = int(self.notes_limit_spin.value())
         work_order_filter = str(self.notes_work_order_filter.text() or "").strip()
         category_filter = self._current_dashboard_category_filter()
+        submissions_mode = self._notes_target_is_submissions(target_key)
         state_key = {
             "target_key": target_key,
             "rows_limit": rows_limit,
@@ -2480,8 +2604,12 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_refresh_btn.setEnabled(False)
         self._notes_selected_row_id = None
         self.notes_editor.clear()
+        self.notes_editor.setVisible(not submissions_mode)
         self.notes_editor.setEnabled(False)
+        self.notes_save_btn.setText("Save Row" if submissions_mode else "Save Note")
         self.notes_save_btn.setEnabled(False)
+        self.notes_delete_btn.setVisible(submissions_mode)
+        self.notes_delete_btn.setEnabled(False)
         self.notes_selected_label.setText("Select a row to edit.")
         self.notes_status_label.setText("Loading note rows...")
 
@@ -2509,18 +2637,44 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             self.notes_status_label.setText("Could not start note load. Details were logged for support.")
 
     def _apply_notes_rows_result(self, result: DepotLoadResult) -> None:
-        self._configure_notes_rows_table()
         self._notes_loading = False
         self._notes_loaded = True
         self.notes_refresh_btn.setEnabled(True)
         payload = result.payload if isinstance(result.payload, dict) else {}
+        target_key = str(payload.get("target_key", "") or "").strip()
+        self._configure_notes_rows_table(target_key)
+        submissions_mode = self._notes_target_is_submissions(target_key)
         rows_raw = payload.get("rows", [])
         rows = rows_raw if isinstance(rows_raw, list) else []
         self.notes_table.setRowCount(len(rows))
+        can_manage_submissions = self._can_manage_dashboard_submissions()
         for row_idx, row in enumerate(rows):
             if not isinstance(row, dict):
                 continue
             row_id = int(max(0, safe_int(row.get("id"), 0)))
+            if submissions_mode:
+                values = [
+                    str(row_id),
+                    self._normalize_dashboard_datetime(str(row.get("created_at", "") or "")),
+                    self._normalize_dashboard_datetime(str(row.get("updated_at", "") or "")),
+                    str(row.get("user_id", "") or "").strip(),
+                    str(row.get("work_order", "") or "").strip(),
+                    str(row.get("touch", "") or "").strip(),
+                    str(row.get("category", "") or "").strip(),
+                    str(int(max(0, safe_int(row.get("client_unit", 0), 0)))),
+                    str(row.get("entry_date", "") or "").strip(),
+                ]
+                for col_idx, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+                    if col_idx == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, row)
+                    self.notes_table.setItem(
+                        row_idx,
+                        col_idx,
+                        self._set_table_item_editable(item, can_manage_submissions and col_idx != 0),
+                    )
+                continue
             created_text = self._normalize_dashboard_datetime(str(row.get("created_at", "") or ""))
             user_text = str(row.get("user_id", "") or "").strip()
             work_order_text = str(row.get("work_order", "") or "").strip()
@@ -2530,29 +2684,33 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             id_item = QTableWidgetItem(str(row_id))
             id_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
             id_item.setData(Qt.ItemDataRole.UserRole, note_text)
-            self.notes_table.setItem(row_idx, 0, id_item)
+            self.notes_table.setItem(row_idx, 0, self._set_table_item_editable(id_item, False))
 
             created_item = QTableWidgetItem(created_text)
             created_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-            self.notes_table.setItem(row_idx, 1, created_item)
+            self.notes_table.setItem(row_idx, 1, self._set_table_item_editable(created_item, False))
 
             user_item = QTableWidgetItem(user_text)
             user_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-            self.notes_table.setItem(row_idx, 2, user_item)
+            self.notes_table.setItem(row_idx, 2, self._set_table_item_editable(user_item, False))
 
             work_order_item = QTableWidgetItem(work_order_text)
             work_order_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
-            self.notes_table.setItem(row_idx, 3, work_order_item)
+            self.notes_table.setItem(row_idx, 3, self._set_table_item_editable(work_order_item, False))
 
             preview_item = QTableWidgetItem(preview_text)
             preview_item.setToolTip(note_text if note_text else "(empty)")
-            self.notes_table.setItem(row_idx, 4, preview_item)
+            self.notes_table.setItem(row_idx, 4, self._set_table_item_editable(preview_item, False))
 
         self.notes_table.clearSelection()
         self._notes_selected_row_id = None
         self.notes_editor.clear()
+        self.notes_editor.setVisible(not submissions_mode)
         self.notes_editor.setEnabled(False)
+        self.notes_save_btn.setText("Save Row" if submissions_mode else "Save Note")
         self.notes_save_btn.setEnabled(False)
+        self.notes_delete_btn.setVisible(submissions_mode)
+        self.notes_delete_btn.setEnabled(False)
         self.notes_selected_label.setText("Select a row to edit.")
         self.notes_status_label.setText(f"Loaded {len(rows)} row(s).")
 
@@ -2580,11 +2738,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
 
     def _on_notes_selection_changed(self) -> None:
         selected_rows = self.notes_table.selectionModel().selectedRows() if self.notes_table.selectionModel() is not None else []
+        target_key = str(self.notes_target_combo.currentData() or "").strip()
+        submissions_mode = self._notes_target_is_submissions(target_key)
         if not selected_rows:
             self._notes_selected_row_id = None
             self.notes_editor.clear()
             self.notes_editor.setEnabled(False)
             self.notes_save_btn.setEnabled(False)
+            self.notes_delete_btn.setEnabled(False)
             self.notes_selected_label.setText("Select a row to edit.")
             return
 
@@ -2595,10 +2756,32 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             self.notes_editor.clear()
             self.notes_editor.setEnabled(False)
             self.notes_save_btn.setEnabled(False)
+            self.notes_delete_btn.setEnabled(False)
             self.notes_selected_label.setText("Select a row to edit.")
             return
 
         row_id = int(max(0, safe_int(id_item.text(), 0)))
+        if submissions_mode:
+            can_manage = self._can_manage_dashboard_submissions()
+            self._notes_selected_row_id = row_id if row_id > 0 else None
+            self.notes_editor.clear()
+            self.notes_editor.setVisible(False)
+            self.notes_editor.setEnabled(False)
+            self.notes_save_btn.setText("Save Row")
+            self.notes_save_btn.setEnabled(self._notes_selected_row_id is not None and can_manage)
+            self.notes_delete_btn.setVisible(True)
+            self.notes_delete_btn.setEnabled(self._notes_selected_row_id is not None and can_manage)
+            work_order_item = self.notes_table.item(row_idx, 4)
+            user_item = self.notes_table.item(row_idx, 3)
+            work_order_text = work_order_item.text().strip() if work_order_item is not None else ""
+            user_text = user_item.text().strip() if user_item is not None else ""
+            suffix = "" if can_manage else " Admin access is required to save or delete submissions."
+            self.notes_selected_label.setText(
+                f"Editing submission row #{row_id} | Work Order: {work_order_text or '(none)'} | User: {user_text or '(none)'}."
+                f" Edit cells directly, then Save Row.{suffix}"
+            )
+            self.notes_status_label.setText("")
+            return
         note_text = str(id_item.data(Qt.ItemDataRole.UserRole) or "")
         work_order_item = self.notes_table.item(row_idx, 3)
         user_item = self.notes_table.item(row_idx, 2)
@@ -2606,9 +2789,13 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         user_text = user_item.text().strip() if user_item is not None else ""
 
         self._notes_selected_row_id = row_id if row_id > 0 else None
+        self.notes_editor.setVisible(True)
         self.notes_editor.setEnabled(self._notes_selected_row_id is not None and not self.is_read_only_mode())
         self.notes_editor.setPlainText(note_text)
+        self.notes_save_btn.setText("Save Note")
         self.notes_save_btn.setEnabled(self._notes_selected_row_id is not None and not self.is_read_only_mode())
+        self.notes_delete_btn.setVisible(False)
+        self.notes_delete_btn.setEnabled(False)
         if self._notes_selected_row_id is not None:
             self.notes_selected_label.setText(
                 f"Editing row #{self._notes_selected_row_id} | Work Order: {work_order_text or '(none)'} | User: {user_text or '(none)'}"
@@ -2623,7 +2810,10 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         target_key = str(self.notes_target_combo.currentData() or "").strip()
         row_id = self._notes_selected_row_id
         if not target_key or row_id is None:
-            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a note row first.")
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a table row first.")
+            return
+        if self._notes_target_is_submissions(target_key):
+            self._save_selected_submission_row(row_id)
             return
 
         note_text = str(self.notes_editor.toPlainText() or "").strip()
@@ -2655,6 +2845,168 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
                 preview_item.setToolTip(note_text if note_text else "(empty)")
         self.notes_status_label.setText(f"Saved row #{row_id} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.")
         self.refresh_completed_parts(force=True, reason="notes-save")
+
+    def _current_submission_table_values(self, row_idx: int) -> dict[str, Any]:
+        values: dict[str, Any] = {}
+        columns = {
+            "created_at": 1,
+            "updated_at": 2,
+            "user_id": 3,
+            "work_order": 4,
+            "touch": 5,
+            "category": 6,
+            "client_unit": 7,
+            "entry_date": 8,
+        }
+        for key, col_idx in columns.items():
+            item = self.notes_table.item(row_idx, col_idx)
+            values[key] = item.text().strip() if item is not None else ""
+        return values
+
+    def _save_selected_submission_row(self, row_id: int) -> None:
+        if not self._can_manage_dashboard_submissions():
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Admin Access Required",
+                "Only administrators can edit submission rows from Dashboard Tables.",
+            )
+            return
+        row_idx = int(self.notes_table.currentRow())
+        if row_idx < 0:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a submission row first.")
+            return
+        values = self._current_submission_table_values(row_idx)
+        try:
+            updated = self.app_window.depot_tracker.update_dashboard_submission_row(
+                row_id,
+                values,
+                getattr(self.app_window, "current_user", ""),
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_submission_save_failed",
+                severity="error",
+                summary="Dashboard Tables failed saving a submission row.",
+                exc=exc,
+                context={"submission_id": int(row_id), "values": values},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Save failed",
+                f"Could not save submission row:\n{type(exc).__name__}: {exc}",
+            )
+            return
+        self.notes_status_label.setText(f"Saved submission #{row_id} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}.")
+        if isinstance(updated, dict):
+            row_values = [
+                str(int(max(0, safe_int(updated.get("id", row_id), row_id)))),
+                self._normalize_dashboard_datetime(str(updated.get("created_at", "") or values.get("created_at", ""))),
+                self._normalize_dashboard_datetime(str(updated.get("updated_at", "") or values.get("updated_at", ""))),
+                str(updated.get("user_id", "") or values.get("user_id", "")),
+                str(updated.get("work_order", "") or values.get("work_order", "")),
+                str(updated.get("touch", "") or values.get("touch", "")),
+                str(updated.get("category", "") or values.get("category", "")),
+                "1" if bool(updated.get("client_unit", False)) else "0",
+                str(updated.get("entry_date", "") or values.get("entry_date", "")),
+            ]
+            for col_idx, text in enumerate(row_values):
+                item = self.notes_table.item(row_idx, col_idx)
+                if item is not None:
+                    item.setText(text)
+        self.app_window._refresh_shared_linked_views(
+            "dashboard_metrics",
+            "dashboard_notes",
+            "agent_recent",
+            "agent_parts",
+            "agent_category",
+            "qa_recent",
+            "qa_assigned",
+            "qa_category",
+            force=True,
+            reason="dashboard_submission_save",
+        )
+
+    def _confirm_submission_row_delete(self, row_id: int, work_order: str, touch: str) -> bool:
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("Delete Submission")
+        dialog.setText(f"Delete submission #{row_id} for {work_order or 'this work order'}?")
+        dialog.setInformativeText(
+            f"Touch: {touch or '(none)'}\n\nThis can affect dashboard totals and linked workflow queues. Details will be logged."
+        )
+        if self.styleSheet():
+            dialog.setStyleSheet(self.styleSheet())
+        delete_button = dialog.addButton("Delete Row", QMessageBox.ButtonRole.YesRole)
+        dialog.addButton(QMessageBox.StandardButton.Cancel)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        dialog.exec()
+        return dialog.clickedButton() == delete_button
+
+    def _delete_selected_tables_row(self) -> None:
+        if self._warn_if_read_only("Dashboard table row deletion"):
+            return
+        target_key = str(self.notes_target_combo.currentData() or "").strip()
+        if not self._notes_target_is_submissions(target_key):
+            return
+        row_id = self._notes_selected_row_id
+        row_idx = int(self.notes_table.currentRow())
+        if row_id is None or row_idx < 0:
+            self._show_themed_message(QMessageBox.Icon.Warning, "Validation", "Select a submission row first.")
+            return
+        if not self._can_manage_dashboard_submissions():
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Admin Access Required",
+                "Only administrators can delete submission rows from Dashboard Tables.",
+            )
+            return
+        work_order_item = self.notes_table.item(row_idx, 4)
+        touch_item = self.notes_table.item(row_idx, 5)
+        work_order = work_order_item.text().strip() if work_order_item is not None else ""
+        touch = touch_item.text().strip() if touch_item is not None else ""
+        if not self._confirm_submission_row_delete(int(row_id), work_order, touch):
+            return
+        try:
+            result = self.app_window.depot_tracker.delete_dashboard_submission(
+                int(row_id),
+                getattr(self.app_window, "current_user", ""),
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.depot_dashboard_submission_delete_failed",
+                severity="error",
+                summary="Dashboard Tables failed deleting a submission row.",
+                exc=exc,
+                context={"submission_id": int(row_id), "work_order": work_order, "touch": touch},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Delete failed",
+                f"Could not delete submission row:\n{type(exc).__name__}: {exc}",
+            )
+            return
+        self.notes_table.removeRow(row_idx)
+        self._notes_selected_row_id = None
+        self.notes_save_btn.setEnabled(False)
+        self.notes_delete_btn.setEnabled(False)
+        self.notes_selected_label.setText("Select a row to edit.")
+        self.notes_status_label.setText(
+            f"Deleted submission #{int(row_id)} for {str(result.get('work_order', work_order) or work_order or 'work order')}."
+        )
+        self.app_window._refresh_shared_linked_views(
+            "dashboard_metrics",
+            "dashboard_notes",
+            "agent_recent",
+            "agent_parts",
+            "agent_category",
+            "agent_client_followup",
+            "qa_recent",
+            "qa_assigned",
+            "qa_category",
+            "qa_client_followup",
+            force=True,
+            reason="dashboard_submission_delete",
+        )
 
     def _touch_color(self, touch: str) -> str:
         normalized = str(touch or "").strip()

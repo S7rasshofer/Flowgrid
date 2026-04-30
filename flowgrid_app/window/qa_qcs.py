@@ -7,12 +7,13 @@ import csv
 import re
 import time
 
-from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtCore import QDate, QPoint, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
@@ -100,7 +101,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_tabs.addTab(self.qa_cat_parts_tab, "Cat Parts")
         self.qa_tabs.addTab(self.qa_client_tab, "Client Est.")
         self.qa_tabs.addTab(self.qa_rtv_tab, "RTV")
-        self.qa_tabs.addTab(self.client_jo_tab, "Client JO")
+        self.qa_tabs.addTab(self.client_jo_tab, "JO")
         if self._can_view_missing_po_tab:
             self.qa_tabs.addTab(self.missing_po_followup_tab, "Missing PO")
 
@@ -122,7 +123,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self._qa_tab_alert_states["rtv"] = False
         self._qa_tab_alert_ack_states["rtv"] = False
         self._qa_tab_indices["client_jo"] = int(self.qa_tabs.indexOf(self.client_jo_tab))
-        self._qa_tab_titles["client_jo"] = "Client JO"
+        self._qa_tab_titles["client_jo"] = "JO"
         self._qa_tab_alert_states["client_jo"] = False
         self._qa_tab_alert_ack_states["client_jo"] = False
         if self._can_view_missing_po_tab:
@@ -1735,7 +1736,7 @@ class DepotQAWindow(DepotFramelessToolWindow):
 
     def _build_qa_client_jo_tab(self) -> None:
         layout = QVBoxLayout(self.client_jo_tab)
-        summary = QLabel("Client-unit Junk Out queue sourced from the existing client_jo table.")
+        summary = QLabel("Junk Out review queue with serial numbers and client filters.")
         summary.setWordWrap(True)
         summary.setProperty("muted", True)
         layout.addWidget(summary)
@@ -1743,37 +1744,59 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_client_jo_table = QTableWidget()
         configure_standard_table(
             self.qa_client_jo_table,
-            ["Work Order", "Agent/User", "Logged At", "Comments"],
+            ["Work Order", "Client", "SN", "Agent/User", "Logged At", "Category", "Notes"],
             resize_modes={
                 0: QHeaderView.ResizeMode.ResizeToContents,
                 1: QHeaderView.ResizeMode.ResizeToContents,
                 2: QHeaderView.ResizeMode.ResizeToContents,
-                3: QHeaderView.ResizeMode.Stretch,
+                3: QHeaderView.ResizeMode.ResizeToContents,
+                4: QHeaderView.ResizeMode.ResizeToContents,
+                5: QHeaderView.ResizeMode.ResizeToContents,
+                6: QHeaderView.ResizeMode.Stretch,
             },
             stretch_last=True,
         )
         self.qa_client_jo_table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qa_client_jo_table.itemDoubleClicked.connect(lambda item: _copy_work_order_with_notice(self, item))
-        self.qa_client_jo_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.qa_client_jo_table.customContextMenuRequested.connect(
-            lambda pos: self._open_qa_client_jo_comment_from_context(pos)
-        )
 
         self.qa_client_jo_refresh = QPushButton("Refresh")
         self.qa_client_jo_refresh.clicked.connect(lambda: self._refresh_qa_client_jo_rows(force=True, reason="manual", ttl_ms=0))
-        self.qa_client_jo_open_notes_btn = QPushButton("Open Notes / Update Comment")
-        self.qa_client_jo_open_notes_btn.setProperty("actionRole", "pick")
-        self.qa_client_jo_open_notes_btn.clicked.connect(self._open_selected_qa_client_jo_comment)
         self.qa_client_jo_workorder_search = QLineEdit()
         self.qa_client_jo_workorder_search.setPlaceholderText("Search work order...")
         self.qa_client_jo_workorder_search.setClearButtonEnabled(True)
         self.qa_client_jo_workorder_search.textChanged.connect(lambda _text: self._qa_client_jo_search_timer.start())
+        self.qa_client_jo_client_filter = QComboBox()
+        self.qa_client_jo_client_filter.addItem("All", "all")
+        self.qa_client_jo_client_filter.addItem("Client", "client")
+        self.qa_client_jo_client_filter.addItem("Non-client", "non_client")
+        self.qa_client_jo_client_filter.currentIndexChanged.connect(
+            lambda _index: self._refresh_qa_client_jo_rows(reason="filter-change", ttl_ms=DEPOT_VIEW_TTL_MS)
+        )
+        self.qa_client_jo_start_date = QDateEdit()
+        self.qa_client_jo_start_date.setCalendarPopup(True)
+        self.qa_client_jo_start_date.setDisplayFormat("yyyy-MM-dd")
+        self.qa_client_jo_start_date.setDate(QDate.currentDate().addDays(-30))
+        self.qa_client_jo_start_date.dateChanged.connect(
+            lambda _date: self._refresh_qa_client_jo_rows(reason="date-filter", ttl_ms=DEPOT_VIEW_TTL_MS)
+        )
+        self.qa_client_jo_end_date = QDateEdit()
+        self.qa_client_jo_end_date.setCalendarPopup(True)
+        self.qa_client_jo_end_date.setDisplayFormat("yyyy-MM-dd")
+        self.qa_client_jo_end_date.setDate(QDate.currentDate())
+        self.qa_client_jo_end_date.dateChanged.connect(
+            lambda _date: self._refresh_qa_client_jo_rows(reason="date-filter", ttl_ms=DEPOT_VIEW_TTL_MS)
+        )
 
         controls = QHBoxLayout()
         controls.addWidget(QLabel("Work Order:"))
         controls.addWidget(self.qa_client_jo_workorder_search, 1)
+        controls.addWidget(QLabel("Client:"))
+        controls.addWidget(self.qa_client_jo_client_filter, 0)
+        controls.addWidget(QLabel("From:"))
+        controls.addWidget(self.qa_client_jo_start_date, 0)
+        controls.addWidget(QLabel("To:"))
+        controls.addWidget(self.qa_client_jo_end_date, 0)
         controls.addWidget(self.qa_client_jo_refresh)
-        controls.addWidget(self.qa_client_jo_open_notes_btn)
         layout.addLayout(controls)
         layout.addWidget(self.qa_client_jo_table)
 
@@ -1787,19 +1810,39 @@ class DepotQAWindow(DepotFramelessToolWindow):
         if not hasattr(self, "qa_client_jo_table"):
             return
         search_text = str(self.qa_client_jo_workorder_search.text() or "").strip() if hasattr(self, "qa_client_jo_workorder_search") else ""
-        state_key = {"search": search_text}
+        client_filter = (
+            str(self.qa_client_jo_client_filter.currentData() or "all")
+            if hasattr(self, "qa_client_jo_client_filter")
+            else "all"
+        )
+        start_date = (
+            self.qa_client_jo_start_date.date().toString("yyyy-MM-dd")
+            if hasattr(self, "qa_client_jo_start_date")
+            else ""
+        )
+        end_date = (
+            self.qa_client_jo_end_date.date().toString("yyyy-MM-dd")
+            if hasattr(self, "qa_client_jo_end_date")
+            else ""
+        )
+        state_key = {"search": search_text, "client_filter": client_filter, "start_date": start_date, "end_date": end_date}
         if not self._should_refresh_depot_view("qa_client_jo", state_key, force=force, ttl_ms=ttl_ms, reason=reason):
             return
         started = time.monotonic()
         try:
-            rows = self.tracker.list_client_jo_rows(search_text)
+            rows = self.tracker.list_junk_out_rows(
+                search_text,
+                client_filter=client_filter,
+                start_date=start_date,
+                end_date=end_date,
+            )
         except Exception as exc:
             _runtime_log_event(
                 "ui.qa_client_jo_refresh_failed",
                 severity="warning",
-                summary="Failed loading QA Client JO queue.",
+                summary="Failed loading QA JO queue.",
                 exc=exc,
-                context={"user_id": str(self.current_user)},
+                context={"user_id": str(self.current_user), "state_key": state_key},
             )
             self.qa_client_jo_table.setRowCount(0)
             return
@@ -1808,17 +1851,24 @@ class DepotQAWindow(DepotFramelessToolWindow):
             self.qa_client_jo_table.insertRow(row_idx)
             work_item = _center_table_item(QTableWidgetItem(str(row["work_order"] or "").strip()))
             work_item.setData(Qt.ItemDataRole.UserRole, int(row["id"] or 0))
+            client_item = _center_table_item(QTableWidgetItem("Yes" if int(max(0, safe_int(row["client_unit"], 0))) else "No"))
+            serial_item = _center_table_item(QTableWidgetItem(str(row["serial_number"] or "").strip() or "-"))
             user_item = _center_table_item(QTableWidgetItem(DepotRules.normalize_user_id(str(row["user_id"] or "")) or "-"))
-            logged_item = _center_table_item(QTableWidgetItem(format_working_updated_stamp(str(row["created_at"] or "").strip()) or "-"))
-            logged_item.setToolTip(str(row["created_at"] or "").strip())
+            logged_raw = str(row["updated_at"] or "").strip() or str(row["created_at"] or "").strip()
+            logged_item = _center_table_item(QTableWidgetItem(format_working_updated_stamp(logged_raw) or "-"))
+            logged_item.setToolTip(logged_raw)
+            category_item = _center_table_item(QTableWidgetItem(str(row["category"] or "").strip() or "-"))
             comment_text = str(row["comments"] or "").strip()
             comment_item = _center_table_item(QTableWidgetItem(note_preview(comment_text)))
             comment_item.setData(Qt.ItemDataRole.UserRole + 1, comment_text)
-            comment_item.setToolTip(f"Comments: {comment_text if comment_text else '(none)'}")
+            comment_item.setToolTip(f"Notes: {comment_text if comment_text else '(none)'}")
             self.qa_client_jo_table.setItem(row_idx, 0, work_item)
-            self.qa_client_jo_table.setItem(row_idx, 1, user_item)
-            self.qa_client_jo_table.setItem(row_idx, 2, logged_item)
-            self.qa_client_jo_table.setItem(row_idx, 3, comment_item)
+            self.qa_client_jo_table.setItem(row_idx, 1, client_item)
+            self.qa_client_jo_table.setItem(row_idx, 2, serial_item)
+            self.qa_client_jo_table.setItem(row_idx, 3, user_item)
+            self.qa_client_jo_table.setItem(row_idx, 4, logged_item)
+            self.qa_client_jo_table.setItem(row_idx, 5, category_item)
+            self.qa_client_jo_table.setItem(row_idx, 6, comment_item)
         self._mark_depot_view_refreshed(
             "qa_client_jo",
             state_key,

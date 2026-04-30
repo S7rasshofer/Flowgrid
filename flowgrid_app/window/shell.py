@@ -163,6 +163,7 @@ from .quick_designer import (
     LEGACY_DEFAULT_THEME_ACCENT,
     LEGACY_DEFAULT_THEME_PRIMARY,
     LEGACY_DEFAULT_THEME_SURFACE,
+    PREVIOUS_THEME_PRESETS,
     QuickButtonCard,
     QuickButtonCanvas,
     QuickLayoutDialog,
@@ -523,7 +524,7 @@ class QuickInputsWindow(QMainWindow):
                             "image_path": old_path,
                             "image_x": data.get("theme_image_x", 0),
                             "image_y": data.get("theme_image_y", 0),
-                            "image_scale_mode": data.get("theme_image_scale_mode", "Fill"),
+                            "image_scale_mode": data.get("theme_image_scale_mode", "Fit"),
                             "image_anchor": data.get("theme_image_anchor", "Center"),
                             "image_scale_percent": data.get("theme_image_scale_percent", 100),
                         }
@@ -558,6 +559,22 @@ class QuickInputsWindow(QMainWindow):
         if not merged["theme_presets"]:
             merged["theme_presets"] = deep_clone(DEFAULT_THEME_PRESETS)
 
+        def _normalized_theme_triplet(raw_theme: dict[str, Any]) -> dict[str, str]:
+            return {
+                "primary": normalize_hex(raw_theme.get("primary", DEFAULT_THEME_PRIMARY), DEFAULT_THEME_PRIMARY),
+                "accent": normalize_hex(raw_theme.get("accent", DEFAULT_THEME_ACCENT), DEFAULT_THEME_ACCENT),
+                "surface": normalize_hex(raw_theme.get("surface", DEFAULT_THEME_SURFACE), DEFAULT_THEME_SURFACE),
+            }
+
+        for preset_name, default_preset in DEFAULT_THEME_PRESETS.items():
+            existing_preset = merged["theme_presets"].get(preset_name)
+            previous_preset = PREVIOUS_THEME_PRESETS.get(preset_name)
+            if not isinstance(existing_preset, dict):
+                merged["theme_presets"][preset_name] = deep_clone(default_preset)
+                continue
+            if isinstance(previous_preset, dict) and _normalized_theme_triplet(existing_preset) == _normalized_theme_triplet(previous_preset):
+                merged["theme_presets"][preset_name] = deep_clone(default_preset)
+
         legacy_default_theme = {
             "primary": LEGACY_DEFAULT_THEME_PRIMARY,
             "accent": LEGACY_DEFAULT_THEME_ACCENT,
@@ -579,6 +596,13 @@ class QuickInputsWindow(QMainWindow):
             selected_preset = "Default"
         if selected_preset == "Default" and merged.get("theme", {}) == legacy_default_theme:
             merged["theme"] = deep_clone(DEFAULT_THEME_PRESETS["Default"])
+        previous_selected_preset = PREVIOUS_THEME_PRESETS.get(selected_preset)
+        if (
+            isinstance(previous_selected_preset, dict)
+            and selected_preset in DEFAULT_THEME_PRESETS
+            and _normalized_theme_triplet(merged.get("theme", {})) == _normalized_theme_triplet(previous_selected_preset)
+        ):
+            merged["theme"] = deep_clone(DEFAULT_THEME_PRESETS[selected_preset])
 
         if merged.get("selected_theme_preset") not in merged["theme_presets"]:
             merged["selected_theme_preset"] = next(iter(merged["theme_presets"].keys()))
@@ -834,7 +858,7 @@ class QuickInputsWindow(QMainWindow):
             return None
 
         target_rect = QRectF(0, 0, float(size.width()), float(size.height()))
-        mode = str(layer.get("image_scale_mode", "Fill"))
+        mode = str(layer.get("image_scale_mode", "Fit"))
         anchor = str(layer.get("image_anchor", "Center"))
         scale_percent = int(clamp(int(layer.get("image_scale_percent", 100)), 10, 400)) / 100.0
         img_w = float(pixmap.width())
@@ -1683,7 +1707,8 @@ class QuickInputsWindow(QMainWindow):
         self.quick_editor_dialog.setObjectName("QuickEditorDialog")
         self.quick_editor_dialog.setWindowTitle("Edit Quick Button")
         self.quick_editor_dialog.setModal(False)
-        self.quick_editor_dialog.resize(430, 580)
+        self.quick_editor_dialog.setMinimumSize(390, 320)
+        self.quick_editor_dialog.resize(430, 390)
         self.quick_editor_dialog.apply_theme_styles(force_opaque_root=True)
 
         editor_layout = QVBoxLayout(self.quick_editor_dialog)
@@ -1938,6 +1963,62 @@ class QuickInputsWindow(QMainWindow):
         )
         layout.addWidget(self.popup_auto_reinherit_check)
 
+        defaults_title = QLabel("Popup Control Defaults")
+        defaults_title.setProperty("section", True)
+        layout.addWidget(defaults_title)
+
+        defaults_form = QFormLayout()
+        defaults_form.setContentsMargins(0, 0, 0, 0)
+        defaults_form.setSpacing(6)
+
+        self.main_control_style_combo = QComboBox()
+        self.main_control_style_combo.addItems(["Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"])
+        self.main_control_style_combo.setToolTip("Default fill style used by popup controls that inherit Flowgrid theme settings.")
+        defaults_form.addRow("Fill Style", self.main_control_style_combo)
+
+        self.main_control_fade_slider = QSlider(Qt.Orientation.Horizontal)
+        self.main_control_fade_slider.setRange(0, 100)
+        self.main_control_fade_slider.setToolTip("Default strength for inherited popup control gradients.")
+        self.main_control_fade_value = QLabel("65%")
+        self.main_control_fade_value.setToolTip(self.main_control_fade_slider.toolTip())
+        fade_row = QHBoxLayout()
+        fade_row.setContentsMargins(0, 0, 0, 0)
+        fade_row.setSpacing(4)
+        fade_row.addWidget(self.main_control_fade_slider, 1)
+        fade_row.addWidget(self.main_control_fade_value, 0)
+        fade_wrap = QWidget()
+        fade_wrap.setLayout(fade_row)
+        defaults_form.addRow("Fade", fade_wrap)
+
+        self.main_control_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.main_control_opacity_slider.setRange(0, 100)
+        self.main_control_opacity_slider.setToolTip("Default opacity for controls in popups that inherit Flowgrid theme settings.")
+        self.main_control_opacity_value = QLabel("82%")
+        self.main_control_opacity_value.setToolTip(self.main_control_opacity_slider.toolTip())
+        opacity_row = QHBoxLayout()
+        opacity_row.setContentsMargins(0, 0, 0, 0)
+        opacity_row.setSpacing(4)
+        opacity_row.addWidget(self.main_control_opacity_slider, 1)
+        opacity_row.addWidget(self.main_control_opacity_value, 0)
+        opacity_wrap = QWidget()
+        opacity_wrap.setLayout(opacity_row)
+        defaults_form.addRow("Opacity", opacity_wrap)
+
+        self.main_control_tail_opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.main_control_tail_opacity_slider.setRange(0, 100)
+        self.main_control_tail_opacity_slider.setToolTip("Default opacity at the faded end of inherited popup control gradients.")
+        self.main_control_tail_opacity_value = QLabel("0%")
+        self.main_control_tail_opacity_value.setToolTip(self.main_control_tail_opacity_slider.toolTip())
+        tail_row = QHBoxLayout()
+        tail_row.setContentsMargins(0, 0, 0, 0)
+        tail_row.setSpacing(4)
+        tail_row.addWidget(self.main_control_tail_opacity_slider, 1)
+        tail_row.addWidget(self.main_control_tail_opacity_value, 0)
+        tail_wrap = QWidget()
+        tail_wrap.setLayout(tail_row)
+        defaults_form.addRow("End Opacity", tail_wrap)
+
+        layout.addLayout(defaults_form)
         layout.addStretch(1)
 
         self.theme_preset_combo.currentTextChanged.connect(self.on_theme_preset_selected)
@@ -1947,6 +2028,10 @@ class QuickInputsWindow(QMainWindow):
         self.image_layers_btn.clicked.connect(lambda _checked=False: self.open_image_layers_dialog("main"))
         self.theme_transparent_bg_check.toggled.connect(self.on_theme_page_background_option_changed)
         self.popup_auto_reinherit_check.toggled.connect(self.on_popup_auto_reinherit_changed)
+        self.main_control_style_combo.currentTextChanged.connect(lambda _text: self.on_main_popup_control_changed())
+        self.main_control_fade_slider.valueChanged.connect(lambda _value: self.on_main_popup_control_changed())
+        self.main_control_opacity_slider.valueChanged.connect(lambda _value: self.on_main_popup_control_changed())
+        self.main_control_tail_opacity_slider.valueChanged.connect(lambda _value: self.on_main_popup_control_changed())
         return page
 
     def _build_agent_theme_tab(self) -> QWidget:
@@ -2375,7 +2460,7 @@ class QuickInputsWindow(QMainWindow):
         main_tab_bar = self.settings_tabs.tabBar()
         main_tab_bar.setObjectName("SettingsMainTabBar")
         main_tab_bar.setElideMode(Qt.TextElideMode.ElideNone)
-        self.settings_tabs.addTab(self._build_app_settings_tab(), "App Settings")
+        self.settings_tabs.addTab(self._wrap_scrollable_page(self._build_app_settings_tab()), "Settings")
         self.settings_tabs.addTab(self._build_theme_page(), "Themes")
         self.settings_tabs.setTabIcon(0, self._resolve_standard_icon("SP_FileDialogDetailedView", "SP_FileIcon"))
         self.settings_tabs.setTabIcon(1, self._resolve_standard_icon("SP_DirOpenIcon", "SP_FileIcon"))
@@ -3994,6 +4079,19 @@ class QuickInputsWindow(QMainWindow):
             self.editor_urls.setEnabled(False)
             self.editor_browser_combo.setEnabled(False)
             self.editor_refresh_browsers_button.setEnabled(False)
+        self._resize_quick_editor_for_action(action)
+
+    def _resize_quick_editor_for_action(self, action: str) -> None:
+        if not hasattr(self, "quick_editor_dialog"):
+            return
+        desired_height = {
+            "paste_text": 350,
+            "input_sequence": 390,
+            "macro_sequence": 390,
+            "open_app": 410,
+            "open_url": 410,
+        }.get(str(action or "").strip(), 390)
+        self.quick_editor_dialog.resize(max(430, int(self.quick_editor_dialog.width())), desired_height)
 
     def browse_quick_apps(self) -> None:
         action = str(self.editor_action_combo.currentData() or "paste_text")
@@ -4275,6 +4373,7 @@ class QuickInputsWindow(QMainWindow):
         self.popup_auto_reinherit_check.blockSignals(True)
         self.popup_auto_reinherit_check.setChecked(bool(self.config.get("popup_auto_reinherit_enabled", True)))
         self.popup_auto_reinherit_check.blockSignals(False)
+        self._refresh_main_popup_control_defaults()
 
         self._refresh_popup_theme_tab("agent")
         self._refresh_popup_theme_tab("qa")
@@ -4299,6 +4398,70 @@ class QuickInputsWindow(QMainWindow):
         self.refresh_all_views()
         self.queue_save_config()
         self._refresh_popup_themes()
+
+    def _refresh_main_popup_control_defaults(self) -> None:
+        style_combo = getattr(self, "main_control_style_combo", None)
+        fade_slider = getattr(self, "main_control_fade_slider", None)
+        opacity_slider = getattr(self, "main_control_opacity_slider", None)
+        tail_slider = getattr(self, "main_control_tail_opacity_slider", None)
+        if style_combo is None or fade_slider is None or opacity_slider is None or tail_slider is None:
+            return
+
+        style = str(self.config.get("popup_control_style", "Fade Left to Right") or "Fade Left to Right").strip()
+        if style not in {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}:
+            style = "Fade Left to Right"
+        style_combo.blockSignals(True)
+        style_index = style_combo.findText(style)
+        style_combo.setCurrentIndex(style_index if style_index >= 0 else 1)
+        style_combo.blockSignals(False)
+
+        values = (
+            (fade_slider, getattr(self, "main_control_fade_value", None), "popup_control_fade_strength", 65),
+            (opacity_slider, getattr(self, "main_control_opacity_value", None), "popup_control_opacity", 82),
+            (tail_slider, getattr(self, "main_control_tail_opacity_value", None), "popup_control_tail_opacity", 0),
+        )
+        for slider, value_label, config_key, default_value in values:
+            numeric_value = int(clamp(safe_int(self.config.get(config_key, default_value), default_value), 0, 100))
+            slider.blockSignals(True)
+            slider.setValue(numeric_value)
+            slider.blockSignals(False)
+            if value_label is not None:
+                value_label.setText(f"{numeric_value}%")
+
+    def on_main_popup_control_changed(self) -> None:
+        style_combo = getattr(self, "main_control_style_combo", None)
+        fade_slider = getattr(self, "main_control_fade_slider", None)
+        opacity_slider = getattr(self, "main_control_opacity_slider", None)
+        tail_slider = getattr(self, "main_control_tail_opacity_slider", None)
+        if style_combo is None or fade_slider is None or opacity_slider is None or tail_slider is None:
+            return
+
+        style = str(style_combo.currentText() or "Fade Left to Right").strip()
+        if style not in {"Solid", "Fade Left to Right", "Fade Right to Left", "Fade Center Out"}:
+            style = "Fade Left to Right"
+        fade_value = int(clamp(int(fade_slider.value()), 0, 100))
+        opacity_value = int(clamp(int(opacity_slider.value()), 0, 100))
+        tail_value = int(clamp(int(tail_slider.value()), 0, 100))
+
+        self.config["popup_control_style"] = style
+        self.config["popup_control_fade_enabled"] = style != "Solid"
+        self.config["popup_control_fade_strength"] = fade_value
+        self.config["popup_control_opacity"] = opacity_value
+        self.config["popup_control_tail_opacity"] = tail_value
+
+        if hasattr(self, "main_control_fade_value"):
+            self.main_control_fade_value.setText(f"{fade_value}%")
+        if hasattr(self, "main_control_opacity_value"):
+            self.main_control_opacity_value.setText(f"{opacity_value}%")
+        if hasattr(self, "main_control_tail_opacity_value"):
+            self.main_control_tail_opacity_value.setText(f"{tail_value}%")
+
+        self._refresh_popup_theme_tab("agent")
+        self._refresh_popup_theme_tab("qa")
+        self._refresh_popup_theme_tab("admin")
+        self._refresh_popup_theme_tab("dashboard")
+        self._refresh_popup_themes()
+        self.queue_save_config()
 
     def _popup_control_fill_css(self, kind: str, popup_theme: dict[str, Any], field_bg: str) -> str:
         style = str(popup_theme.get("control_style", "Fade Left to Right") or "Fade Left to Right").strip()

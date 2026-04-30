@@ -668,6 +668,7 @@ class DepotSchema:
                     category TEXT NOT NULL DEFAULT '',
                     client_unit INTEGER NOT NULL DEFAULT 0,
                     entry_date TEXT NOT NULL,
+                    serial_number TEXT NOT NULL DEFAULT '',
                     part_order_count INTEGER NOT NULL DEFAULT 0
                 )
                 """
@@ -852,6 +853,7 @@ class DepotSchema:
             db._ensure_column("agents", "icon_path", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("submissions", "category", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("submissions", "updated_at", "TEXT NOT NULL DEFAULT ''")
+            db._ensure_column("submissions", "serial_number", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "admin_name", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "position", "TEXT NOT NULL DEFAULT ''")
             db._ensure_column("admin_users", "location", "TEXT NOT NULL DEFAULT ''")
@@ -969,7 +971,8 @@ class DepotSchema:
                     {_submission_latest_ts_sql()} AS latest_stamp,
                     COALESCE(touch, '') AS touch,
                     COALESCE(category, '') AS category,
-                    COALESCE(client_unit, 0) AS client_unit
+                    COALESCE(client_unit, 0) AS client_unit,
+                    COALESCE(serial_number, '') AS serial_number
                 FROM submissions
                 WHERE entry_date=? AND user_id=? AND work_order=?
                 ORDER BY created_at ASC, id ASC
@@ -990,13 +993,14 @@ class DepotSchema:
             latest_stamp = str(latest_row["latest_stamp"] or latest_row["created_at"] or "").strip()
             cursor.execute(
                 "UPDATE submissions "
-                "SET touch=?, category=?, client_unit=?, updated_at=? "
+                "SET touch=?, category=?, client_unit=?, updated_at=?, serial_number=? "
                 "WHERE id=?",
                 (
                     str(latest_row["touch"] or "").strip(),
                     str(latest_row["category"] or "").strip(),
                     int(max(0, safe_int(latest_row["client_unit"], 0))),
                     latest_stamp,
+                    str(latest_row["serial_number"] or "").strip().upper(),
                     keep_id,
                 ),
             )
@@ -1095,6 +1099,14 @@ class DepotSchema:
 
 class DepotTracker:
     DASHBOARD_NOTE_TARGET_SPECS: dict[str, dict[str, Any]] = {
+        "submissions.rows": {
+            "label": "Submissions - Rows",
+            "table": "submissions",
+            "column": "",
+            "order_by": f"{_submission_latest_ts_sql()} DESC, id DESC",
+            "mode": "submission_rows",
+            "sync_comments_with_column": False,
+        },
         "parts.qa_comment": {
             "label": "Parts - QA Note",
             "table": "parts",
@@ -1461,6 +1473,12 @@ class DepotTracker:
         category_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         spec = self._dashboard_note_target_spec(target_key)
+        if str(spec.get("mode", "") or "").strip() == "submission_rows":
+            return self.fetch_dashboard_submission_rows(
+                limit=limit,
+                work_order_filter=work_order_filter,
+                category_filter=category_filter,
+            )
         table_name = str(spec.get("table", "")).strip()
         column_name = str(spec.get("column", "")).strip()
         order_by = str(spec.get("order_by", "id DESC")).strip() or "id DESC"
@@ -1502,8 +1520,55 @@ class DepotTracker:
             )
         return result
 
+    def fetch_dashboard_submission_rows(
+        self,
+        *,
+        limit: int = 200,
+        work_order_filter: str | None = None,
+        category_filter: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where_parts: list[str] = []
+        params: list[Any] = []
+        normalized_work_order = DepotRules.normalize_work_order(str(work_order_filter or ""))
+        if normalized_work_order:
+            where_parts.append("UPPER(COALESCE(s0.work_order, '')) LIKE ?")
+            params.append(f"%{normalized_work_order}%")
+        self._append_dashboard_category_filter(
+            where_parts,
+            params,
+            category_filter,
+            self._dashboard_resolved_category_expr("s0.work_order"),
+        )
+        where_clause = f" WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        max_rows = int(clamp(safe_int(limit, 200), 1, 5000))
+        params.append(max_rows)
+        rows = self.db.fetchall(
+            "SELECT s0.id, COALESCE(s0.created_at, '') AS created_at, COALESCE(s0.updated_at, '') AS updated_at, "
+            "COALESCE(s0.user_id, '') AS user_id, COALESCE(s0.work_order, '') AS work_order, "
+            "COALESCE(s0.touch, '') AS touch, COALESCE(s0.category, '') AS category, "
+            "COALESCE(s0.client_unit, 0) AS client_unit, COALESCE(s0.entry_date, '') AS entry_date "
+            f"FROM submissions s0{where_clause} ORDER BY {_submission_latest_ts_sql('s0')} DESC, s0.id DESC LIMIT ?",
+            tuple(params),
+        )
+        return [
+            {
+                "id": int(max(0, safe_int(row["id"], 0))),
+                "created_at": str(row["created_at"] or "").strip(),
+                "updated_at": str(row["updated_at"] or "").strip(),
+                "user_id": DepotRules.normalize_user_id(str(row["user_id"] or "")),
+                "work_order": DepotRules.normalize_work_order(str(row["work_order"] or "")),
+                "touch": str(row["touch"] or "").strip(),
+                "category": str(row["category"] or "").strip(),
+                "client_unit": int(max(0, safe_int(row["client_unit"], 0))),
+                "entry_date": str(row["entry_date"] or "").strip(),
+            }
+            for row in rows
+        ]
+
     def update_dashboard_note_value(self, target_key: str, row_id: int, note_text: str) -> None:
         spec = self._dashboard_note_target_spec(target_key)
+        if str(spec.get("mode", "") or "").strip() == "submission_rows":
+            raise ValueError("Submission rows use the table row editor.")
         table_name = str(spec.get("table", "")).strip()
         column_name = str(spec.get("column", "")).strip()
         if not table_name or not column_name:
@@ -1525,6 +1590,166 @@ class DepotTracker:
             f"UPDATE {table_name} SET {column_name}=? WHERE id=?",
             (normalized_note, normalized_row_id),
         )
+
+    def _require_dashboard_submission_admin(self, actor_user_id: str) -> str:
+        actor = DepotRules.normalize_user_id(actor_user_id)
+        if not actor:
+            raise PermissionDeniedError("A valid administrator is required.")
+        if self.permission_service is not None:
+            self.permission_service.require_admin_access(actor)
+        elif not self.is_admin_user(actor):
+            raise PermissionDeniedError(PermissionService.ADMIN_ACCESS_DENIED_MESSAGE)
+        return actor
+
+    def update_dashboard_submission_row(self, submission_id: int, values: dict[str, Any], actor_user_id: str) -> dict[str, Any]:
+        actor = self._require_dashboard_submission_admin(actor_user_id)
+        target_id = int(max(0, safe_int(submission_id, 0)))
+        if target_id <= 0:
+            raise ValueError("A valid submission row is required.")
+        existing = self.get_submission_record(target_id)
+        if existing is None:
+            raise ValueError("Selected submission row no longer exists.")
+
+        linked_parts_count_row = self.db.fetchone(
+            "SELECT COUNT(*) AS c FROM parts WHERE COALESCE(source_submission_id, 0)=?",
+            (target_id,),
+        )
+        linked_parts_count = int(max(0, safe_int(linked_parts_count_row["c"], 0))) if linked_parts_count_row is not None else 0
+        old_work_order = DepotRules.normalize_work_order(str(existing.get("work_order", "") or ""))
+        old_touch = str(existing.get("touch", "") or "").strip()
+
+        created_at = str(values.get("created_at", existing.get("created_at", "")) or "").strip()
+        updated_at = str(values.get("updated_at", "") or "").strip() or datetime.now().isoformat(timespec="seconds")
+        user_id = DepotRules.normalize_user_id(str(values.get("user_id", existing.get("user_id", "")) or ""))
+        work_order = DepotRules.normalize_work_order(str(values.get("work_order", existing.get("work_order", "")) or ""))
+        touch = str(values.get("touch", existing.get("touch", "")) or "").strip()
+        category = str(values.get("category", existing.get("category", "")) or "").strip()
+        client_unit = 1 if str(values.get("client_unit", existing.get("client_unit", 0)) or "").strip().lower() in {"1", "true", "yes", "y", "on"} else 0
+        entry_date = str(values.get("entry_date", existing.get("entry_date", "")) or "").strip()
+        if not entry_date and len(created_at) >= 10:
+            entry_date = created_at[:10]
+
+        if not created_at:
+            raise ValueError("created_at is required.")
+        if not user_id:
+            raise ValueError("user_id is required.")
+        if not work_order:
+            raise ValueError("work_order is required.")
+        if not touch:
+            raise ValueError("touch is required.")
+        if not entry_date:
+            raise ValueError("entry_date is required.")
+        if linked_parts_count > 0 and old_touch == DepotRules.TOUCH_PART_ORDER and touch != DepotRules.TOUCH_PART_ORDER:
+            raise ValueError("This Part Order submission is linked to parts; keep touch as Part Order or relink/delete parts first.")
+        if linked_parts_count > 0 and old_work_order != work_order:
+            raise ValueError("This submission is linked to parts; keep the work order unchanged or relink/delete parts first.")
+
+        with self.db.write_transaction("tracker.update_dashboard_submission_row"):
+            self.db.execute(
+                "UPDATE submissions SET created_at=?, updated_at=?, user_id=?, work_order=?, touch=?, category=?, client_unit=?, entry_date=? "
+                "WHERE id=?",
+                (created_at, updated_at, user_id, work_order, touch, category, int(client_unit), entry_date, target_id),
+            )
+            if linked_parts_count > 0:
+                self.db.execute(
+                    "UPDATE parts SET assigned_user_id=? WHERE COALESCE(source_submission_id, 0)=?",
+                    (user_id, target_id),
+                )
+
+        _runtime_log_event(
+            "depot.dashboard_submission_updated",
+            severity="info",
+            summary="A dashboard submission row was edited.",
+            context={
+                "submission_id": int(target_id),
+                "actor_user_id": actor,
+                "work_order": work_order,
+                "touch": touch,
+                "linked_parts_count": int(linked_parts_count),
+            },
+        )
+        return self.get_submission_record(target_id) or {"id": target_id}
+
+    def delete_dashboard_submission(self, submission_id: int, actor_user_id: str) -> dict[str, Any]:
+        actor = self._require_dashboard_submission_admin(actor_user_id)
+        target_id = int(max(0, safe_int(submission_id, 0)))
+        if target_id <= 0:
+            raise ValueError("A valid submission row is required.")
+        submission = self.get_submission_record(target_id)
+        if submission is None:
+            raise ValueError("Selected submission row no longer exists.")
+
+        work_order = DepotRules.normalize_work_order(str(submission.get("work_order", "") or ""))
+        touch = str(submission.get("touch", "") or "").strip()
+        client_unit = bool(submission.get("client_unit", False))
+        linked_parts_count_row = self.db.fetchone(
+            "SELECT COUNT(*) AS c FROM parts WHERE COALESCE(source_submission_id, 0)=?",
+            (target_id,),
+        )
+        linked_parts_count = int(max(0, safe_int(linked_parts_count_row["c"], 0))) if linked_parts_count_row is not None else 0
+        fallback_part_order = None
+        if touch == DepotRules.TOUCH_PART_ORDER and linked_parts_count > 0:
+            fallback_part_order = self.db.fetchone(
+                "SELECT id, COALESCE(user_id, '') AS user_id "
+                "FROM submissions WHERE work_order=? AND touch=? AND id<>? "
+                f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                (work_order, DepotRules.TOUCH_PART_ORDER, target_id),
+            )
+            if fallback_part_order is None:
+                raise ValueError(
+                    "This Part Order is linked to live parts and cannot be deleted because there is no earlier Part Order to relink."
+                )
+
+        with self.db.write_transaction("tracker.delete_dashboard_submission"):
+            self._delete_submission_row_and_aux_logs(submission)
+            if touch == DepotRules.TOUCH_PART_ORDER and linked_parts_count > 0 and fallback_part_order is not None:
+                fallback_submission_id = int(max(0, safe_int(fallback_part_order["id"], 0)))
+                fallback_user_id = DepotRules.normalize_user_id(str(fallback_part_order["user_id"] or ""))
+                self.db.execute(
+                    "UPDATE parts SET source_submission_id=?, assigned_user_id=? WHERE COALESCE(source_submission_id, 0)=?",
+                    (fallback_submission_id, fallback_user_id, target_id),
+                )
+
+            if client_unit and touch in DepotRules.FOLLOW_UP_TOUCHES:
+                fallback_client_submission = self.db.fetchone(
+                    "SELECT COALESCE(user_id, '') AS user_id, "
+                    f"{_submission_latest_ts_sql()} AS latest_stamp "
+                    "FROM submissions "
+                    "WHERE work_order=? AND COALESCE(client_unit, 0)=1 AND touch IN (?, ?) "
+                    f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                    (work_order, DepotRules.TOUCH_PART_ORDER, DepotRules.TOUCH_OTHER),
+                )
+                if fallback_client_submission is None:
+                    self.db.execute("DELETE FROM client_parts WHERE work_order=?", (work_order,))
+                else:
+                    fallback_user = DepotRules.normalize_user_id(str(fallback_client_submission["user_id"] or ""))
+                    fallback_stamp = str(fallback_client_submission["latest_stamp"] or "").strip()
+                    existing_client_row = self.db.fetchone("SELECT id FROM client_parts WHERE work_order=?", (work_order,))
+                    if existing_client_row is None:
+                        self.db.execute(
+                            "INSERT INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+                            (fallback_stamp, fallback_user, work_order, ""),
+                        )
+                    else:
+                        self.db.execute(
+                            "UPDATE client_parts SET user_id=?, created_at=? WHERE work_order=?",
+                            (fallback_user, fallback_stamp, work_order),
+                        )
+
+        _runtime_log_event(
+            "depot.dashboard_submission_deleted",
+            severity="warning",
+            summary="A dashboard submission row was deleted by an administrator.",
+            context={
+                "submission_id": int(target_id),
+                "actor_user_id": actor,
+                "work_order": work_order,
+                "touch": touch,
+                "client_unit": bool(client_unit),
+                "linked_parts_count": int(linked_parts_count),
+            },
+        )
+        return {"submission_id": int(target_id), "work_order": work_order, "touch": touch, "client_unit": bool(client_unit)}
 
     def get_admin_access_level(self, user_id: str) -> str:
         snapshot = self._user_repository_or_fallback().get_role_snapshot(user_id)
@@ -2878,6 +3103,16 @@ class DepotTracker:
         return self.db.fetchall(query, tuple(params))
 
     def list_team_client_followups(self) -> list[sqlite3.Row]:
+        return self.list_client_followups("", include_all=True)
+
+    def list_client_followups(self, user_id: str = "", *, include_all: bool = False) -> list[sqlite3.Row]:
+        normalized_user = DepotRules.normalize_user_id(user_id)
+        if not include_all and not normalized_user:
+            return []
+        submission_user_filter = "" if include_all else "s.user_id=cp.user_id AND "
+        where_clause = "" if include_all else "WHERE cp.user_id=? "
+        params: tuple[Any, ...] = () if include_all else (normalized_user,)
+        limit = 600 if include_all else 300
         return self.db.fetchall(
             "SELECT cp.id, COALESCE(cp.user_id, '') AS user_id, cp.work_order, cp.created_at, "
             "COALESCE(cp.comments, '') AS comments, "
@@ -2886,58 +3121,27 @@ class DepotTracker:
             "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
             "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
             "COALESCE(cp.followup_no_contact_count, 0) AS followup_no_contact_count, "
-            "COALESCE(("
-            "SELECT s.touch FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
-            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
-            "), '') AS latest_touch, "
-            "COALESCE(("
-            f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
-            "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
-            f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
-            "), '') AS latest_touch_date, "
-            "COALESCE(("
-            f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
-            "AND s.client_unit=1 AND s.touch='Part Order'"
-            "), '') AS last_part_order_date "
-            "FROM client_parts cp "
-            "ORDER BY cp.created_at DESC, cp.id DESC LIMIT 600"
-        )
-
-    def list_client_followups(self, user_id: str) -> list[sqlite3.Row]:
-        normalized_user = DepotRules.normalize_user_id(user_id)
-        return self.db.fetchall(
-            "SELECT cp.id, cp.work_order, cp.created_at, COALESCE(cp.comments, '') AS comments, "
-            "COALESCE(cp.alert_quiet_until, '') AS alert_quiet_until, "
-            "COALESCE(cp.followup_last_action, '') AS followup_last_action, "
-            "COALESCE(cp.followup_last_action_at, '') AS followup_last_action_at, "
-            "COALESCE(cp.followup_last_actor, '') AS followup_last_actor, "
-            "COALESCE(cp.followup_no_contact_count, 0) AS followup_no_contact_count, "
             "COALESCE(cp.followup_stage_logged, -1) AS followup_stage_logged, "
             "COALESCE(("
             "SELECT s.touch FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            f"WHERE {submission_user_filter}s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
             f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch, "
             "COALESCE(("
             f"SELECT {_submission_entry_date_sql('s')} FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            f"WHERE {submission_user_filter}s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch IN ('Part Order', 'Other') "
             f"ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 1"
             "), '') AS latest_touch_date, "
             "COALESCE(("
             f"SELECT MAX({_submission_entry_date_sql('s')}) FROM submissions s "
-            "WHERE s.user_id=cp.user_id AND s.work_order=cp.work_order "
+            f"WHERE {submission_user_filter}s.work_order=cp.work_order "
             "AND s.client_unit=1 AND s.touch='Part Order'"
             "), '') AS last_part_order_date "
-            "FROM client_parts cp "
-            "WHERE cp.user_id=? "
-            "ORDER BY cp.created_at DESC, cp.id DESC LIMIT 300",
-            (normalized_user,),
+            f"FROM client_parts cp {where_clause}"
+            f"ORDER BY cp.created_at DESC, cp.id DESC LIMIT {limit}",
+            params,
         )
 
     def get_part_work_order(self, part_id: int) -> str:
@@ -2962,6 +3166,46 @@ class DepotTracker:
         query += " ORDER BY created_at DESC, id DESC LIMIT 400"
         return self.db.fetchall(query, tuple(params))
 
+    def list_junk_out_rows(
+        self,
+        search_text: str = "",
+        *,
+        client_filter: str = "all",
+        start_date: str = "",
+        end_date: str = "",
+    ) -> list[sqlite3.Row]:
+        query = (
+            "SELECT s.id, COALESCE(s.created_at, '') AS created_at, COALESCE(s.updated_at, '') AS updated_at, "
+            "COALESCE(s.user_id, '') AS user_id, COALESCE(s.work_order, '') AS work_order, "
+            "COALESCE(s.category, '') AS category, COALESCE(s.client_unit, 0) AS client_unit, "
+            "COALESCE(s.entry_date, SUBSTR(COALESCE(s.created_at, ''), 1, 10)) AS entry_date, "
+            "COALESCE(s.serial_number, '') AS serial_number, COALESCE(cj.comments, '') AS comments "
+            "FROM submissions s "
+            "LEFT JOIN client_jo cj ON cj.user_id=s.user_id AND cj.work_order=s.work_order "
+            "AND SUBSTR(COALESCE(cj.created_at, ''), 1, 10)=COALESCE(s.entry_date, SUBSTR(COALESCE(s.created_at, ''), 1, 10)) "
+            "WHERE s.touch=?"
+        )
+        params: list[Any] = [DepotRules.TOUCH_JUNK]
+        normalized_search = DepotRules.normalize_work_order(str(search_text or ""))
+        if normalized_search:
+            query += " AND UPPER(COALESCE(s.work_order, '')) LIKE ?"
+            params.append(f"%{normalized_search}%")
+        normalized_filter = str(client_filter or "all").strip().lower()
+        if normalized_filter in {"client", "client_only", "client only"}:
+            query += " AND COALESCE(s.client_unit, 0)=1"
+        elif normalized_filter in {"non_client", "non-client", "non client", "without_client", "without client"}:
+            query += " AND COALESCE(s.client_unit, 0)=0"
+        normalized_start = str(start_date or "").strip()
+        if normalized_start:
+            query += " AND COALESCE(s.entry_date, SUBSTR(COALESCE(s.created_at, ''), 1, 10)) >= ?"
+            params.append(normalized_start[:10])
+        normalized_end = str(end_date or "").strip()
+        if normalized_end:
+            query += " AND COALESCE(s.entry_date, SUBSTR(COALESCE(s.created_at, ''), 1, 10)) <= ?"
+            params.append(normalized_end[:10])
+        query += f" ORDER BY {_submission_latest_ts_sql('s')} DESC, s.id DESC LIMIT 600"
+        return self.db.fetchall(query, tuple(params))
+
     def list_rtv_rows(self, search_text: str = "") -> list[sqlite3.Row]:
         query = (
             "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(user_id, '') AS user_id, "
@@ -2980,6 +3224,7 @@ class DepotTracker:
         max_rows = int(clamp(safe_int(limit, 3), 1, 20))
         return self.db.fetchall(
             "SELECT id, work_order, touch, COALESCE(category, '') AS category, client_unit, "
+            "COALESCE(serial_number, '') AS serial_number, "
             "COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at, "
             f"{_submission_latest_ts_sql()} AS latest_stamp "
             "FROM submissions WHERE user_id=? "
@@ -2992,7 +3237,8 @@ class DepotTracker:
             "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at, "
             "COALESCE(user_id, '') AS user_id, COALESCE(work_order, '') AS work_order, "
             "COALESCE(touch, '') AS touch, COALESCE(category, '') AS category, "
-            "COALESCE(client_unit, 0) AS client_unit, COALESCE(entry_date, '') AS entry_date "
+            "COALESCE(client_unit, 0) AS client_unit, COALESCE(entry_date, '') AS entry_date, "
+            "COALESCE(serial_number, '') AS serial_number "
             "FROM submissions WHERE id=?",
             (int(submission_id),),
         )
@@ -3010,6 +3256,7 @@ class DepotTracker:
             "category": str(row["category"] or "").strip(),
             "client_unit": bool(int(max(0, safe_int(row["client_unit"], 0)))),
             "entry_date": str(row["entry_date"] or "").strip(),
+            "serial_number": str(row["serial_number"] or "").strip(),
         }
 
     def get_latest_work_order_submission(self, work_order: str) -> dict[str, Any] | None:
@@ -3020,7 +3267,7 @@ class DepotTracker:
             "SELECT id, COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at, "
             "COALESCE(user_id, '') AS user_id, COALESCE(work_order, '') AS work_order, "
             "COALESCE(touch, '') AS touch, COALESCE(category, '') AS category, COALESCE(client_unit, 0) AS client_unit, "
-            "COALESCE(entry_date, '') AS entry_date "
+            "COALESCE(entry_date, '') AS entry_date, COALESCE(serial_number, '') AS serial_number "
             "FROM submissions WHERE work_order=? "
             f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
             (normalized_work_order,),
@@ -3039,6 +3286,7 @@ class DepotTracker:
             "category": str(row["category"] or "").strip(),
             "client_unit": bool(int(max(0, safe_int(row["client_unit"], 0)))),
             "entry_date": str(row["entry_date"] or "").strip(),
+            "serial_number": str(row["serial_number"] or "").strip(),
         }
 
     def _delete_submission_row_and_aux_logs(self, submission: dict[str, Any]) -> None:
@@ -3110,12 +3358,6 @@ class DepotTracker:
         entry_date = str(submission.get("entry_date", "") or "").strip()
         client_unit = bool(submission.get("client_unit", False))
 
-        if touch in DepotRules.CLOSING_TOUCHES:
-            raise ValueError(
-                f"{touch} submissions cannot be removed from Recent submissions because closing touches clear queue state. "
-                "Resubmit the same work order on the same day to overwrite it."
-            )
-
         fallback_part_order = None
         linked_parts_count_row = self.db.fetchone(
             "SELECT COUNT(*) AS c FROM parts WHERE COALESCE(source_submission_id, 0)=?",
@@ -3134,18 +3376,10 @@ class DepotTracker:
                     "This Part Order is linked to live parts and cannot be removed because there is no earlier Part Order to relink."
                 )
 
+        reopened_part_id = 0
+        restored_client_followup = False
         with self.db.write_transaction("tracker.delete_user_submission"):
-            if touch == DepotRules.TOUCH_RTV:
-                self.db.execute(
-                    "DELETE FROM rtvs WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
-                    (actor, work_order, entry_date),
-                )
-            if client_unit and touch == DepotRules.TOUCH_JUNK:
-                self.db.execute(
-                    "DELETE FROM client_jo WHERE user_id=? AND work_order=? AND SUBSTR(COALESCE(created_at, ''), 1, 10)=?",
-                    (actor, work_order, entry_date),
-                )
-            self.db.execute("DELETE FROM submissions WHERE id=?", (target_id,))
+            self._delete_submission_row_and_aux_logs(submission)
 
             if touch == DepotRules.TOUCH_PART_ORDER and linked_parts_count > 0 and fallback_part_order is not None:
                 fallback_submission_id = int(max(0, safe_int(fallback_part_order["id"], 0)))
@@ -3184,6 +3418,69 @@ class DepotTracker:
                             (fallback_user, fallback_stamp, work_order),
                         )
 
+            if touch in DepotRules.CLOSING_TOUCHES:
+                latest_after_close_delete = self.db.fetchone(
+                    "SELECT COALESCE(touch, '') AS touch FROM submissions WHERE work_order=? "
+                    f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                    (work_order,),
+                )
+                latest_after_touch = (
+                    str(latest_after_close_delete["touch"] or "").strip()
+                    if latest_after_close_delete is not None
+                    else ""
+                )
+                if latest_after_touch not in DepotRules.CLOSING_TOUCHES:
+                    part_row = self.db.fetchone(
+                        "SELECT id, COALESCE(assigned_user_id, '') AS assigned_user_id "
+                        "FROM parts WHERE work_order=? AND is_active=0 ORDER BY id DESC LIMIT 1",
+                        (work_order,),
+                    )
+                    if part_row is not None:
+                        reopened_part_id = int(max(0, safe_int(part_row["id"], 0)))
+                        fallback_source = self.db.fetchone(
+                            "SELECT id, COALESCE(user_id, '') AS user_id FROM submissions WHERE work_order=? AND touch=? "
+                            f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                            (work_order, DepotRules.TOUCH_PART_ORDER),
+                        )
+                        fallback_source_id = (
+                            int(max(0, safe_int(fallback_source["id"], 0)))
+                            if fallback_source is not None
+                            else 0
+                        )
+                        fallback_assigned_user = (
+                            DepotRules.normalize_user_id(str(fallback_source["user_id"] or ""))
+                            if fallback_source is not None
+                            else DepotRules.normalize_user_id(str(part_row["assigned_user_id"] or ""))
+                        )
+                        self.db.execute(
+                            "UPDATE parts SET is_active=1, source_submission_id=?, assigned_user_id=?, "
+                            "working_user_id='', working_updated_at='' WHERE id=?",
+                            (fallback_source_id, fallback_assigned_user, reopened_part_id),
+                        )
+                    fallback_client_submission = self.db.fetchone(
+                        "SELECT COALESCE(user_id, '') AS user_id, "
+                        f"{_submission_latest_ts_sql()} AS latest_stamp "
+                        "FROM submissions "
+                        "WHERE work_order=? AND COALESCE(client_unit, 0)=1 AND touch IN (?, ?) "
+                        f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT 1",
+                        (work_order, DepotRules.TOUCH_PART_ORDER, DepotRules.TOUCH_OTHER),
+                    )
+                    if fallback_client_submission is not None:
+                        fallback_user = DepotRules.normalize_user_id(str(fallback_client_submission["user_id"] or ""))
+                        fallback_stamp = str(fallback_client_submission["latest_stamp"] or "").strip()
+                        existing_client_row = self.db.fetchone("SELECT id FROM client_parts WHERE work_order=?", (work_order,))
+                        if existing_client_row is None:
+                            self.db.execute(
+                                "INSERT INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+                                (fallback_stamp, fallback_user, work_order, ""),
+                            )
+                        else:
+                            self.db.execute(
+                                "UPDATE client_parts SET user_id=?, created_at=? WHERE work_order=?",
+                                (fallback_user, fallback_stamp, work_order),
+                            )
+                        restored_client_followup = True
+
         _runtime_log_event(
             "depot.user_submission_deleted",
             severity="info",
@@ -3195,6 +3492,8 @@ class DepotTracker:
                 "touch": touch,
                 "client_unit": bool(client_unit),
                 "linked_parts_count": int(linked_parts_count),
+                "reopened_part_id": int(reopened_part_id),
+                "restored_client_followup": bool(restored_client_followup),
             },
         )
         return {
@@ -3202,6 +3501,7 @@ class DepotTracker:
             "work_order": work_order,
             "touch": touch,
             "client_unit": bool(client_unit),
+            "reopened_part_id": int(reopened_part_id),
         }
 
     def upsert_agent(self, user_id: str, agent_name: str, tier: int, icon_path: str = "", location: str = "") -> str:
@@ -3295,18 +3595,20 @@ class DepotTracker:
         category_text: str,
         client_unit_int: int,
         stamp_text: str,
+        serial_number: str = "",
     ) -> int:
+        serial_text = str(serial_number or "").strip().upper()
         existing = self._find_existing_same_day_submission(entry_date, user_id, work_order)
         if existing is not None:
             self.db.execute(
-                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
-                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=?, serial_number=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), serial_text, int(existing["id"])),
             )
             return int(existing["id"])
         try:
             cursor = self.db.execute(
-                "INSERT INTO submissions (created_at, updated_at, user_id, work_order, touch, category, client_unit, entry_date) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO submissions (created_at, updated_at, user_id, work_order, touch, category, client_unit, entry_date, serial_number) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     str(stamp_text or "").strip(),
                     str(stamp_text or "").strip(),
@@ -3316,6 +3618,7 @@ class DepotTracker:
                     str(category_text or "").strip(),
                     int(client_unit_int),
                     str(entry_date or "").strip(),
+                    serial_text,
                 ),
             )
             return int(cursor.lastrowid or 0)
@@ -3324,8 +3627,8 @@ class DepotTracker:
             if existing is None:
                 raise
             self.db.execute(
-                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=? WHERE id=?",
-                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), int(existing["id"])),
+                "UPDATE submissions SET touch=?, category=?, client_unit=?, updated_at=?, serial_number=? WHERE id=?",
+                (touch, category_text, int(client_unit_int), str(stamp_text or "").strip(), serial_text, int(existing["id"])),
             )
             return int(existing["id"])
 
@@ -3376,6 +3679,7 @@ class DepotTracker:
         comments: str | None = None,
         category: str | None = "",
         submitted_at: datetime | date | str | None = None,
+        serial_number: str | None = "",
     ) -> None:
         stamp_dt = self._normalize_submission_timestamp(submitted_at)
         stamp_text = stamp_dt.isoformat(timespec="seconds")
@@ -3385,6 +3689,9 @@ class DepotTracker:
         category_text = str(category or "").strip()
         comments_text = str(comments or "")
         client_unit_int = 1 if client_unit else 0
+        serial_text = str(serial_number or "").strip().upper()
+        if touch == DepotRules.TOUCH_JUNK and not serial_text:
+            raise ValueError("Serial number is required for Junk Out submissions.")
 
         with self.db.write_transaction("tracker.submit_work"):
             existing_same_day_submission = self._find_existing_same_day_submission(entry_date, user_id, work_order)
@@ -3426,6 +3733,7 @@ class DepotTracker:
                 category_text,
                 client_unit_int,
                 stamp_text,
+                serial_text,
             )
 
             if prior_same_day_touch == DepotRules.TOUCH_RTV and touch != DepotRules.TOUCH_RTV:
@@ -4173,6 +4481,85 @@ class DepotTracker:
                     int(part_id),
                 ),
             )
+
+    def reopen_completed_part(self, part_id: int, actor_user_id: str) -> dict[str, Any]:
+        actor = self._require_dashboard_submission_admin(actor_user_id)
+        target_id = int(max(0, safe_int(part_id, 0)))
+        if target_id <= 0:
+            raise ValueError("A valid completed part row is required.")
+        part = self.db.fetchone(
+            "SELECT id, COALESCE(work_order, '') AS work_order, COALESCE(assigned_user_id, '') AS assigned_user_id, "
+            "COALESCE(category, '') AS category, COALESCE(client_unit, 0) AS client_unit, COALESCE(is_active, 0) AS is_active "
+            "FROM parts WHERE id=?",
+            (target_id,),
+        )
+        if part is None:
+            raise ValueError("Selected completed part row no longer exists.")
+        if int(max(0, safe_int(part["is_active"], 0))) != 0:
+            raise ValueError("Selected part row is already active.")
+
+        work_order = DepotRules.normalize_work_order(str(part["work_order"] or ""))
+        if not work_order:
+            raise ValueError("Selected completed part row is missing a work order.")
+        assigned_user = DepotRules.normalize_user_id(str(part["assigned_user_id"] or ""))
+        submission_user = assigned_user or actor
+        category = str(part["category"] or "").strip()
+        client_unit_int = int(max(0, safe_int(part["client_unit"], 0)))
+        stamp_dt = datetime.now()
+        stamp = stamp_dt.isoformat(timespec="seconds")
+        entry_date = stamp_dt.date().isoformat()
+
+        with self.db.write_transaction("tracker.reopen_completed_part"):
+            submission_id = self._upsert_same_day_submission(
+                entry_date,
+                submission_user,
+                work_order,
+                DepotRules.TOUCH_PART_ORDER,
+                category,
+                client_unit_int,
+                stamp,
+                "",
+            )
+            self.db.execute(
+                "UPDATE parts SET is_active=1, assigned_user_id=?, source_submission_id=?, "
+                "parts_installed=0, parts_installed_by='', parts_installed_at='', "
+                "working_user_id='', working_updated_at='', alert_quiet_until='' WHERE id=?",
+                (submission_user, int(submission_id), target_id),
+            )
+            self.db.execute("UPDATE part_details SET installed_keys='' WHERE part_id=?", (target_id,))
+            if client_unit_int:
+                existing_client_row = self.db.fetchone("SELECT id FROM client_parts WHERE work_order=?", (work_order,))
+                if existing_client_row is None:
+                    self.db.execute(
+                        "INSERT INTO client_parts (created_at, user_id, work_order, comments) VALUES (?, ?, ?, ?)",
+                        (stamp, submission_user, work_order, ""),
+                    )
+                else:
+                    self.db.execute(
+                        "UPDATE client_parts SET user_id=?, created_at=? WHERE work_order=?",
+                        (submission_user, stamp, work_order),
+                    )
+
+        _runtime_log_event(
+            "depot.completed_part_reopened",
+            severity="warning",
+            summary="A dashboard completed part row was reopened into the active Part Order queue.",
+            context={
+                "part_id": int(target_id),
+                "work_order": work_order,
+                "actor_user_id": actor,
+                "assigned_user_id": submission_user,
+                "source_submission_id": int(submission_id),
+                "client_unit": bool(client_unit_int),
+            },
+        )
+        return {
+            "part_id": int(target_id),
+            "work_order": work_order,
+            "assigned_user_id": submission_user,
+            "source_submission_id": int(submission_id),
+            "client_unit": bool(client_unit_int),
+        }
 
     def mark_client_followup_action(self, client_part_id: int, action: str, actor_user_id: str) -> int:
         normalized_action = DepotRules.normalize_followup_action(action)

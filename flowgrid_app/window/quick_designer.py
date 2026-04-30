@@ -107,7 +107,7 @@ SIDEBAR_WIDTH = 52
 SHIFT_CONTEXT_SCRIPT_LAUNCHERS: dict[str, str] = {
 }
 
-DEFAULT_THEME_PRESETS: dict[str, dict[str, str]] = {
+PREVIOUS_THEME_PRESETS: dict[str, dict[str, str]] = {
     "Default": {"primary": "#C35A00", "accent": "#FF9A1F", "surface": "#090A0F"},
     "Classic": {"primary": "#0A246A", "accent": "#C0C0C0", "surface": "#D4D0C8"},
     "Slate": {"primary": "#3A4A6A", "accent": "#D97706", "surface": "#E8ECF3"},
@@ -119,6 +119,20 @@ DEFAULT_THEME_PRESETS: dict[str, dict[str, str]] = {
     "Crimson": {"primary": "#6A1E1E", "accent": "#D85A5A", "surface": "#F1E6E6"},
     "Steel": {"primary": "#3C4B5C", "accent": "#8FA7BF", "surface": "#E3EAF2"},
     "Amber": {"primary": "#70420C", "accent": "#F3B33E", "surface": "#F6EDD9"},
+}
+
+DEFAULT_THEME_PRESETS: dict[str, dict[str, str]] = {
+    "Default": {"primary": "#C35A00", "accent": "#FF9A1F", "surface": "#090A0F"},
+    "Classic": {"primary": "#0A246A", "accent": "#9EA6B2", "surface": "#D8D6D0"},
+    "Slate": {"primary": "#344763", "accent": "#C66C10", "surface": "#E6EBF2"},
+    "Forest": {"primary": "#205E55", "accent": "#C95F18", "surface": "#E7F0EC"},
+    "Ocean": {"primary": "#0E93A5", "accent": "#CDA320", "surface": "#D9F5FA"},
+    "Midnight": {"primary": "#1E2B3A", "accent": "#5AA9FF", "surface": "#0F141C"},
+    "Desert": {"primary": "#75472A", "accent": "#C98C45", "surface": "#EFE1CF"},
+    "Sage": {"primary": "#2F5D50", "accent": "#83AD55", "surface": "#E5EEE4"},
+    "Crimson": {"primary": "#6A1E1E", "accent": "#C84B4B", "surface": "#F0E5E6"},
+    "Steel": {"primary": "#3C4B5C", "accent": "#7995AF", "surface": "#E2EAF1"},
+    "Amber": {"primary": "#70420C", "accent": "#D99526", "surface": "#F4E8D2"},
 }
 
 DEFAULT_THEME_PRIMARY = "#C35A00"
@@ -345,10 +359,10 @@ def compute_palette(theme: dict[str, str]) -> dict[str, str]:
 
     shell_overlay = shift(primary, -0.60)
     sidebar_overlay = shift(primary, -0.70)
-    nav_active = blend(accent, primary, 0.35)
-    text_color = readable_text(shift(surface, -0.55))
     control_bg = blend(surface, "#1E2A34", 0.22)
     input_bg = blend(surface, "#FFFFFF", 0.08)
+    nav_active = blend(accent, primary, 0.35)
+    text_color = readable_text(control_bg)
     button_bg = blend(primary, accent, 0.30)
 
     return {
@@ -382,7 +396,7 @@ def safe_layer_defaults(layer: dict[str, Any]) -> dict[str, Any]:
         "image_path": layer.get("image_path", ""),
         "image_x": int(layer.get("image_x", 0)),
         "image_y": int(layer.get("image_y", 0)),
-        "image_scale_mode": layer.get("image_scale_mode", "Fill"),
+        "image_scale_mode": layer.get("image_scale_mode", "Fit"),
         "image_anchor": layer.get("image_anchor", "Center"),
         "image_scale_percent": int(layer.get("image_scale_percent", 100)),
         "image_opacity": float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)),
@@ -1998,7 +2012,7 @@ class ImageLayersDialog(QDialog):
         self.visible_check.setChecked(bool(layer.get("visible", True)))
         self.x_spin.setValue(int(layer.get("image_x", 0)))
         self.y_spin.setValue(int(layer.get("image_y", 0)))
-        self.scale_mode.setCurrentText(layer.get("image_scale_mode", "Fill"))
+        self.scale_mode.setCurrentText(layer.get("image_scale_mode", "Fit"))
         self.anchor_combo.setCurrentText(layer.get("image_anchor", "Center"))
         self.scale_spin.setValue(int(layer.get("image_scale_percent", 100)))
         self.opacity_slider.setValue(int(float(layer.get("image_opacity", 1.0)) * 100))
@@ -2115,6 +2129,7 @@ __all__ = [
     "LEGACY_DEFAULT_THEME_ACCENT",
     "LEGACY_DEFAULT_THEME_PRIMARY",
     "LEGACY_DEFAULT_THEME_SURFACE",
+    "PREVIOUS_THEME_PRESETS",
     "QuickButtonCanvas",
     "QuickButtonCard",
     "QuickLayoutDialog",

@@ -88,10 +88,10 @@ def compute_palette(theme: dict[str, str]) -> dict[str, str]:
 
     shell_overlay = shift(primary, -0.60)
     sidebar_overlay = shift(primary, -0.70)
-    nav_active = blend(accent, primary, 0.35)
-    text_color = readable_text(shift(surface, -0.55))
     control_bg = blend(surface, "#1E2A34", 0.22)
     input_bg = blend(surface, "#FFFFFF", 0.08)
+    nav_active = blend(accent, primary, 0.35)
+    text_color = readable_text(control_bg)
     button_bg = blend(primary, accent, 0.30)
 
     return {
@@ -126,7 +126,7 @@ def safe_layer_defaults(layer: dict[str, Any]) -> dict[str, Any]:
         "image_path": layer.get("image_path", ""),
         "image_x": int(layer.get("image_x", 0)),
         "image_y": int(layer.get("image_y", 0)),
-        "image_scale_mode": layer.get("image_scale_mode", "Fill"),
+        "image_scale_mode": layer.get("image_scale_mode", "Fit"),
         "image_anchor": layer.get("image_anchor", "Center"),
         "image_scale_percent": int(layer.get("image_scale_percent", 100)),
         "image_opacity": float(clamp(float(layer.get("image_opacity", 1.0)), 0.0, 1.0)),
