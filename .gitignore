@@ -1,4 +1,4 @@
 Flowgrid_depot.db
 __pycache__/
-Logs/*
-!Logs/.gitignore
+Logs/
+logs/

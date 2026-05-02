@@ -636,6 +636,76 @@ def _run_ui_smoke_under_manifest(temp_paths: dict[str, Path]) -> list[Diagnostic
         else:
             _record(results, "Workbook import removal", "ok", "Tracker Hub no longer exposes workbook import UI.", temp_paths["runtime_root"])
 
+        quick_action_labels = [
+            str(window.editor_action_combo.itemText(index) or "").strip()
+            for index in range(window.editor_action_combo.count())
+        ]
+        quick_action_values = [
+            str(window.editor_action_combo.itemData(index) or "").strip()
+            for index in range(window.editor_action_combo.count())
+        ]
+        if "Paste Text" in quick_action_labels or "paste_text" in quick_action_values or quick_action_values[:1] != ["input_sequence"]:
+            _record(
+                results,
+                "Quick input editor actions",
+                "failed",
+                f"Unexpected quick action editor choices: labels={quick_action_labels!r} values={quick_action_values!r}",
+                expected_config_path,
+            )
+        else:
+            _record(results, "Quick input editor actions", "ok", "Input Sequence is the default text/input action and Paste Text is not exposed.", expected_config_path)
+
+        parsed_literal = window._parse_macro_sequence("Part [ABC123]")
+        if parsed_literal == [{"action": "type", "text": "Part [ABC123]"}]:
+            _record(results, "Input sequence literal brackets", "ok", "Unknown bracketed text is preserved as literal input.", expected_config_path)
+        else:
+            _record(results, "Input sequence literal brackets", "failed", f"Parser returned {parsed_literal!r}.", expected_config_path)
+
+        original_config_text = expected_config_path.read_text(encoding="utf-8") if expected_config_path.exists() else ""
+        try:
+            legacy_payload = json.loads(original_config_text) if original_config_text else dict(window.config)
+            legacy_entry = {
+                "title": "Diag Legacy Text",
+                "tooltip": "",
+                "text": "legacy text",
+                "action": "paste_text",
+                "open_target": "",
+                "app_targets": "",
+                "urls": "",
+                "browser_path": "",
+            }
+            legacy_payload["quick_texts"] = [dict(legacy_entry)]
+            legacy_payload["quick_tabs"] = [{"name": "Legacy", "quick_texts": [dict(legacy_entry)]}]
+            legacy_payload["active_quick_tab"] = 0
+            expected_config_path.write_text(json.dumps(legacy_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+            loaded_legacy = window.load_config()
+            loaded_items = loaded_legacy.get("quick_tabs", [{}])[0].get("quick_texts", [])
+            loaded_action = str(loaded_items[0].get("action", "") if loaded_items else "")
+            if loaded_action == "input_sequence":
+                _record(results, "Legacy Paste Text migration", "ok", "Legacy paste_text quick buttons normalize to Input Sequence.", expected_config_path)
+            else:
+                _record(results, "Legacy Paste Text migration", "failed", f"Legacy action normalized to {loaded_action!r}.", expected_config_path)
+        finally:
+            if original_config_text:
+                expected_config_path.write_text(original_config_text, encoding="utf-8")
+            elif expected_config_path.exists():
+                expected_config_path.unlink()
+
+        clipboard = QApplication.clipboard()
+        clipboard_snapshot = window._clone_clipboard_mime_data()
+        if clipboard_snapshot is None:
+            _record(results, "Quick input clipboard restore", "failed", "Could not snapshot clipboard before restore diagnostic.", expected_config_path)
+        else:
+            try:
+                clipboard.setText("Flowgrid smoke clipboard sentinel")
+                window._execute_macro_sequence("Temporary quick input text", send_paste_keys=False)
+                if str(clipboard.text() or "") == "Flowgrid smoke clipboard sentinel":
+                    _record(results, "Quick input clipboard restore", "ok", "Text-only input sequence restored the previous clipboard content.", expected_config_path)
+                else:
+                    _record(results, "Quick input clipboard restore", "failed", "Clipboard content changed after text-only input sequence execution.", expected_config_path)
+            finally:
+                window._restore_clipboard_mime_data(clipboard_snapshot)
+
         added_index = window._add_quick_task_tab_named("DiagTemp")
         window.rename_quick_task_tab_named("DiagSmoke", added_index)
         window.flush_pending_config_save()

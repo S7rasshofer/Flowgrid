@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     QEvent,
     QEasingCurve,
     QIODevice,
+    QMimeData,
     QPoint,
     QPointF,
     QRect,
@@ -114,9 +115,7 @@ from flowgrid_app.paths import (
     ASSETS_DIR_NAME,
     ASSET_UI_ICON_COMPAT_DIR_NAME,
     CONFIG_FILENAME,
-    DEPOT_BACKGROUND_AUTO_REFRESH_MS,
     FLOWGRID_ICON_PACK_DIR_NAME,
-    SHARED_SYNC_REFRESH_INTERVAL_MS,
     _data_file_path,
     _get_local_updater_path,
     _local_data_root,
@@ -230,6 +229,11 @@ KEY_CODES: dict[str, int] = {
     "up": VK_UP,
     "down": VK_DOWN,
 }
+QUICK_ACTION_INPUT_SEQUENCE = "input_sequence"
+QUICK_ACTION_OPEN_URL = "open_url"
+QUICK_ACTION_OPEN_APP = "open_app"
+QUICK_ACTIONS = {QUICK_ACTION_INPUT_SEQUENCE, QUICK_ACTION_OPEN_URL, QUICK_ACTION_OPEN_APP}
+LEGACY_QUICK_INPUT_ACTIONS = {"paste_text", "macro_sequence"}
 
 if os.name == "nt":
     try:
@@ -470,11 +474,6 @@ class QuickInputsWindow(QMainWindow):
         self._foreground_timer.timeout.connect(self._capture_external_target)
         self._foreground_timer.start()
 
-        self._shared_sync_timer = QTimer(self)
-        self._shared_sync_timer.setInterval(SHARED_SYNC_REFRESH_INTERVAL_MS)
-        self._shared_sync_timer.timeout.connect(self._refresh_shared_data)
-        self._shared_sync_timer.start()
-
         self._restore_window_position()
         self._apply_window_flags()
         self._init_ui_opacity_effects()
@@ -699,7 +698,7 @@ class QuickInputsWindow(QMainWindow):
             for idx, item in enumerate(raw_items):
                 if not isinstance(item, dict):
                     continue
-                action = str(item.get("action", "paste_text")).strip().lower()
+                action = str(item.get("action", QUICK_ACTION_INPUT_SEQUENCE)).strip().lower()
                 open_target = str(item.get("open_target", "")).strip()
                 app_targets = str(item.get("app_targets", "")).strip()
                 urls_text = str(item.get("urls", "")).strip()
@@ -711,21 +710,27 @@ class QuickInputsWindow(QMainWindow):
                     if not app_targets and open_target:
                         app_targets = open_target
                     if app_targets:
-                        action = "open_app"
+                        action = QUICK_ACTION_OPEN_APP
                     elif urls_text or text_payload.strip():
-                        action = "open_url"
+                        action = QUICK_ACTION_OPEN_URL
                     else:
-                        action = "paste_text"
-                elif action == "macro_sequence":
-                    action = "input_sequence"
-                elif action not in {"paste_text", "open_url", "open_app", "input_sequence"}:
-                    action = "paste_text"
+                        action = QUICK_ACTION_INPUT_SEQUENCE
+                elif action in LEGACY_QUICK_INPUT_ACTIONS:
+                    action = QUICK_ACTION_INPUT_SEQUENCE
+                elif action not in QUICK_ACTIONS:
+                    _runtime_log_event(
+                        "runtime.quick_action_unknown_migrated",
+                        severity="warning",
+                        summary="Unknown quick input action was migrated to Input Sequence.",
+                        context={"index": int(idx), "action": action},
+                    )
+                    action = QUICK_ACTION_INPUT_SEQUENCE
 
                 # Backward compatibility for entries saved before URL list/browser fields existed.
-                if action == "open_url" and not urls_text:
+                if action == QUICK_ACTION_OPEN_URL and not urls_text:
                     fallback = open_target or text_payload.strip()
                     urls_text = fallback
-                if action == "open_app" and not app_targets and open_target:
+                if action == QUICK_ACTION_OPEN_APP and not app_targets and open_target:
                     app_targets = open_target
                 normalized_item: dict[str, Any] = {
                     "title": str(item.get("title", f"Item {idx + 1}"))[:64],
@@ -1498,13 +1503,23 @@ class QuickInputsWindow(QMainWindow):
         force: bool = False,
         reason: str = "",
         ttl_ms: int = DEPOT_VIEW_TTL_MS,
+        window_scope: str | None = None,
     ) -> None:
         requested = {str(section or "").strip() for section in sections if str(section or "").strip()}
         if not requested:
             return
+        scope = str(window_scope or "").strip().lower()
+        if scope and scope not in {"agent", "qa", "dashboard", "admin"}:
+            _runtime_log_event(
+                "sync.depot_view_refresh_scope_invalid",
+                severity="warning",
+                summary="A shared workflow view refresh used an unknown window scope.",
+                context={"window_scope": scope, "reason": str(reason or ""), "sections": sorted(requested)},
+            )
+            scope = ""
 
         agent_window = getattr(self, "active_agent_window", None)
-        if agent_window is not None and agent_window.isVisible():
+        if scope in {"", "agent"} and agent_window is not None and agent_window.isVisible():
             current_agent_index = int(agent_window.agent_tabs.currentIndex()) if hasattr(agent_window, "agent_tabs") else -1
             current_agent_key = agent_window._tab_key_for_index(current_agent_index) if current_agent_index >= 0 else ""
             on_agent_work_tab = current_agent_index == int(agent_window.agent_tabs.indexOf(agent_window.work_tab)) if hasattr(agent_window, "agent_tabs") else False
@@ -1526,7 +1541,7 @@ class QuickInputsWindow(QMainWindow):
                 agent_window._refresh_missing_po_followups(force=force, reason=reason, ttl_ms=ttl_ms)
 
         qa_window = getattr(self, "active_qa_window", None)
-        if qa_window is not None and qa_window.isVisible():
+        if scope in {"", "qa"} and qa_window is not None and qa_window.isVisible():
             current_qa_index = int(qa_window.qa_tabs.currentIndex()) if hasattr(qa_window, "qa_tabs") else -1
             current_qa_widget = qa_window.qa_tabs.widget(current_qa_index) if current_qa_index >= 0 and hasattr(qa_window, "qa_tabs") else None
             current_qa_key = qa_window._qa_tab_key_for_index(current_qa_index) if current_qa_index >= 0 else ""
@@ -1552,7 +1567,7 @@ class QuickInputsWindow(QMainWindow):
                 qa_window._refresh_missing_po_followups(force=force, reason=reason, ttl_ms=ttl_ms)
 
         dashboard_dialog = getattr(self, "depot_dashboard_dialog", None)
-        if dashboard_dialog is not None and dashboard_dialog.isVisible():
+        if scope in {"", "dashboard"} and dashboard_dialog is not None and dashboard_dialog.isVisible():
             if "dashboard_metrics" in requested:
                 dashboard_dialog.refresh_dashboard(force=force, reason=reason)
             if "dashboard_completed" in requested:
@@ -1561,7 +1576,7 @@ class QuickInputsWindow(QMainWindow):
                 dashboard_dialog.refresh_notes_rows(force=force, reason=reason)
 
         admin_dialog = getattr(self, "admin_dialog", None)
-        if admin_dialog is not None and admin_dialog.isVisible():
+        if scope in {"", "admin"} and admin_dialog is not None and admin_dialog.isVisible():
             if "admin_agents" in requested or "admin_admins" in requested:
                 admin_dialog.refresh_users()
             if "admin_roles" in requested:
@@ -1611,18 +1626,95 @@ class QuickInputsWindow(QMainWindow):
         self._shared_editable_icon_snapshot = latest_snapshot
         self._refresh_shared_editable_icon_views()
 
-    def _refresh_shared_linked_views(self, *sections: str, force: bool = False, reason: str = "linked_refresh") -> None:
-        """Invalidate and refresh targeted shared workflow views visible in the current shell."""
+    def _depot_window_kind_for_widget(self, widget: QWidget | None) -> str:
+        current = widget
+        while current is not None:
+            if current is getattr(self, "active_agent_window", None):
+                return "agent"
+            if current is getattr(self, "active_qa_window", None):
+                return "qa"
+            if current is getattr(self, "admin_dialog", None):
+                return "admin"
+            if current is getattr(self, "depot_dashboard_dialog", None):
+                return "dashboard"
+            try:
+                current = current.parentWidget()
+            except Exception:
+                current = None
+        return ""
+
+    def _resolve_depot_refresh_source_kind(self, source_window: QWidget | None = None) -> str:
+        for candidate in (source_window, QApplication.focusWidget(), QApplication.activeWindow()):
+            kind = self._depot_window_kind_for_widget(candidate)
+            if kind:
+                return kind
+        return ""
+
+    def _refresh_shared_linked_views(
+        self,
+        *sections: str,
+        force: bool = False,
+        reason: str = "linked_refresh",
+        refresh_scope: str = "active",
+        source_window: QWidget | None = None,
+    ) -> None:
+        """Invalidate targeted shared workflow views and refresh only the requested scope."""
         requested_sections = tuple(str(section or "").strip() for section in sections if str(section or "").strip())
         if not requested_sections:
             requested_sections = self._all_depot_refresh_sections()
         self._invalidate_depot_views(*requested_sections, reason=reason)
-        self._refresh_visible_depot_views(
-            *requested_sections,
-            force=force,
-            reason=reason,
-            ttl_ms=DEPOT_VIEW_TTL_MS,
-        )
+        normalized_scope = str(refresh_scope or "active").strip().lower()
+        if normalized_scope == "none":
+            return
+        if normalized_scope == "all":
+            try:
+                self._refresh_visible_depot_views(
+                    *requested_sections,
+                    force=force,
+                    reason=reason,
+                    ttl_ms=DEPOT_VIEW_TTL_MS,
+                )
+            except Exception as exc:
+                _runtime_log_event(
+                    "sync.depot_linked_refresh_failed",
+                    severity="warning",
+                    summary="A linked shared workflow refresh failed after invalidation.",
+                    exc=exc,
+                    context={"views": list(requested_sections), "reason": str(reason or ""), "refresh_scope": "all"},
+                )
+            return
+        if normalized_scope != "active":
+            _runtime_log_event(
+                "sync.depot_linked_refresh_scope_invalid",
+                severity="warning",
+                summary="A linked shared workflow refresh used an unknown scope; defaulting to the active window.",
+                context={"refresh_scope": normalized_scope, "reason": str(reason or "")},
+            )
+        source_kind = self._resolve_depot_refresh_source_kind(source_window)
+        if not source_kind:
+            _runtime_log_event(
+                "sync.depot_linked_refresh_source_unresolved",
+                severity="info",
+                summary="Shared workflow views were invalidated without an immediate source-window refresh.",
+                context={"views": list(requested_sections), "reason": str(reason or "")},
+            )
+            return
+        try:
+            self._refresh_visible_depot_views(
+                *requested_sections,
+                force=force,
+                reason=reason,
+                ttl_ms=DEPOT_VIEW_TTL_MS,
+                window_scope=source_kind,
+            )
+        except Exception as exc:
+            _runtime_log_event(
+                "sync.depot_linked_refresh_failed",
+                severity="warning",
+                summary="A linked shared workflow refresh failed after invalidation.",
+                exc=exc,
+                context={"views": list(requested_sections), "reason": str(reason or ""), "refresh_scope": source_kind},
+            )
 
     def _export_depot_dashboard(self) -> None:
         dashboard_dialog = self.window_manager.get_window("dashboard")
@@ -1718,13 +1810,13 @@ class QuickInputsWindow(QMainWindow):
         self.editor_title = QLineEdit()
         self.editor_tooltip = QLineEdit()
         self.editor_action_combo = QComboBox()
-        self.editor_action_combo.addItem("Paste Text", "paste_text")
-        self.editor_action_combo.addItem("Open URL(s)", "open_url")
-        self.editor_action_combo.addItem("Open App/File", "open_app")
-        self.editor_action_combo.addItem("Input Sequence", "input_sequence")
+        self.editor_action_combo.addItem("Input Sequence", QUICK_ACTION_INPUT_SEQUENCE)
+        self.editor_action_combo.addItem("Open URL(s)", QUICK_ACTION_OPEN_URL)
+        self.editor_action_combo.addItem("Open App/File", QUICK_ACTION_OPEN_APP)
 
-        self.editor_text = QTextEdit()
+        self.editor_text = QTextEdit(self.quick_editor_dialog)
         self.editor_text.setFixedHeight(82)
+        self.editor_text.hide()
         
         self.editor_macro = QTextEdit()
         self.editor_macro.setFixedHeight(82)
@@ -1803,13 +1895,12 @@ class QuickInputsWindow(QMainWindow):
         form.addRow("Title", self.editor_title)
         form.addRow("Context", self.editor_tooltip)
         form.addRow("Action", self.editor_action_combo)
-        form.addRow("Text", self.editor_text)
         form.addRow("Input Sequence", self.editor_macro_wrap)
         form.addRow("Apps/Files", self.editor_apps_wrap)
         form.addRow("URLs", self.editor_urls)
         form.addRow("Browser", self.editor_browser_wrap)
         self.editor_form = form
-        self.editor_text_label = form.labelForField(self.editor_text)
+        self.editor_text_label = None
         self.editor_macro_label = form.labelForField(self.editor_macro_wrap)
         self.editor_apps_label = form.labelForField(self.editor_apps_wrap)
         self.editor_urls_label = form.labelForField(self.editor_urls)
@@ -2469,20 +2560,20 @@ class QuickInputsWindow(QMainWindow):
         layout.addWidget(self.settings_tabs, 1)
         return page
 
-    def _quick_button_style_tokens(self, font_size: int, button_opacity: float, shape: str, action_type: str = "paste_text") -> tuple[int, int, str, str, str, str]:
+    def _quick_button_style_tokens(self, font_size: int, button_opacity: float, shape: str, action_type: str = QUICK_ACTION_INPUT_SEQUENCE) -> tuple[int, int, str, str, str, str]:
         font_size = int(clamp(font_size, 8, 20))
         button_opacity = float(clamp(button_opacity, 0.15, 1.0))
         palette = self.palette_data
 
         # Adjust base color based on action type for subtle distinction
         base_bg = palette["button_bg"]
-        if action_type == "open_url":
+        if action_type == QUICK_ACTION_OPEN_URL:
             # Shift toward accent color for web links
             base_bg = blend(palette['button_bg'], palette['accent'], 0.25)
-        elif action_type == "open_app":
+        elif action_type == QUICK_ACTION_OPEN_APP:
             # Shift toward primary color for apps
             base_bg = blend(palette['button_bg'], palette['primary'], 0.25)
-        elif action_type in {"input_sequence", "macro_sequence"}:
+        elif action_type in {QUICK_ACTION_INPUT_SEQUENCE, "macro_sequence", "paste_text"}:
             # Shift toward surface color for input sequences.
             base_bg = blend(palette['button_bg'], palette['surface'], 0.35)
 
@@ -2679,7 +2770,7 @@ class QuickInputsWindow(QMainWindow):
         shape: str,
         font_family: str | None = None,
         padding: str = "2px 20px 2px 8px",
-        action_type: str = "paste_text",
+        action_type: str = QUICK_ACTION_INPUT_SEQUENCE,
     ) -> str:
         radius, border, shape_bg, border_color, hover_bg, text_color = self._quick_button_style_tokens(font_size, button_opacity, shape, action_type)
         family_value = str(font_family or self.config.get("quick_button_font_family", "Segoe UI"))
@@ -3171,7 +3262,7 @@ class QuickInputsWindow(QMainWindow):
         self._ui_opacity_anim.stop()
         self._set_ui_opacity(1.0)
 
-    # ----------------------- Quick Text Screen ---------------------- #
+    # ----------------------- Quick Input Screen --------------------- #
     def _build_quick_radial_menu(self) -> None:
         self.quick_radial_menu = QuickRadialMenu(self)
         self.quick_radial_menu.action_requested.connect(self._handle_quick_radial_action)
@@ -3471,7 +3562,7 @@ class QuickInputsWindow(QMainWindow):
         can_persist_positions = self._quick_positions_can_persist()
 
         if not quick_texts:
-            self.quick_canvas.set_placeholder("No quick text buttons yet.", self.palette_data["muted_text"])
+            self.quick_canvas.set_placeholder("No quick input buttons yet.", self.palette_data["muted_text"])
             return
 
         width = int(self.config.get("quick_button_width", 140))
@@ -3542,21 +3633,17 @@ class QuickInputsWindow(QMainWindow):
             entry = quick_texts[index]
             self.editor_title.setText(str(entry.get("title", "")))
             self.editor_tooltip.setText(str(entry.get("tooltip", "")))
-            action = str(entry.get("action", "paste_text")).strip().lower()
-            if action == "macro_sequence":
-                action = "input_sequence"
+            action = self._quick_action_kind(entry)
             action_index = self.editor_action_combo.findData(action)
             if action_index < 0:
-                action_index = self.editor_action_combo.findData("paste_text")
+                action_index = self.editor_action_combo.findData(QUICK_ACTION_INPUT_SEQUENCE)
             self.editor_action_combo.setCurrentIndex(max(0, action_index))
-            
-            # Handle input sequence vs regular text.
-            if action == "input_sequence":
+
+            if action == QUICK_ACTION_INPUT_SEQUENCE:
                 self.editor_macro.setPlainText(str(entry.get("text", "")))
-                self.editor_text.setPlainText("")
             else:
-                self.editor_text.setPlainText(str(entry.get("text", "")))
                 self.editor_macro.setPlainText("")
+            self.editor_text.setPlainText("")
             
             app_targets = str(entry.get("app_targets", "")).strip()
             if not app_targets:
@@ -3598,24 +3685,27 @@ class QuickInputsWindow(QMainWindow):
     def save_quick_editor(self) -> None:
         title = self.editor_title.text().strip() or "Untitled"
         tooltip = self.editor_tooltip.text().strip()
-        action = str(self.editor_action_combo.currentData() or "paste_text")
-        text = self.editor_text.toPlainText()
-        macro = self.editor_macro.toPlainText()
+        action = str(self.editor_action_combo.currentData() or QUICK_ACTION_INPUT_SEQUENCE)
+        text = self.editor_macro.toPlainText()
         app_targets = self.editor_apps.toPlainText().strip()
         urls = self.editor_urls.toPlainText().strip()
         browser_path = str(self.editor_browser_combo.currentData() or "").strip()
 
-        if action == "paste_text":
-            macro = ""
+        if action in LEGACY_QUICK_INPUT_ACTIONS:
+            action = QUICK_ACTION_INPUT_SEQUENCE
+        elif action not in QUICK_ACTIONS:
+            _runtime_log_event(
+                "ui.quick_editor_unknown_action_defaulted",
+                severity="warning",
+                summary="Quick input editor encountered an unknown action and defaulted to Input Sequence.",
+                context={"action": action, "title": title},
+            )
+            action = QUICK_ACTION_INPUT_SEQUENCE
+
+        if action == QUICK_ACTION_INPUT_SEQUENCE:
             app_targets = ""
             urls = ""
             browser_path = ""
-        elif action == "input_sequence":
-            text = macro
-            app_targets = ""
-            urls = ""
-            browser_path = ""
-            macro = ""
             if self._input_sequence_contains_blocked_credentials(text):
                 _runtime_log_event(
                     "ui.quick_input_sequence_sensitive_content_blocked",
@@ -3630,13 +3720,11 @@ class QuickInputsWindow(QMainWindow):
                     "Please remove sensitive fields and save again.",
                 )
                 return
-        elif action == "open_url":
+        elif action == QUICK_ACTION_OPEN_URL:
             text = ""
-            macro = ""
             app_targets = ""
-        elif action == "open_app":
+        elif action == QUICK_ACTION_OPEN_APP:
             text = ""
-            macro = ""
             urls = ""
             browser_path = ""
 
@@ -3713,26 +3801,6 @@ class QuickInputsWindow(QMainWindow):
         if pid.value != os.getpid():
             self.last_external_hwnd = int(hwnd)
 
-    def _refresh_shared_data(self) -> None:
-        if not self.isVisible():
-            return
-
-        try:
-            self._refresh_shared_editable_icons()
-            self._refresh_visible_depot_views(
-                *self._all_depot_refresh_sections(),
-                force=False,
-                reason="background",
-                ttl_ms=DEPOT_BACKGROUND_AUTO_REFRESH_MS,
-            )
-        except Exception as exc:
-            _runtime_log_event(
-                "sync.shared_data_refresh_failed",
-                severity="warning",
-                summary="Periodic shared database refresh failed.",
-                exc=exc,
-            )
-
     def _is_shift_pressed(self) -> bool:
         return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
 
@@ -3806,73 +3874,176 @@ class QuickInputsWindow(QMainWindow):
         for mod in reversed(modifiers):
             user32.keybd_event(mod, 0, KEYEVENTF_KEYUP, 0)
 
+    @staticmethod
+    def _append_input_sequence_text(commands: list[dict[str, Any]], text: str) -> None:
+        if not text:
+            return
+        if commands and commands[-1].get("action") == "type":
+            commands[-1]["text"] = str(commands[-1].get("text", "")) + text
+        else:
+            commands.append({"action": "type", "text": text})
+
     def _parse_macro_sequence(self, sequence: str) -> list[dict[str, Any]]:
-        """Parse an input sequence into supported commands.
-
-        Supported syntax:
-        - plain text
-        - [tab]
-        - [enter]
-        - [delay: ms]
-        """
-        import re
-        
+        """Parse an input sequence into literal text, key commands, and delay commands."""
+        sequence_text = str(sequence or "")
         commands: list[dict[str, Any]] = []
-        
-        # Find all [commands] and plain text segments
-        pattern = r'(\[([^\]]+)\]|[^\[\]]+)'
-        matches = re.finditer(pattern, sequence)
-        
-        for match in matches:
-            part = match.group(0).strip()
-            if not part:
-                continue
-                
-            # Check if this part is a [command]
-            if part.startswith('[') and part.endswith(']'):
-                content = part[1:-1].strip()
-                
-                # Parse the command
-                if ':' in content:
-                    cmd_type, cmd_value = content.split(':', 1)
-                    cmd_type = cmd_type.strip().lower()
-                    cmd_value = cmd_value.strip()
+        cursor = 0
 
-                    if cmd_type == 'delay':
-                        try:
-                            delay_ms = int(cmd_value)
-                            if 0 <= delay_ms <= 60000:  # Max 60 seconds
-                                commands.append({'action': 'delay', 'ms': delay_ms})
-                        except ValueError as exc:
+        for match in re.finditer(r"\[[^\]]*\]", sequence_text):
+            if match.start() > cursor:
+                self._append_input_sequence_text(commands, sequence_text[cursor : match.start()])
+
+            token = match.group(0)
+            content = token[1:-1].strip()
+            handled = False
+            if ":" in content:
+                cmd_type, cmd_value = content.split(":", 1)
+                if cmd_type.strip().lower() == "delay":
+                    raw_delay = cmd_value.strip()
+                    try:
+                        delay_ms = int(raw_delay)
+                        if 0 <= delay_ms <= 60000:
+                            commands.append({"action": "delay", "ms": delay_ms})
+                            handled = True
+                        else:
                             _runtime_log_event(
-                                "runtime.macro_delay_parse_failed",
+                                "runtime.input_sequence_delay_out_of_range",
                                 severity="warning",
-                                summary="Invalid [delay: ms] command value in input sequence; command skipped.",
-                                exc=exc,
-                                context={"raw_value": cmd_value, "sequence_preview": sequence[:240]},
+                                summary="Input Sequence delay command was outside the supported 0-60000 ms range and will be pasted literally.",
+                                context={"raw_value": raw_delay},
                             )
-                else:
-                    # Single-word commands: [tab], [enter].
-                    cmd_name = content.lower()
-                    if cmd_name == 'tab':
-                        commands.append({'action': 'key', 'key': 'tab'})
-                    elif cmd_name in {'enter', 'return'}:
-                        commands.append({'action': 'key', 'key': 'enter'})
+                    except ValueError as exc:
+                        _runtime_log_event(
+                            "runtime.input_sequence_delay_parse_failed",
+                            severity="warning",
+                            summary="Invalid Input Sequence delay command value; command will be pasted literally.",
+                            exc=exc,
+                            context={"raw_value": raw_delay},
+                        )
             else:
-                # Plain text - treat as type command
-                text = part.strip()
-                if text:
-                    commands.append({'action': 'type', 'text': text})
-        
+                cmd_name = content.lower()
+                if cmd_name == "tab":
+                    commands.append({"action": "key", "key": "tab"})
+                    handled = True
+                elif cmd_name in {"enter", "return"}:
+                    commands.append({"action": "key", "key": "enter"})
+                    handled = True
+
+            if not handled:
+                self._append_input_sequence_text(commands, token)
+            cursor = match.end()
+
+        if cursor < len(sequence_text):
+            self._append_input_sequence_text(commands, sequence_text[cursor:])
+
         return commands
 
-    def _execute_macro_sequence(self, sequence: str) -> None:
-        """Execute a parsed macro sequence."""
-        if os.name != "nt" or user32 is None:
+    def _clone_clipboard_mime_data(self) -> QMimeData | None:
+        try:
+            source = QGuiApplication.clipboard().mimeData()
+            clone = QMimeData()
+            if source is None:
+                return clone
+            if source.hasText():
+                clone.setText(source.text())
+            if source.hasHtml():
+                clone.setHtml(source.html())
+            if source.hasUrls():
+                clone.setUrls(source.urls())
+            if source.hasImage():
+                clone.setImageData(source.imageData())
+            if source.hasColor():
+                clone.setColorData(source.colorData())
+            for fmt in source.formats():
+                if fmt not in clone.formats():
+                    clone.setData(fmt, QByteArray(source.data(fmt)))
+            return clone
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_clipboard_snapshot_failed",
+                severity="critical",
+                summary="Quick input could not snapshot the clipboard before temporary paste.",
+                exc=exc,
+            )
+            _escalate_runtime_issue_once(
+                "runtime.quick_input_clipboard_snapshot_failed",
+                "Quick input could not safely preserve the clipboard.",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+            return None
+
+    def _restore_clipboard_mime_data(self, snapshot: QMimeData | None) -> None:
+        if snapshot is None:
             return
-        
-        # Restore focus to the external window before executing macro
-        if self.last_external_hwnd:
+        try:
+            QGuiApplication.clipboard().setMimeData(snapshot)
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_clipboard_restore_failed",
+                severity="critical",
+                summary="Quick input failed to restore the previous clipboard content.",
+                exc=exc,
+            )
+            _escalate_runtime_issue_once(
+                "runtime.quick_input_clipboard_restore_failed",
+                "Quick input could not restore the previous clipboard.",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _paste_input_sequence_text(self, text: str, *, send_paste_keys: bool = True) -> bool:
+        if not text:
+            return True
+        try:
+            QGuiApplication.clipboard().setText(text)
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_clipboard_set_failed",
+                severity="critical",
+                summary="Quick input failed to place temporary text on the clipboard.",
+                exc=exc,
+                context={"text_length": len(text)},
+            )
+            _escalate_runtime_issue_once(
+                "runtime.quick_input_clipboard_set_failed",
+                "Quick input could not place temporary text on the clipboard.",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+        if not send_paste_keys:
+            return True
+
+        try:
+            time.sleep(0.05)
+            self._send_ctrl_v()
+            time.sleep(0.08)
+            return True
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_paste_keys_failed",
+                severity="critical",
+                summary="Quick input failed while sending paste keystrokes.",
+                exc=exc,
+                context={"text_length": len(text)},
+            )
+            _escalate_runtime_issue_once(
+                "runtime.quick_input_paste_keys_failed",
+                "Quick input could not send paste keystrokes.",
+                details=f"{type(exc).__name__}: {exc}",
+            )
+            return False
+
+    def _execute_macro_sequence(self, sequence: str, *, send_paste_keys: bool = True) -> None:
+        """Execute a parsed input sequence."""
+        if send_paste_keys and (os.name != "nt" or user32 is None):
+            _runtime_log_event(
+                "runtime.input_sequence_platform_unsupported",
+                severity="warning",
+                summary="Input Sequence could not execute because Windows keyboard automation is unavailable.",
+            )
+            return
+
+        if send_paste_keys and self.last_external_hwnd:
             hwnd = int(self.last_external_hwnd)
             try:
                 user32.ShowWindow(hwnd, SW_RESTORE)
@@ -3880,46 +4051,58 @@ class QuickInputsWindow(QMainWindow):
                 time.sleep(0.05)
             except Exception as exc:
                 _runtime_log_event(
-                    "runtime.macro_restore_foreground_failed",
+                    "runtime.input_sequence_restore_foreground_failed",
                     severity="warning",
-                    summary="Failed restoring foreground window before executing macro sequence.",
+                    summary="Failed restoring foreground window before executing input sequence.",
                     exc=exc,
                     context={"hwnd": hwnd},
                 )
-        
+
         commands = self._parse_macro_sequence(sequence)
-        
-        for cmd in commands:
-            action = cmd.get('action', '')
-            
-            if action == 'type':
-                text = cmd.get('text', '')
-                if text:
-                    QGuiApplication.clipboard().setText(text)
-                    time.sleep(0.05)  # Small delay before pasting
-                    self._send_ctrl_v()
-                    time.sleep(0.05)  # Small delay after pasting
-            
-            elif action == 'key':
-                key_name = cmd.get('key', '')
-                shift_held = cmd.get('shift', False)
-                alt_held = cmd.get('alt', False)
-                
-                if key_name in KEY_CODES:
-                    key_code = KEY_CODES[key_name]
-                    self._send_key(key_code, shift_held=shift_held, alt_held=alt_held)
-                    time.sleep(0.06)  # Small delay between keys
-            
-            elif action == 'delay':
-                delay_ms = cmd.get('ms', 0)
-                time.sleep(delay_ms / 1000.0)
+        needs_clipboard = any(cmd.get("action") == "type" and str(cmd.get("text", "")) for cmd in commands)
+        clipboard_snapshot = self._clone_clipboard_mime_data() if needs_clipboard else None
+        if needs_clipboard and clipboard_snapshot is None:
+            return
+
+        try:
+            for cmd in commands:
+                action = cmd.get("action", "")
+
+                if action == "type":
+                    text = str(cmd.get("text", ""))
+                    if text and not self._paste_input_sequence_text(text, send_paste_keys=send_paste_keys):
+                        return
+
+                elif action == "key":
+                    key_name = str(cmd.get("key", ""))
+                    shift_held = bool(cmd.get("shift", False))
+                    alt_held = bool(cmd.get("alt", False))
+
+                    if send_paste_keys and key_name in KEY_CODES:
+                        key_code = KEY_CODES[key_name]
+                        self._send_key(key_code, shift_held=shift_held, alt_held=alt_held)
+                        time.sleep(0.06)
+
+                elif action == "delay":
+                    delay_ms = safe_int(cmd.get("ms", 0), 0)
+                    if send_paste_keys:
+                        time.sleep(delay_ms / 1000.0)
+        finally:
+            if needs_clipboard:
+                self._restore_clipboard_mime_data(clipboard_snapshot)
 
     def _quick_action_kind(self, entry: dict[str, Any]) -> str:
-        action = str(entry.get("action", "paste_text")).strip().lower()
-        if action == "macro_sequence":
-            action = "input_sequence"
-        if action not in {"paste_text", "open_url", "open_app", "input_sequence"}:
-            return "paste_text"
+        action = str(entry.get("action", QUICK_ACTION_INPUT_SEQUENCE)).strip().lower()
+        if action in LEGACY_QUICK_INPUT_ACTIONS:
+            return QUICK_ACTION_INPUT_SEQUENCE
+        if action not in QUICK_ACTIONS:
+            _runtime_log_event(
+                "runtime.quick_action_unknown_defaulted",
+                severity="warning",
+                summary="Unknown quick input action was defaulted to Input Sequence at runtime.",
+                context={"action": action, "title": str(entry.get("title", ""))},
+            )
+            return QUICK_ACTION_INPUT_SEQUENCE
         return action
 
     def _detect_installed_browsers(self) -> list[tuple[str, str]]:
@@ -4026,29 +4209,20 @@ class QuickInputsWindow(QMainWindow):
         field.setVisible(visible)
 
     def _update_quick_editor_action_ui(self) -> None:
-        action = str(self.editor_action_combo.currentData() or "paste_text")
-        text_mode = action == "paste_text"
-        input_mode = action in {"input_sequence", "macro_sequence"}
-        url_mode = action == "open_url"
-        app_mode = action == "open_app"
+        action = str(self.editor_action_combo.currentData() or QUICK_ACTION_INPUT_SEQUENCE)
+        if action in LEGACY_QUICK_INPUT_ACTIONS or action not in QUICK_ACTIONS:
+            action = QUICK_ACTION_INPUT_SEQUENCE
+        input_mode = action == QUICK_ACTION_INPUT_SEQUENCE
+        url_mode = action == QUICK_ACTION_OPEN_URL
+        app_mode = action == QUICK_ACTION_OPEN_APP
 
-        self._set_editor_row_visible(self.editor_text_label, self.editor_text, text_mode)
+        self._set_editor_row_visible(self.editor_text_label, self.editor_text, False)
         self._set_editor_row_visible(self.editor_macro_label, self.editor_macro_wrap, input_mode)
         self._set_editor_row_visible(self.editor_apps_label, self.editor_apps_wrap, app_mode)
         self._set_editor_row_visible(self.editor_urls_label, self.editor_urls, url_mode)
         self._set_editor_row_visible(self.editor_browser_label, self.editor_browser_wrap, url_mode)
 
-        if action == "paste_text":
-            self.editor_text.setPlaceholderText("Text to copy + paste into the last selected app.")
-            self.editor_macro.setPlaceholderText("")
-            self.editor_macro.setEnabled(False)
-            self.editor_apps.setEnabled(False)
-            self.editor_apps_browse.setEnabled(False)
-            self.editor_apps_browse_folder.setEnabled(False)
-            self.editor_urls.setEnabled(False)
-            self.editor_browser_combo.setEnabled(False)
-            self.editor_refresh_browsers_button.setEnabled(False)
-        elif action in {"input_sequence", "macro_sequence"}:
+        if action == QUICK_ACTION_INPUT_SEQUENCE:
             self.editor_macro.setPlaceholderText("Format: Bin location [enter]  (credentials are blocked)")
             self.editor_macro.setEnabled(True)
             self.editor_text.setPlaceholderText("")
@@ -4059,7 +4233,7 @@ class QuickInputsWindow(QMainWindow):
             self.editor_urls.setEnabled(False)
             self.editor_browser_combo.setEnabled(False)
             self.editor_refresh_browsers_button.setEnabled(False)
-        elif action == "open_url":
+        elif action == QUICK_ACTION_OPEN_URL:
             self.editor_urls.setPlaceholderText("One URL per line.")
             self.editor_macro.setPlaceholderText("")
             self.editor_macro.setEnabled(False)
@@ -4085,17 +4259,15 @@ class QuickInputsWindow(QMainWindow):
         if not hasattr(self, "quick_editor_dialog"):
             return
         desired_height = {
-            "paste_text": 350,
-            "input_sequence": 390,
-            "macro_sequence": 390,
-            "open_app": 410,
-            "open_url": 410,
+            QUICK_ACTION_INPUT_SEQUENCE: 390,
+            QUICK_ACTION_OPEN_APP: 410,
+            QUICK_ACTION_OPEN_URL: 410,
         }.get(str(action or "").strip(), 390)
         self.quick_editor_dialog.resize(max(430, int(self.quick_editor_dialog.width())), desired_height)
 
     def browse_quick_apps(self) -> None:
-        action = str(self.editor_action_combo.currentData() or "paste_text")
-        if action != "open_app":
+        action = str(self.editor_action_combo.currentData() or QUICK_ACTION_INPUT_SEQUENCE)
+        if action != QUICK_ACTION_OPEN_APP:
             return
         current_lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
         current = current_lines[-1] if current_lines else ""
@@ -4120,8 +4292,8 @@ class QuickInputsWindow(QMainWindow):
         self.editor_apps.setPlainText("\n".join(lines))
 
     def browse_quick_app_folder(self) -> None:
-        action = str(self.editor_action_combo.currentData() or "paste_text")
-        if action != "open_app":
+        action = str(self.editor_action_combo.currentData() or QUICK_ACTION_INPUT_SEQUENCE)
+        if action != QUICK_ACTION_OPEN_APP:
             return
         current_lines = [line.strip() for line in self.editor_apps.toPlainText().splitlines() if line.strip()]
         current = current_lines[-1] if current_lines else ""
@@ -4167,29 +4339,6 @@ class QuickInputsWindow(QMainWindow):
     def _insert_macro_simple(self, command: str) -> None:
         """Insert a simple predefined command."""
         self._insert_macro_command(command)
-
-    def _insert_text_payload(self, text: str) -> None:
-        if not text:
-            return
-        QGuiApplication.clipboard().setText(text)
-        if os.name == "nt" and user32 is not None and self.last_external_hwnd:
-            hwnd = int(self.last_external_hwnd)
-            try:
-                user32.ShowWindow(hwnd, SW_RESTORE)
-                user32.SetForegroundWindow(hwnd)
-                time.sleep(0.05)
-                self._send_ctrl_v()
-            except Exception as exc:
-                _runtime_log_event(
-                    "runtime.insert_text_foreground_restore_failed",
-                    severity="warning",
-                    summary="Failed restoring target window before paste; using direct Ctrl+V fallback.",
-                    exc=exc,
-                    context={"hwnd": hwnd, "text_length": len(text)},
-                )
-                self._send_ctrl_v()
-        else:
-            self._send_ctrl_v()
 
     def _open_url_target(self, target: str, browser_path: str = "") -> bool:
         target = target.strip()
@@ -4296,7 +4445,7 @@ class QuickInputsWindow(QMainWindow):
         urls = str(entry.get("urls", ""))
         browser_path = str(entry.get("browser_path", "")).strip()
 
-        if action == "open_url":
+        if action == QUICK_ACTION_OPEN_URL:
             opened = self._open_url_targets(urls, browser_path=browser_path, fallback_target=target, fallback_text=text)
             if not opened:
                 context = {
@@ -4318,7 +4467,7 @@ class QuickInputsWindow(QMainWindow):
                     details="Review the URLs and browser path configured for this quick action.",
                     context=context,
                 )
-        elif action == "open_app":
+        elif action == QUICK_ACTION_OPEN_APP:
             opened = self._open_app_targets(app_targets, fallback_target=target, fallback_text=text)
             if not opened:
                 context = {
@@ -4339,10 +4488,8 @@ class QuickInputsWindow(QMainWindow):
                     details="Verify the path(s) and launch permissions for this quick action.",
                     context=context,
                 )
-        elif action in {"input_sequence", "macro_sequence"}:
-            self._execute_macro_sequence(text)
         else:
-            self._insert_text_payload(text)
+            self._execute_macro_sequence(text)
 
     # ------------------------- Theme Screen ------------------------- #
     def refresh_theme_controls(self) -> None:

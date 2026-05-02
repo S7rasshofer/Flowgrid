@@ -384,6 +384,8 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_repair_owner = QLineEdit()
         self.qa_repair_owner.setReadOnly(True)
         self.qa_repair_owner.setPlaceholderText("Latest Part Order repair owner")
+        self.qa_repair_owner_refresh_btn = QPushButton("Refresh")
+        self.qa_repair_owner_refresh_btn.setProperty("actionRole", "pick")
         self.qa_client_check = QCheckBox("Client")
         self.qa_comments = QLineEdit()
         self.qa_flag_combo = QComboBox()
@@ -425,8 +427,15 @@ class DepotQAWindow(DepotFramelessToolWindow):
         self.qa_bulk_import_status.setWordWrap(True)
         self.qa_bulk_import_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        repair_owner_row_wrap = QWidget(self.submit_tab)
+        repair_owner_row = QHBoxLayout(repair_owner_row_wrap)
+        repair_owner_row.setContentsMargins(0, 0, 0, 0)
+        repair_owner_row.setSpacing(6)
+        repair_owner_row.addWidget(self.qa_repair_owner, 1)
+        repair_owner_row.addWidget(self.qa_repair_owner_refresh_btn, 0)
+
         layout.addRow("Work Order", self.qa_work_order)
-        layout.addRow("Repair Owner", self.qa_repair_owner)
+        layout.addRow("Repair Owner", repair_owner_row_wrap)
         layout.addRow("Client", self.qa_client_check)
         layout.addRow("Flag", self.qa_flag_combo)
         layout.addRow("QA Comment", self.qa_comments)
@@ -435,6 +444,9 @@ class DepotQAWindow(DepotFramelessToolWindow):
         layout.addRow("", self.qa_bulk_import_status)
 
         self.qa_work_order.textChanged.connect(lambda _text: self._qa_owner_preview_timer.start())
+        self.qa_repair_owner_refresh_btn.clicked.connect(
+            lambda _checked=False: self._refresh_repair_owner_preview(force=True, reason="manual", ttl_ms=0)
+        )
         self.qa_work_order.returnPressed.connect(self._submit_qa_part)
 
     def _refresh_repair_owner_preview(
@@ -451,40 +463,60 @@ class DepotQAWindow(DepotFramelessToolWindow):
         if not self._should_refresh_depot_view("qa_owner", state_key, force=force, ttl_ms=ttl_ms, reason=reason):
             return
         started = time.monotonic()
-        if not work_order:
-            self.qa_repair_owner.clear()
-            self.qa_repair_owner.setPlaceholderText("Latest Part Order repair owner")
+        try:
+            if not work_order:
+                self.qa_repair_owner.clear()
+                self.qa_repair_owner.setPlaceholderText("Latest Part Order repair owner")
+                self._mark_depot_view_refreshed(
+                    "qa_owner",
+                    state_key,
+                    payload="",
+                    reason=reason,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                    row_count=0,
+                )
+                return
+            source_submission = self.tracker.get_latest_part_order_submission(work_order)
+            if source_submission is None:
+                self.qa_repair_owner.setText("No Part Order submission")
+                self._mark_depot_view_refreshed(
+                    "qa_owner",
+                    state_key,
+                    payload="No Part Order submission",
+                    reason=reason,
+                    duration_ms=(time.monotonic() - started) * 1000.0,
+                    row_count=0,
+                )
+                return
+            owner_user_id = DepotRules.normalize_user_id(str(source_submission.get("user_id", "") or ""))
+            self.qa_repair_owner.setText(owner_user_id if owner_user_id else "Repair owner unavailable")
             self._mark_depot_view_refreshed(
                 "qa_owner",
                 state_key,
-                payload="",
+                payload=owner_user_id,
                 reason=reason,
                 duration_ms=(time.monotonic() - started) * 1000.0,
-                row_count=0,
+                row_count=1,
             )
-            return
-        source_submission = self.tracker.get_latest_part_order_submission(work_order)
-        if source_submission is None:
-            self.qa_repair_owner.setText("No Part Order submission")
-            self._mark_depot_view_refreshed(
-                "qa_owner",
-                state_key,
-                payload="No Part Order submission",
-                reason=reason,
-                duration_ms=(time.monotonic() - started) * 1000.0,
-                row_count=0,
+        except Exception as exc:
+            self.qa_repair_owner.setText("Repair owner lookup failed")
+            _runtime_log_event(
+                "ui.qa_repair_owner_preview_failed",
+                severity="warning",
+                summary="QA repair-owner preview refresh failed.",
+                exc=exc,
+                context={
+                    "user_id": str(self.current_user),
+                    "work_order": work_order,
+                    "reason": str(reason or ""),
+                },
             )
-            return
-        owner_user_id = DepotRules.normalize_user_id(str(source_submission.get("user_id", "") or ""))
-        self.qa_repair_owner.setText(owner_user_id if owner_user_id else "Repair owner unavailable")
-        self._mark_depot_view_refreshed(
-            "qa_owner",
-            state_key,
-            payload=owner_user_id,
-            reason=reason,
-            duration_ms=(time.monotonic() - started) * 1000.0,
-            row_count=1,
-        )
+            if str(reason or "").strip().lower() == "manual":
+                self._show_themed_message(
+                    QMessageBox.Icon.Warning,
+                    "Refresh Failed",
+                    "Repair owner could not be refreshed. Details were logged for support.",
+                )
 
     def _confirm_qa_flag_retention(self, work_order: str, selected_flag: str) -> str | None:
         selected_flag_text = str(selected_flag or "").strip()

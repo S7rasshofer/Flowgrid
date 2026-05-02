@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -876,6 +877,15 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
             }
         )
         save_install_state(final_state)
+        runtime_result = verify_runtime()
+        checks = _build_update_checks(
+            source_detail=f"{_update_source_label(final_state)} at {remote.get('short_sha', '')}.",
+            state=final_state,
+            asset_result=asset_result,
+            runtime_result=runtime_result,
+            update_status="up_to_date",
+            update_detail="No code changes were needed.",
+        )
         return {
             "status": "up_to_date",
             "summary": final_summary,
@@ -884,6 +894,8 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
             "removed": 0,
             "state": final_state,
             "remote": remote,
+            "runtime": runtime_result,
+            "checks": checks,
         }
 
     try:
@@ -924,6 +936,15 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
     )
     final_state.update({"last_check_summary": summary, "last_check_status": "up_to_date"})
     save_install_state(final_state)
+    runtime_result = verify_runtime()
+    checks = _build_update_checks(
+        source_detail=f"{_update_source_label(final_state)} at {remote.get('short_sha', '')}.",
+        state=final_state,
+        asset_result=asset_result,
+        runtime_result=runtime_result,
+        update_status="updated",
+        update_detail=f"Copied {apply_result['copied']}, unchanged {apply_result['unchanged']}, removed {apply_result['removed']}.",
+    )
     _runtime_log_event(
         "update.apply_complete",
         severity="info",
@@ -946,6 +967,8 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
         "removed": apply_result["removed"],
         "state": final_state,
         "remote": remote,
+        "runtime": runtime_result,
+        "checks": checks,
     }
 
 
@@ -1166,7 +1189,429 @@ def _wait_for_parent_exit(parent_pid: int) -> None:
                 pass
 
 
+def _path_is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _safe_path_exists(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_file()
+    except Exception:
+        return False
+
+
+def _dedupe_runtime_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in candidates:
+        gui_path = Path(str(candidate.get("gui_path") or ""))
+        cli_path = Path(str(candidate.get("cli_path") or ""))
+        try:
+            key = (str(gui_path.resolve()).lower(), str(cli_path.resolve()).lower())
+        except Exception:
+            key = (str(gui_path).lower(), str(cli_path).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _python_launcher_pair(path: Path) -> tuple[Path, Path]:
+    name = path.name.lower()
+    if name == "pythonw.exe":
+        cli_path = path.with_name("python.exe")
+        return path, cli_path if _safe_path_exists(cli_path) else path
+    if name == "python.exe":
+        gui_path = path.with_name("pythonw.exe")
+        return gui_path if _safe_path_exists(gui_path) else path, path
+    return path, path
+
+
+def _add_python_candidate(
+    candidates: list[dict[str, Any]],
+    path: Path,
+    *,
+    category: str,
+    label: str,
+) -> None:
+    if not _safe_path_exists(path):
+        return
+    gui_path, cli_path = _python_launcher_pair(path)
+    candidates.append(
+        {
+            "category": str(category or "system"),
+            "label": str(label or "Python runtime"),
+            "gui_path": str(gui_path),
+            "cli_path": str(cli_path),
+        }
+    )
+
+
+def _iter_py_launcher_paths() -> Iterator[Path]:
+    if os.name != "nt":
+        return
+    try:
+        result = subprocess.run(
+            ["py", "-0p"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        _runtime_log_event(
+            "update.py_launcher_discovery_failed",
+            severity="info",
+            summary="Python launcher discovery failed during runtime verification.",
+            exc=exc,
+        )
+        return
+    if result.returncode != 0:
+        return
+    for line in str(result.stdout or "").splitlines():
+        marker_index = line.find(":\\")
+        if marker_index <= 0:
+            continue
+        raw_path = line[marker_index - 1 :].strip()
+        if raw_path:
+            yield Path(raw_path)
+
+
+def _runtime_candidate_specs() -> list[dict[str, Any]]:
+    local_root = _local_data_root()
+    candidates: list[dict[str, Any]] = []
+
+    for env_name in ("FLOWGRID_RUNTIME_PYTHON", "FLOWGRID_PYTHON"):
+        raw_value = str(os.environ.get(env_name, "") or "").strip()
+        if raw_value:
+            _add_python_candidate(
+                candidates,
+                Path(raw_value),
+                category="local",
+                label=f"{env_name} Flowgrid runtime",
+            )
+
+    local_relative_paths = (
+        "pythonw.exe",
+        "python.exe",
+        "Scripts/pythonw.exe",
+        "Scripts/python.exe",
+    )
+    for relative_path in local_relative_paths:
+        _add_python_candidate(
+            candidates,
+            local_root / Path(relative_path),
+            category="local",
+            label="Bundled/local Flowgrid runtime",
+        )
+
+    embedded_roots = ("runtime", "Runtime", ".venv", "venv", "python", "Python", "embedded", "Embedded")
+    embedded_relative_paths = (
+        "pythonw.exe",
+        "python.exe",
+        "Scripts/pythonw.exe",
+        "Scripts/python.exe",
+    )
+    for root_name in embedded_roots:
+        root = local_root / root_name
+        for relative_path in embedded_relative_paths:
+            _add_python_candidate(
+                candidates,
+                root / Path(relative_path),
+                category="embedded",
+                label="Embedded Flowgrid runtime",
+            )
+
+    for raw_prefix in (getattr(sys, "prefix", ""), getattr(sys, "exec_prefix", "")):
+        prefix_text = str(raw_prefix or "").strip()
+        if not prefix_text:
+            continue
+        prefix_path = Path(prefix_text)
+        if not _path_is_under(prefix_path, local_root):
+            continue
+        for relative_path in embedded_relative_paths:
+            _add_python_candidate(
+                candidates,
+                prefix_path / Path(relative_path),
+                category="embedded",
+                label="Embedded Flowgrid runtime",
+            )
+
+    for raw in (getattr(sys, "_base_executable", ""), sys.executable):
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        category = "local" if _path_is_under(path, local_root) else "system"
+        label = "Bundled/local Flowgrid runtime" if category == "local" else "System Python"
+        _add_python_candidate(candidates, path, category=category, label=label)
+        if path.name.lower() == "python.exe":
+            _add_python_candidate(candidates, path.with_name("pythonw.exe"), category=category, label=label)
+        elif path.name.lower() == "pythonw.exe":
+            _add_python_candidate(candidates, path.with_name("python.exe"), category=category, label=label)
+
+    for executable_name in ("pythonw", "python"):
+        resolved = shutil.which(executable_name)
+        if resolved:
+            _add_python_candidate(candidates, Path(resolved), category="system", label="System Python")
+
+    for path in _iter_py_launcher_paths():
+        _add_python_candidate(candidates, path, category="system", label="System Python")
+
+    priority = {"local": 0, "embedded": 1, "system": 2}
+    return sorted(
+        _dedupe_runtime_candidates(candidates),
+        key=lambda item: priority.get(str(item.get("category") or "system"), 9),
+    )
+
+
+def _probe_runtime_candidate(candidate: dict[str, Any], local_root: Path) -> dict[str, Any]:
+    cli_path = Path(str(candidate.get("cli_path") or ""))
+    if not _safe_path_exists(cli_path):
+        return {
+            **candidate,
+            "status": "failed",
+            "detail": f"Python launcher not found: {cli_path}",
+        }
+
+    script = "\n".join(
+        [
+            "import json",
+            "import sys",
+            "payload = {'executable': sys.executable}",
+            "try:",
+            "    import PySide6",
+            "    payload['pyside6'] = str(getattr(PySide6, '__file__', '') or '')",
+            "    print(json.dumps(payload))",
+            "except Exception as exc:",
+            "    payload['error'] = f'{type(exc).__name__}: {exc}'",
+            "    print(json.dumps(payload), file=sys.stderr)",
+            "    raise",
+        ]
+    )
+    env = os.environ.copy()
+    existing_pythonpath = str(env.get("PYTHONPATH", "") or "").strip()
+    env["PYTHONPATH"] = str(local_root) if not existing_pythonpath else str(local_root) + os.pathsep + existing_pythonpath
+
+    try:
+        result = subprocess.run(
+            [str(cli_path), "-c", script],
+            cwd=str(local_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except Exception as exc:
+        return {
+            **candidate,
+            "status": "failed",
+            "detail": f"{type(exc).__name__}: {exc}",
+        }
+
+    if result.returncode == 0:
+        detail = "PySide6 import verified."
+        stdout_text = str(result.stdout or "").strip()
+        if stdout_text:
+            try:
+                payload = json.loads(stdout_text.splitlines()[-1])
+                pyside_path = str(payload.get("pyside6") or "").strip()
+                if pyside_path:
+                    detail = f"PySide6 import verified at {pyside_path}."
+            except Exception:
+                pass
+        return {
+            **candidate,
+            "status": "ok",
+            "detail": detail,
+        }
+
+    detail = (str(result.stderr or "").strip() or str(result.stdout or "").strip() or "PySide6 import failed.")[-2000:]
+    return {
+        **candidate,
+        "status": "failed",
+        "detail": detail,
+    }
+
+
+def verify_runtime() -> dict[str, Any]:
+    local_root = _local_data_root()
+    attempts: list[dict[str, Any]] = []
+    selected: dict[str, Any] | None = None
+
+    for candidate in _runtime_candidate_specs():
+        attempt = _probe_runtime_candidate(candidate, local_root)
+        attempts.append(attempt)
+        if selected is None and str(attempt.get("status") or "").lower() == "ok":
+            selected = attempt
+
+    if selected is None:
+        runtime_files_present = (
+            (local_root / "Flowgrid.pyw").exists()
+            and (local_root / "flowgrid_app" / "__init__.py").exists()
+        )
+        summary = (
+            "Flowgrid runtime could not import PySide6.\nRepair install?"
+            if runtime_files_present
+            else "Flowgrid runtime missing.\nRepair install?"
+        )
+        _runtime_log_event(
+            "update.runtime_verification_failed",
+            severity="error",
+            summary=summary,
+            context={
+                "local_runtime_root": str(local_root),
+                "attempts": attempts,
+            },
+        )
+        return {
+            "status": "failed",
+            "summary": summary,
+            "detail": summary,
+            "attempts": attempts,
+            "gui_path": "",
+            "cli_path": "",
+            "category": "",
+        }
+
+    local_runtime_verified = str(selected.get("category") or "") in {"local", "embedded"}
+    system_attempts = [item for item in attempts if str(item.get("category") or "") == "system"]
+    system_failures = [item for item in system_attempts if str(item.get("status") or "") != "ok"]
+    system_successes = [item for item in system_attempts if str(item.get("status") or "") == "ok"]
+    detail = str(selected.get("detail") or "Runtime verified.").strip()
+    summary = "Runtime verified."
+    if local_runtime_verified and system_failures and not system_successes:
+        summary = "System Python missing PySide6, bundled Flowgrid runtime verified."
+        detail = summary
+    elif not local_runtime_verified:
+        detail = f"Runtime verified with system Python: {selected.get('cli_path')}"
+
+    _runtime_log_event(
+        "update.runtime_verification_complete",
+        severity="info",
+        summary=summary,
+        context={
+            "selected": selected,
+            "attempt_count": len(attempts),
+            "local_runtime_root": str(local_root),
+        },
+    )
+    return {
+        "status": "ok",
+        "summary": summary,
+        "detail": detail,
+        "attempts": attempts,
+        "gui_path": str(selected.get("gui_path") or ""),
+        "cli_path": str(selected.get("cli_path") or ""),
+        "category": str(selected.get("category") or ""),
+    }
+
+
+def _make_update_check(label: str, status: str, detail: str = "", path: str = "") -> dict[str, str]:
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"ok", "warning", "failed"}:
+        normalized = "ok" if normalized in {"updated", "up_to_date", "complete"} else "failed"
+    return {
+        "label": str(label or "").strip(),
+        "status": normalized,
+        "detail": str(detail or "").strip(),
+        "path": str(path or "").strip(),
+    }
+
+
+def _verify_local_runtime_files() -> dict[str, str]:
+    local_root = _local_data_root()
+    required_paths = (
+        (local_root / "Flowgrid.pyw", "Flowgrid.pyw"),
+        (_get_local_updater_path(), "Flowgrid_updater.pyw"),
+        (local_root / "flowgrid_app" / "__init__.py", "flowgrid_app package"),
+    )
+    missing = [label for path, label in required_paths if not path.exists()]
+    if missing:
+        return _make_update_check(
+            "Verified local files",
+            "failed",
+            f"Missing local runtime files: {', '.join(missing)}.",
+            str(local_root),
+        )
+    return _make_update_check("Verified local files", "ok", "Local runtime files are present.", str(local_root))
+
+
+def _verify_shared_database_reachable(state: dict[str, Any] | None = None) -> dict[str, str]:
+    _ = state
+    try:
+        shared_root = _get_shared_root_from_config()
+        shared_db = shared_root / "Flowgrid_depot.db"
+        if not shared_db.exists() or not shared_db.is_file():
+            return _make_update_check("Shared database reachable", "failed", "Shared workflow DB is missing.", str(shared_db))
+        with sqlite3.connect(str(shared_db), timeout=10.0) as conn:
+            conn.execute("SELECT 1").fetchone()
+        return _make_update_check("Shared database reachable", "ok", "Shared workflow DB opened successfully.", str(shared_db))
+    except Exception as exc:
+        _runtime_log_event(
+            "update.shared_db_verify_failed",
+            severity="warning",
+            summary="Updater could not verify the shared workflow DB after update.",
+            exc=exc,
+        )
+        return _make_update_check(
+            "Shared database reachable",
+            "failed",
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def _runtime_check_from_result(runtime_result: dict[str, Any]) -> dict[str, str]:
+    status = "ok" if str(runtime_result.get("status") or "").lower() == "ok" else "failed"
+    return _make_update_check(
+        "Runtime verified",
+        status,
+        str(runtime_result.get("detail") or runtime_result.get("summary") or ""),
+        str(runtime_result.get("gui_path") or runtime_result.get("cli_path") or ""),
+    )
+
+
+def _asset_check_from_result(asset_result: dict[str, Any]) -> dict[str, str]:
+    raw_status = str(asset_result.get("status") or "").strip().lower()
+    status = raw_status if raw_status in {"ok", "warning", "failed"} else "ok"
+    return _make_update_check(
+        "Assets ready",
+        status,
+        str(asset_result.get("summary") or ""),
+        str(asset_result.get("local_assets_root") or ""),
+    )
+
+
+def _build_update_checks(
+    *,
+    source_detail: str,
+    state: dict[str, Any],
+    asset_result: dict[str, Any],
+    runtime_result: dict[str, Any],
+    update_status: str,
+    update_detail: str,
+) -> list[dict[str, str]]:
+    return [
+        _make_update_check("Connected to update source", "ok", source_detail),
+        _verify_local_runtime_files(),
+        _verify_shared_database_reachable(state),
+        _asset_check_from_result(asset_result),
+        _runtime_check_from_result(runtime_result),
+        _make_update_check("Update complete", "ok", update_detail or update_status),
+    ]
+
+
 def _preferred_gui_python_executable() -> Path:
+    runtime_result = verify_runtime()
+    if str(runtime_result.get("status") or "").lower() == "ok":
+        gui_path = Path(str(runtime_result.get("gui_path") or ""))
+        if _safe_path_exists(gui_path):
+            return gui_path
+
     candidates: list[Path] = []
     for raw in (getattr(sys, "_base_executable", ""), sys.executable):
         text = str(raw or "").strip()
@@ -1191,6 +1636,12 @@ def _preferred_gui_python_executable() -> Path:
 
 
 def _preferred_cli_python_executable() -> Path:
+    runtime_result = verify_runtime()
+    if str(runtime_result.get("status") or "").lower() == "ok":
+        cli_path = Path(str(runtime_result.get("cli_path") or ""))
+        if _safe_path_exists(cli_path):
+            return cli_path
+
     candidates: list[Path] = []
     for raw in (getattr(sys, "_base_executable", ""), sys.executable):
         text = str(raw or "").strip()
@@ -1299,8 +1750,17 @@ def _bootstrap_shared_database_with_local_runtime(
     return True, f"Shared workflow DB created at {shared_db}."
 
 
-def _launch_flowgrid_detached(*, skip_startup_update: bool = False) -> tuple[bool, str]:
-    launcher_path = _preferred_gui_python_executable()
+def _launch_flowgrid_detached(
+    *,
+    skip_startup_update: bool = False,
+    runtime_result: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    resolved_runtime = runtime_result if isinstance(runtime_result, dict) else verify_runtime()
+    if str(resolved_runtime.get("status") or "").lower() != "ok":
+        return False, str(resolved_runtime.get("summary") or "Flowgrid runtime missing.\nRepair install?")
+    launcher_path = Path(str(resolved_runtime.get("gui_path") or ""))
+    if not _safe_path_exists(launcher_path):
+        launcher_path = _preferred_gui_python_executable()
     script_path = _local_data_root() / "Flowgrid.pyw"
     if not launcher_path.exists() or not launcher_path.is_file():
         return False, f"Python launcher not found: {launcher_path}"
@@ -1323,14 +1783,357 @@ def _launch_flowgrid_detached(*, skip_startup_update: bool = False) -> tuple[boo
         return False, f"{type(exc).__name__}: {exc}"
 
 
-def _show_updater_message(title: str, message: str, *, is_error: bool = False) -> None:
+def _check_marker(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "ok":
+        return "✔"
+    if normalized == "warning":
+        return "⚠"
+    return "❌"
+
+
+def _result_checks(result: dict[str, Any]) -> list[dict[str, str]]:
+    checks = result.get("checks") if isinstance(result, dict) else None
+    if isinstance(checks, list) and checks:
+        normalized: list[dict[str, str]] = []
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                _make_update_check(
+                    str(item.get("label") or ""),
+                    str(item.get("status") or ""),
+                    str(item.get("detail") or ""),
+                    str(item.get("path") or ""),
+                )
+            )
+        if normalized:
+            return normalized
+    return [
+        _make_update_check("Connected to update source", "failed", "Update source was not verified."),
+        _verify_local_runtime_files(),
+        _make_update_check("Shared database reachable", "warning", "Shared database was not checked."),
+        _make_update_check("Assets ready", "warning", "Assets were not checked."),
+        _runtime_check_from_result(verify_runtime()),
+        _make_update_check("Update complete", "failed", str(result.get("summary") or "Update did not complete.")),
+    ]
+
+
+def _format_checklist(checks: list[dict[str, str]], *, include_details: bool = False) -> str:
+    lines: list[str] = []
+    for check in checks:
+        label = str(check.get("label") or "").strip()
+        status = str(check.get("status") or "").strip()
+        detail = str(check.get("detail") or "").strip()
+        path = str(check.get("path") or "").strip()
+        line = f"{_check_marker(status)} {label}"
+        if include_details and detail:
+            line = f"{line} - {detail}"
+        lines.append(line)
+        if include_details and path:
+            lines.append(f"  {path}")
+    return "\n".join(lines)
+
+
+def _format_update_details(result: dict[str, Any], checks: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    summary = str(result.get("summary") or "").strip()
+    if summary:
+        lines.extend(["Summary:", summary, ""])
+    lines.extend(["Checklist:", _format_checklist(checks, include_details=True), ""])
+
+    runtime_result = result.get("runtime")
+    if isinstance(runtime_result, dict):
+        attempts = runtime_result.get("attempts")
+        if isinstance(attempts, list) and attempts:
+            lines.append("Runtime attempts:")
+            for attempt in attempts:
+                if not isinstance(attempt, dict):
+                    continue
+                status = str(attempt.get("status") or "").strip()
+                label = str(attempt.get("label") or "").strip()
+                cli_path = str(attempt.get("cli_path") or "").strip()
+                detail = str(attempt.get("detail") or "").strip()
+                lines.append(f"- {status}: {label} ({cli_path})")
+                if detail:
+                    lines.append(f"  {detail}")
+    return "\n".join(lines).strip()
+
+
+def _headline_for_update_result(result: dict[str, Any], *, launch_prompt: bool, is_error: bool) -> str:
+    runtime_result = result.get("runtime")
+    if isinstance(runtime_result, dict) and str(runtime_result.get("status") or "").lower() != "ok":
+        return str(runtime_result.get("summary") or "Flowgrid runtime missing.\nRepair install?")
+    if is_error:
+        return "Flowgrid update could not complete."
+    status = str(result.get("status") or "").strip().lower()
+    if status == "updated":
+        if launch_prompt:
+            return "Flowgrid updated successfully.\nLaunch Flowgrid now?"
+        return "Flowgrid updated successfully."
+    if status == "up_to_date":
+        return "Flowgrid is already up to date."
+    summary = str(result.get("summary") or "").strip()
+    if summary:
+        return summary
+    return "Flowgrid update finished."
+
+
+def _show_native_update_summary(
+    title: str,
+    headline: str,
+    checks: list[dict[str, str]],
+    *,
+    launch_prompt: bool,
+    is_error: bool,
+) -> bool:
+    message = f"{headline}\n\n{_format_checklist(checks)}"
+    if launch_prompt and not is_error and "Launch Flowgrid now?" not in message:
+        message = f"{message}\n\nLaunch Flowgrid now?"
     if os.name != "nt":
-        return
+        return False
     try:
-        flags = 0x00000010 if is_error else 0x00000040
-        ctypes.windll.user32.MessageBoxW(None, str(message), str(title), flags)
+        icon = 0x00000010 if is_error else 0x00000040
+        buttons = 0x00000004 if launch_prompt and not is_error else 0x00000000
+        result = ctypes.windll.user32.MessageBoxW(None, message, str(title), icon | buttons | 0x00001000)
+        return bool(launch_prompt and not is_error and result == 6)
+    except Exception as exc:
+        _runtime_log_event(
+            "update.native_summary_dialog_failed",
+            severity="warning",
+            summary="Native updater summary dialog failed.",
+            exc=exc,
+        )
+        return False
+
+
+def _show_update_summary_via_verified_runtime(
+    result: dict[str, Any],
+    *,
+    title: str,
+    launch_prompt: bool,
+    is_error: bool,
+) -> bool | None:
+    if os.environ.get("FLOWGRID_UPDATER_DIALOG_SUBPROCESS") == "1":
+        return None
+    runtime_result = result.get("runtime")
+    if not isinstance(runtime_result, dict) or str(runtime_result.get("status") or "").lower() != "ok":
+        return None
+    launcher_path = Path(str(runtime_result.get("gui_path") or runtime_result.get("cli_path") or ""))
+    if not _safe_path_exists(launcher_path):
+        return None
+    try:
+        current_executable = Path(sys.executable).resolve()
+        if launcher_path.resolve() == current_executable:
+            return None
     except Exception:
         pass
+
+    payload_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="flowgrid_update_summary_", delete=False) as handle:
+            json.dump(
+                {
+                    "result": result,
+                    "title": title,
+                    "launch_prompt": bool(launch_prompt),
+                    "is_error": bool(is_error),
+                },
+                handle,
+                ensure_ascii=False,
+                default=str,
+            )
+            payload_path = Path(handle.name)
+
+        script = "\n".join(
+            [
+                "import json",
+                "import sys",
+                "from pathlib import Path",
+                "payload = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))",
+                "from flowgrid_app.update_manager import show_update_summary",
+                "accepted = show_update_summary(",
+                "    payload.get('result') or {},",
+                "    title=str(payload.get('title') or 'Flowgrid Update'),",
+                "    launch_prompt=bool(payload.get('launch_prompt', False)),",
+                "    is_error=bool(payload.get('is_error', False)),",
+                ")",
+                "raise SystemExit(10 if accepted else 0)",
+            ]
+        )
+        env = os.environ.copy()
+        env["FLOWGRID_UPDATER_DIALOG_SUBPROCESS"] = "1"
+        local_root = _local_data_root()
+        existing_pythonpath = str(env.get("PYTHONPATH", "") or "").strip()
+        env["PYTHONPATH"] = str(local_root) if not existing_pythonpath else str(local_root) + os.pathsep + existing_pythonpath
+        completed = subprocess.run(
+            [str(launcher_path), "-c", script, str(payload_path)],
+            cwd=str(local_root),
+            env=env,
+        )
+        if completed.returncode == 10:
+            return True
+        if completed.returncode == 0:
+            return False
+        _runtime_log_event(
+            "update.summary_dialog_subprocess_failed",
+            severity="warning",
+            summary="Verified runtime failed to show the updater summary dialog.",
+            context={"launcher_path": str(launcher_path), "returncode": int(completed.returncode)},
+        )
+        return None
+    except Exception as exc:
+        _runtime_log_event(
+            "update.summary_dialog_subprocess_start_failed",
+            severity="warning",
+            summary="Failed launching the updater summary dialog with the verified runtime.",
+            exc=exc,
+            context={"launcher_path": str(launcher_path)},
+        )
+        return None
+    finally:
+        if payload_path is not None:
+            try:
+                payload_path.unlink()
+            except Exception as exc:
+                _runtime_log_event(
+                    "update.summary_dialog_payload_cleanup_failed",
+                    severity="warning",
+                    summary="Failed removing the temporary updater summary payload.",
+                    exc=exc,
+                    context={"payload_path": str(payload_path)},
+                )
+
+
+def show_update_summary(
+    result: dict[str, Any],
+    *,
+    title: str = "Flowgrid Update",
+    launch_prompt: bool = False,
+    is_error: bool = False,
+) -> bool:
+    checks = _result_checks(result)
+    headline = _headline_for_update_result(result, launch_prompt=launch_prompt, is_error=is_error)
+    details = _format_update_details(result, checks)
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QFrame,
+            QHBoxLayout,
+            QLabel,
+            QPlainTextEdit,
+            QPushButton,
+            QVBoxLayout,
+        )
+
+        app = QApplication.instance()
+        if app is None:
+            app = QApplication([])
+
+        dialog = QDialog()
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.resize(640, 360)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        headline_label = QLabel(headline)
+        headline_label.setWordWrap(True)
+        headline_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(headline_label)
+
+        checklist_frame = QFrame()
+        checklist_layout = QVBoxLayout(checklist_frame)
+        checklist_layout.setContentsMargins(0, 0, 0, 0)
+        checklist_layout.setSpacing(6)
+        for check in checks:
+            check_label = QLabel(f"{_check_marker(str(check.get('status') or ''))} {check.get('label') or ''}")
+            check_label.setWordWrap(True)
+            check_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            checklist_layout.addWidget(check_label)
+        layout.addWidget(checklist_frame)
+
+        details_button = QPushButton("Details")
+        details_button.setCheckable(True)
+        details_box = QPlainTextEdit()
+        details_box.setReadOnly(True)
+        details_box.setPlainText(details)
+        details_box.setVisible(False)
+        details_box.setMinimumHeight(180)
+        details_button.toggled.connect(details_box.setVisible)
+        layout.addWidget(details_button)
+        layout.addWidget(details_box, 1)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch(1)
+        launch_button: QPushButton | None = None
+        if launch_prompt and not is_error:
+            launch_button = QPushButton("Launch Now")
+            launch_button.clicked.connect(dialog.accept)
+            button_layout.addWidget(launch_button)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.reject)
+        button_layout.addWidget(close_button)
+        layout.addLayout(button_layout)
+        if launch_button is not None:
+            launch_button.setDefault(True)
+            launch_button.setFocus()
+        else:
+            close_button.setDefault(True)
+            close_button.setFocus()
+
+        return dialog.exec() == QDialog.Accepted
+    except Exception as exc:
+        _runtime_log_event(
+            "update.summary_dialog_failed",
+            severity="warning",
+            summary="PySide6 updater summary dialog failed; falling back to native message box.",
+            exc=exc,
+            context={"title": str(title), "launch_prompt": bool(launch_prompt), "is_error": bool(is_error)},
+        )
+        subprocess_result = _show_update_summary_via_verified_runtime(
+            result,
+            title=title,
+            launch_prompt=launch_prompt,
+            is_error=is_error,
+        )
+        if subprocess_result is not None:
+            return subprocess_result
+        return _show_native_update_summary(
+            title,
+            headline,
+            checks,
+            launch_prompt=launch_prompt,
+            is_error=is_error,
+        )
+
+
+def prompt_launch(result: dict[str, Any]) -> bool:
+    runtime_result = result.get("runtime") if isinstance(result, dict) else None
+    if not isinstance(runtime_result, dict):
+        runtime_result = verify_runtime()
+        result = dict(result)
+        result["runtime"] = runtime_result
+    if str(runtime_result.get("status") or "").lower() != "ok":
+        failure_result = dict(result)
+        failure_result["status"] = "failed"
+        failure_result["summary"] = str(runtime_result.get("summary") or "Flowgrid runtime missing.\nRepair install?")
+        show_update_summary(
+            failure_result,
+            title="Flowgrid Runtime Missing",
+            launch_prompt=False,
+            is_error=True,
+        )
+        return False
+    return show_update_summary(
+        result,
+        title="Flowgrid Updated",
+        launch_prompt=True,
+        is_error=False,
+    )
 
 
 def _parse_updater_cli_options(argv: list[str] | None = None) -> dict[str, Any]:
@@ -1379,6 +2182,20 @@ def run_updater_mode(
         result = apply_repo_update()
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
+        runtime_result = verify_runtime()
+        failure_result = {
+            "status": "failed",
+            "summary": detail,
+            "runtime": runtime_result,
+            "checks": [
+                _make_update_check("Connected to update source", "failed", detail),
+                _verify_local_runtime_files(),
+                _make_update_check("Shared database reachable", "warning", "Skipped after update failure."),
+                _make_update_check("Assets ready", "warning", "Skipped after update failure."),
+                _runtime_check_from_result(runtime_result),
+                _make_update_check("Update complete", "failed", "Update did not complete."),
+            ],
+        }
         _runtime_log_event(
             "update.updater_run_failed",
             severity="error",
@@ -1392,30 +2209,66 @@ def run_updater_mode(
             },
         )
         if should_launch and launch_on_failure:
-            launched, launch_detail = _launch_flowgrid_detached(skip_startup_update=True)
+            launched, launch_detail = _launch_flowgrid_detached(skip_startup_update=True, runtime_result=runtime_result)
             if launched:
                 return 0
-            _show_updater_message(
-                "Flowgrid Update Failed",
-                f"{detail}\n\nThe app also failed to relaunch:\n{launch_detail}",
+            failure_result["summary"] = f"{detail}\n\nThe app also failed to relaunch: {launch_detail}"
+            show_update_summary(
+                failure_result,
+                title="Flowgrid Update Failed",
+                launch_prompt=False,
                 is_error=True,
             )
             return 1
-        _show_updater_message("Flowgrid Update Failed", detail, is_error=True)
+        show_update_summary(
+            failure_result,
+            title="Flowgrid Update Failed",
+            launch_prompt=False,
+            is_error=True,
+        )
         return 1
 
+    runtime_result = result.get("runtime") if isinstance(result.get("runtime"), dict) else verify_runtime()
+    runtime_failed = str(runtime_result.get("status") or "").lower() != "ok"
+    status = str(result.get("status") or "").strip().lower()
+
     if should_launch:
-        launched, detail = _launch_flowgrid_detached(skip_startup_update=True)
+        if runtime_failed:
+            failure_result = dict(result)
+            failure_result["status"] = "failed"
+            failure_result["summary"] = str(runtime_result.get("summary") or "Flowgrid runtime missing.\nRepair install?")
+            failure_result["runtime"] = runtime_result
+            show_update_summary(
+                failure_result,
+                title="Flowgrid Runtime Missing",
+                launch_prompt=False,
+                is_error=True,
+            )
+            return 1
+        if status == "updated" and not prompt_launch(result):
+            return 0
+        launched, detail = _launch_flowgrid_detached(skip_startup_update=True, runtime_result=runtime_result)
         if not launched:
-            _show_updater_message("Flowgrid Update", detail, is_error=True)
+            failure_result = dict(result)
+            failure_result["status"] = "failed"
+            failure_result["summary"] = f"Flowgrid updated, but launch failed: {detail}"
+            show_update_summary(
+                failure_result,
+                title="Flowgrid Launch Failed",
+                launch_prompt=False,
+                is_error=True,
+            )
             return 1
         return 0
 
-    if str(result.get("status") or "").strip().lower() == "updated":
-        _show_updater_message("Flowgrid Updated", str(result.get("summary") or "").strip() or "Update completed.")
-    elif str(result.get("status") or "").strip().lower() == "up_to_date":
-        _show_updater_message("Flowgrid Update", str(result.get("summary") or "").strip() or "Flowgrid is already up to date.")
-    return 0
+    if status in {"updated", "up_to_date"} or runtime_failed:
+        show_update_summary(
+            result,
+            title="Flowgrid Updated" if status == "updated" else "Flowgrid Update",
+            launch_prompt=False,
+            is_error=runtime_failed,
+        )
+    return 1 if runtime_failed else 0
 
 
 __all__ = [
@@ -1429,8 +2282,11 @@ __all__ = [
     "current_install_status",
     "fetch_remote_commit_info",
     "load_install_state",
+    "prompt_launch",
     "run_updater_mode",
     "save_install_state",
+    "show_update_summary",
     "stage_github_snapshot",
     "sync_shared_assets",
+    "verify_runtime",
 ]

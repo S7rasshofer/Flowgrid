@@ -3227,7 +3227,7 @@ class DepotTracker:
             "COALESCE(serial_number, '') AS serial_number, "
             "COALESCE(created_at, '') AS created_at, COALESCE(updated_at, '') AS updated_at, "
             f"{_submission_latest_ts_sql()} AS latest_stamp "
-            "FROM submissions WHERE user_id=? "
+            "FROM submissions WHERE UPPER(TRIM(COALESCE(user_id, '')))=? "
             f"ORDER BY {_submission_latest_ts_sql()} DESC, id DESC LIMIT ?",
             (normalized_user, max_rows),
         )

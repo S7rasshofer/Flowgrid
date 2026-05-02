@@ -252,7 +252,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "title": "Greeting",
             "tooltip": "Quick opening line",
             "text": "Hi there,",
-            "action": "paste_text",
+            "action": "input_sequence",
             "open_target": "",
             "app_targets": "",
             "urls": "",
@@ -262,7 +262,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "title": "Follow-up",
             "tooltip": "Ask for updates",
             "text": "Checking in on this when you have a moment.",
-            "action": "paste_text",
+            "action": "input_sequence",
             "open_target": "",
             "app_targets": "",
             "urls": "",
@@ -651,7 +651,7 @@ class QuickButtonCard(QWidget):
         shape: str,
         button_opacity: float,
         palette: dict[str, str],
-        action_type: str = "paste_text",
+        action_type: str = "input_sequence",
     ) -> None:
         width = int(clamp(width, 90, 220))
         height = int(clamp(height, 35, 100))
@@ -666,7 +666,7 @@ class QuickButtonCard(QWidget):
         elif action_type == "open_app":
             # Shift toward primary color for apps
             base_bg = blend(palette['button_bg'], palette['primary'], 0.25)
-        elif action_type in {"input_sequence", "macro_sequence"}:
+        elif action_type in {"input_sequence", "macro_sequence", "paste_text"}:
             # Shift toward surface color for input sequences.
             base_bg = blend(palette['button_bg'], palette['surface'], 0.35)
 
@@ -1428,7 +1428,7 @@ class QuickLayoutDialog(QDialog):
 
         quick_texts = self.app_window._active_quick_texts()
         if not quick_texts:
-            self.canvas.set_placeholder("No quick text buttons yet.", self.app_window.palette_data["muted_text"])
+            self.canvas.set_placeholder("No quick input buttons yet.", self.app_window.palette_data["muted_text"])
             return
 
         width = int(self.app_window.config.get("quick_button_width", 140))

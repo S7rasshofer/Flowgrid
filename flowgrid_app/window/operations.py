@@ -103,6 +103,7 @@ from flowgrid_app.workflow_core import DepotTracker, QA_FLAG_SEVERITY_OPTIONS, T
 
 from .agent import DepotAgentWindow
 from .common import TouchDistributionBar, format_working_updated_stamp
+from .constants import DEPOT_VIEW_TTL_MS
 from .popup_support import (
     DepotFramelessToolWindow,
     FlowgridThemedDialog,
@@ -565,12 +566,15 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.user_save_btn = QPushButton("Add / Update")
         self.user_remove_btn = QPushButton("Remove")
         self.user_clear_btn = QPushButton("Clear")
+        self.user_refresh_btn = QPushButton("Refresh")
         self.user_save_btn.setProperty("actionRole", "save")
         self.user_remove_btn.setProperty("actionRole", "reset")
         self.user_clear_btn.setProperty("actionRole", "pick")
+        self.user_refresh_btn.setProperty("actionRole", "pick")
         btn_row.addWidget(self.user_save_btn)
         btn_row.addWidget(self.user_remove_btn)
         btn_row.addWidget(self.user_clear_btn)
+        btn_row.addWidget(self.user_refresh_btn)
         layout.addLayout(btn_row)
 
         self.users_table = QTableWidget()
@@ -593,6 +597,7 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.user_save_btn.clicked.connect(self._save_user)
         self.user_remove_btn.clicked.connect(self._remove_selected_user)
         self.user_clear_btn.clicked.connect(self._clear_user_form)
+        self.user_refresh_btn.clicked.connect(self._refresh_users_manual)
         self.users_table.itemSelectionChanged.connect(self._on_user_selected)
         self.users_table.cellDoubleClicked.connect(self._on_user_double_clicked_row)
         self._reload_user_role_combo()
@@ -622,12 +627,15 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.role_save_btn = QPushButton("Add / Update")
         self.role_remove_btn = QPushButton("Remove")
         self.role_clear_btn = QPushButton("Clear")
+        self.role_refresh_btn = QPushButton("Refresh")
         self.role_save_btn.setProperty("actionRole", "save")
         self.role_remove_btn.setProperty("actionRole", "reset")
         self.role_clear_btn.setProperty("actionRole", "pick")
+        self.role_refresh_btn.setProperty("actionRole", "pick")
         btn_row.addWidget(self.role_save_btn)
         btn_row.addWidget(self.role_remove_btn)
         btn_row.addWidget(self.role_clear_btn)
+        btn_row.addWidget(self.role_refresh_btn)
         layout.addLayout(btn_row)
 
         self.roles_table = QTableWidget()
@@ -645,6 +653,7 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.role_save_btn.clicked.connect(self._save_role)
         self.role_remove_btn.clicked.connect(self._remove_selected_role)
         self.role_clear_btn.clicked.connect(self._clear_role_form)
+        self.role_refresh_btn.clicked.connect(self._refresh_roles_manual)
         self.roles_table.itemSelectionChanged.connect(self._on_role_selected)
         self.roles_table.cellDoubleClicked.connect(self._on_role_double_clicked_row)
 
@@ -687,12 +696,15 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.qa_flag_save_btn = QPushButton("Add / Update")
         self.qa_flag_remove_btn = QPushButton("Remove")
         self.qa_flag_clear_btn = QPushButton("Clear")
+        self.qa_flag_refresh_btn = QPushButton("Refresh")
         self.qa_flag_save_btn.setProperty("actionRole", "save")
         self.qa_flag_remove_btn.setProperty("actionRole", "reset")
         self.qa_flag_clear_btn.setProperty("actionRole", "pick")
+        self.qa_flag_refresh_btn.setProperty("actionRole", "pick")
         btn_row.addWidget(self.qa_flag_save_btn)
         btn_row.addWidget(self.qa_flag_remove_btn)
         btn_row.addWidget(self.qa_flag_clear_btn)
+        btn_row.addWidget(self.qa_flag_refresh_btn)
         layout.addLayout(btn_row)
 
         self.qa_flags_table = QTableWidget()
@@ -712,6 +724,7 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.qa_flag_save_btn.clicked.connect(self._save_qa_flag)
         self.qa_flag_remove_btn.clicked.connect(self._remove_selected_qa_flag)
         self.qa_flag_clear_btn.clicked.connect(self._clear_qa_flag_form)
+        self.qa_flag_refresh_btn.clicked.connect(self._refresh_qa_flags_manual)
         self.qa_flags_table.itemSelectionChanged.connect(self._on_qa_flag_selected)
         self.qa_flags_table.cellDoubleClicked.connect(self._on_qa_flag_double_clicked_row)
 
@@ -759,6 +772,23 @@ class DepotAdminDialog(DepotFramelessToolWindow):
                 "sort_order": int(row.get("sort_order", 0) or 0),
             }
         self._reload_user_role_combo()
+
+    def _refresh_roles_manual(self) -> None:
+        try:
+            self.refresh_roles()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.admin_roles_manual_refresh_failed",
+                severity="warning",
+                summary="Admin Roles manual refresh failed.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Refresh Failed",
+                "Roles could not be refreshed. Details were logged for support.",
+            )
 
     def refresh_users(self) -> None:
         self._users_cache.clear()
@@ -810,6 +840,23 @@ class DepotAdminDialog(DepotFramelessToolWindow):
                 "icon_path": icon_path,
             }
 
+    def _refresh_users_manual(self) -> None:
+        try:
+            self.refresh_users()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.admin_users_manual_refresh_failed",
+                severity="warning",
+                summary="Admin Users manual refresh failed.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Refresh Failed",
+                "Users could not be refreshed. Details were logged for support.",
+            )
+
     def refresh_agents(self) -> None:
         self.refresh_users()
 
@@ -838,7 +885,23 @@ class DepotAdminDialog(DepotFramelessToolWindow):
                 "severity": severity,
                 "icon_path": icon_path,
             }
-        self._notify_qa_flag_list_changed()
+
+    def _refresh_qa_flags_manual(self) -> None:
+        try:
+            self.refresh_qa_flags()
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.admin_qa_flags_manual_refresh_failed",
+                severity="warning",
+                summary="Admin Action Flags manual refresh failed.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Refresh Failed",
+                "Action Flags could not be refreshed. Details were logged for support.",
+            )
 
     def refresh_admins(self) -> None:
         self.refresh_users()
@@ -1382,6 +1445,7 @@ class DepotAdminDialog(DepotFramelessToolWindow):
             if name == flag_name:
                 self.qa_flags_table.selectRow(row_idx)
                 break
+        self._notify_qa_flag_list_changed()
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"QA flag '{flag_name}' updated.")
 
     def _remove_selected_qa_flag(self) -> None:
@@ -1400,6 +1464,7 @@ class DepotAdminDialog(DepotFramelessToolWindow):
         self.tracker.delete_qa_flag(flag_name)
         self.refresh_qa_flags()
         self._clear_qa_flag_form()
+        self._notify_qa_flag_list_changed()
         self._show_themed_message(QMessageBox.Icon.Information, "Saved", f"QA flag '{flag_name}' removed.")
 
 class DashboardTrendChart(QWidget):
@@ -1834,7 +1899,7 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_work_order_filter.setPlaceholderText("Optional filter")
         self.notes_work_order_filter.setMinimumWidth(180)
         notes_controls.addWidget(self.notes_work_order_filter, 0)
-        self.notes_refresh_btn = QPushButton("Load")
+        self.notes_refresh_btn = QPushButton("Refresh")
         self.notes_refresh_btn.setProperty("actionRole", "pick")
         notes_controls.addWidget(self.notes_refresh_btn, 0)
         notes_controls.addStretch(1)
@@ -2367,6 +2432,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             "search_text": search_text,
             "category_filter": category_filter or "",
         }
+        if not self._should_refresh_depot_view(
+            "dashboard_completed",
+            state_key,
+            force=force,
+            ttl_ms=DEPOT_VIEW_TTL_MS,
+            reason=reason,
+        ):
+            return
         self._completed_loading = True
         self.completed_refresh_btn.setEnabled(False)
         if hasattr(self, "completed_status_label"):
@@ -2479,6 +2552,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             self.completed_table.setItem(row_idx, 8, _center_table_item(QTableWidgetItem(closed_at_text)))
             self.completed_table.setItem(row_idx, 9, _center_table_item(qa_note_item))
             self.completed_table.setItem(row_idx, 10, _center_table_item(agent_note_item))
+        self._mark_depot_view_refreshed(
+            "dashboard_completed",
+            result.request.state_key,
+            payload=payload,
+            reason=result.request.reason,
+            duration_ms=result.duration_ms,
+            row_count=len(valid_rows),
+        )
 
     def _handle_completed_parts_error(self, result: DepotLoadResult) -> None:
         self._completed_loading = False
@@ -2600,6 +2681,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             "work_order_filter": work_order_filter,
             "category_filter": category_filter or "",
         }
+        if not self._should_refresh_depot_view(
+            "dashboard_notes",
+            state_key,
+            force=force,
+            ttl_ms=DEPOT_VIEW_TTL_MS,
+            reason=reason,
+        ):
+            return
         self._notes_loading = True
         self.notes_refresh_btn.setEnabled(False)
         self._notes_selected_row_id = None
@@ -2713,6 +2802,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         self.notes_delete_btn.setEnabled(False)
         self.notes_selected_label.setText("Select a row to edit.")
         self.notes_status_label.setText(f"Loaded {len(rows)} row(s).")
+        self._mark_depot_view_refreshed(
+            "dashboard_notes",
+            result.request.state_key,
+            payload=payload,
+            reason=result.request.reason,
+            duration_ms=result.duration_ms,
+            row_count=len(rows),
+        )
 
     def _handle_notes_rows_error(self, result: DepotLoadResult) -> None:
         self._notes_loading = False
@@ -3383,6 +3480,14 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
             "category_filter": category_filter or "",
             "latest_workload_mix": latest_workload_mix,
         }
+        if not self._should_refresh_depot_view(
+            "dashboard_metrics",
+            state_key,
+            force=force,
+            ttl_ms=DEPOT_VIEW_TTL_MS,
+            reason=reason,
+        ):
+            return
         self._dashboard_loading = True
         self.refresh_btn.setEnabled(False)
         if self.table.rowCount() <= 0:
@@ -3494,6 +3599,15 @@ class DepotDashboardDialog(DepotFramelessToolWindow):
         else:
             self.empty_hint.setText("No rows in this table for the current row limit/filter.")
             self.empty_hint.show()
+
+        self._mark_depot_view_refreshed(
+            "dashboard_metrics",
+            result.request.state_key,
+            payload=payload,
+            reason=result.request.reason,
+            duration_ms=result.duration_ms,
+            row_count=len(rows),
+        )
 
         if self._completed_loaded or self.results_tabs.currentWidget() is self.completed_tab:
             self.refresh_completed_parts(reason="dashboard-refresh")

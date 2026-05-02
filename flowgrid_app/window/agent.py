@@ -246,17 +246,13 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self._client_due_ack_ids: set[int] = set()
         self._client_due_active_ids: set[int] = set()
         self._missing_po_followup_ids: set[int] = set()
-        self._recent_submission_rows_by_id: dict[int, dict[str, Any]] = {}
-        self._recent_submission_row_widgets: list[tuple[QPushButton, QLabel]] = []
+        self._recent_submission_row_widgets: list[QLabel] = []
         self._team_client_due_count = 0
         self._tab_flash_timer = QTimer(self)
         self._tab_flash_timer.setInterval(700)
         self._tab_flash_timer.timeout.connect(self._on_tab_alert_flash_tick)
         self._tab_flash_timer.start()
-        self._flag_watchdog_timer = QTimer(self)
-        self._flag_watchdog_timer.setInterval(60000)
-        self._flag_watchdog_timer.timeout.connect(self._refresh_flag_alert_watchdog)
-        self._flag_watchdog_timer.start()
+        self._flag_watchdog_timer = None
         self._agent_tabs_ready = False
         self.agent_tabs.currentChanged.connect(self._on_agent_tab_changed)
         self._agent_window_initialized = False
@@ -317,8 +313,6 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             ],
             "Agent data updates",
         )
-        for delete_btn, _label in self._recent_submission_row_widgets:
-            self._disable_widgets_for_read_only([delete_btn], "Recent submission removal")
 
     def _build_work_tab(self):
         root = QHBoxLayout(self.work_tab)
@@ -356,6 +350,10 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self.work_submit_btn = QPushButton("Submit")
         self.work_submit_btn.clicked.connect(self._submit_work_entry)
         self.work_submit_btn.setFixedHeight(24)
+        self.work_refresh_btn = QPushButton("Refresh")
+        self.work_refresh_btn.setProperty("actionRole", "pick")
+        self.work_refresh_btn.clicked.connect(self._refresh_work_tab_manual)
+        self.work_refresh_btn.setFixedHeight(24)
         self.work_compact_mode_check = QCheckBox("Compact input view")
         self.work_compact_mode_check.setToolTip("Hide the full Touch Summary panel on Work and keep only today's total.")
         self.work_compact_mode_check.toggled.connect(self._on_work_compact_mode_toggled)
@@ -386,6 +384,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         self.work_today_compact_summary_label.setFixedHeight(24)
         action_row.addStretch(1)
         action_row.addWidget(self.work_today_compact_summary_label, 0)
+        action_row.addWidget(self.work_refresh_btn, 0)
         action_row.addWidget(self.work_submit_btn, 0)
 
         left_layout.addRow("User", user_row_wrap)
@@ -409,26 +408,15 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             row_wrap = QWidget(self.recent_submissions_wrap)
             row_layout = QHBoxLayout(row_wrap)
             row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(6)
-            delete_btn = QPushButton("x")
-            delete_btn.setObjectName("DepotFramelessCloseButton")
-            delete_btn.setFixedSize(18, 18)
-            delete_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            delete_btn.setAutoDefault(False)
-            delete_btn.setDefault(False)
-            delete_btn.setToolTip("Remove this recent submission")
-            delete_btn.setProperty("submissionId", 0)
-            delete_btn.hide()
-            delete_btn.clicked.connect(self._on_recent_submission_delete_clicked)
+            row_layout.setSpacing(0)
             text_label = QLabel(f"{index}. (none)")
             text_label.setWordWrap(False)
             text_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             text_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             text_label.setFixedHeight(line_height + 2)
-            row_layout.addWidget(delete_btn, 0, Qt.AlignmentFlag.AlignVCenter)
             row_layout.addWidget(text_label, 1)
             recent_layout.addWidget(row_wrap, 0)
-            self._recent_submission_row_widgets.append((delete_btn, text_label))
+            self._recent_submission_row_widgets.append(text_label)
         left_col.addWidget(self.recent_submissions_wrap, 0)
         left_col.addStretch(1)
         root.addWidget(left_wrap, 3)
@@ -483,6 +471,25 @@ class DepotAgentWindow(DepotFramelessToolWindow):
 
         self.work_order_input.returnPressed.connect(self._submit_work_entry)
 
+    def _refresh_work_tab_manual(self) -> None:
+        try:
+            self._refresh_recent_submissions_label(force=True, reason="manual", ttl_ms=0)
+            self._refresh_work_touch_chart(force=True, reason="manual", ttl_ms=0)
+            self._refresh_flag_alert_watchdog(reason="manual")
+        except Exception as exc:
+            _runtime_log_event(
+                "ui.agent_work_manual_refresh_failed",
+                severity="warning",
+                summary="Agent Work tab manual refresh failed.",
+                exc=exc,
+                context={"user_id": str(self.current_user)},
+            )
+            self._show_themed_message(
+                QMessageBox.Icon.Warning,
+                "Refresh Failed",
+                "Agent Work data could not be refreshed. Details were logged for support.",
+            )
+
     def apply_theme_styles(self) -> None:
         super().apply_theme_styles()
         self._apply_tab_alert_visuals()
@@ -491,9 +498,22 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         super().showEvent(event)
         force_refresh = not bool(self._agent_window_initialized)
         self._refresh_agent_visible_views(force=force_refresh, reason="window-show")
+        self._refresh_flag_alert_watchdog(reason="window-show")
         self._agent_window_initialized = True
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        timer = getattr(self, "_flag_watchdog_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception as exc:
+                _runtime_log_event(
+                    "ui.agent_flag_watchdog_stop_failed",
+                    severity="warning",
+                    summary="Agent flag watchdog timer could not be stopped during close.",
+                    exc=exc,
+                    context={"user_id": str(self.current_user)},
+                )
         self._persist_agent_popup_position()
         super().closeEvent(event)
         if event.isAccepted() and _visible_flowgrid_shell_window() is None:
@@ -1218,73 +1238,6 @@ class DepotAgentWindow(DepotFramelessToolWindow):
             return dt_value.strftime("%Y-%m-%d %H:%M")
         return text[:16] if len(text) >= 16 else text
 
-    def _confirm_recent_submission_delete(self, row: dict[str, Any]) -> bool:
-        work_order = DepotRules.normalize_work_order(str(row.get("work_order", "") or ""))
-        touch = str(row.get("touch", "") or "").strip() or "submission"
-        dialog = QMessageBox(self)
-        dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setWindowTitle("Remove Submission")
-        dialog.setText(f"Remove the recent {touch} submission for {work_order or 'this work order'}?")
-        if touch in DepotRules.CLOSING_TOUCHES:
-            dialog.setInformativeText("Removing a closing submission can reopen the latest closed parts row for this work order.")
-        else:
-            dialog.setInformativeText("This removes your recent submission and restores linked queue state when possible.")
-        if self.styleSheet():
-            dialog.setStyleSheet(self.styleSheet())
-        remove_button = dialog.addButton("Remove Submission", QMessageBox.ButtonRole.YesRole)
-        dialog.addButton(QMessageBox.StandardButton.Cancel)
-        dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
-        dialog.exec()
-        return dialog.clickedButton() == remove_button
-
-    def _on_recent_submission_delete_clicked(self) -> None:
-        if self._warn_if_read_only("Recent submission removal"):
-            return
-        button = self.sender()
-        submission_id = int(max(0, safe_int(button.property("submissionId"), 0))) if isinstance(button, QPushButton) else 0
-        if submission_id <= 0:
-            return
-        row = self._recent_submission_rows_by_id.get(submission_id)
-        if row is None:
-            try:
-                row = self.tracker.get_submission_record(submission_id)
-            except Exception as exc:
-                self._show_themed_message(
-                    QMessageBox.Icon.Warning,
-                    "Recent Submission",
-                    f"Could not load that submission:\n{type(exc).__name__}: {exc}",
-                )
-                return
-        if row is None:
-            self._refresh_recent_submissions_label(force=True, reason="recent_delete_missing", ttl_ms=0)
-            self._show_themed_message(
-                QMessageBox.Icon.Warning,
-                "Recent Submission",
-                "That submission no longer exists.",
-            )
-            return
-        if not self._confirm_recent_submission_delete(row):
-            return
-        try:
-            result = self.tracker.delete_user_submission(submission_id, self.current_user)
-        except Exception as exc:
-            self._show_themed_message(
-                QMessageBox.Icon.Warning,
-                "Remove Failed",
-                f"Could not remove submission:\n{type(exc).__name__}: {exc}",
-            )
-            return
-        impacted_sections = self._work_touch_impacted_sections(
-            str(result.get("touch", "") or ""),
-            bool(result.get("client_unit", False)),
-        )
-        self._refresh_after_work_change(impacted_sections, reason="delete_work_submission")
-        self._show_copy_notice(
-            self.recent_submissions_wrap,
-            f"Removed {str(result.get('work_order', '') or '').strip() or 'submission'}",
-            duration_ms=3200,
-        )
-
     def _refresh_recent_submissions_label(
         self,
         *,
@@ -1299,12 +1252,6 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         started = time.monotonic()
         try:
             rows = self.tracker.list_recent_user_submissions(self.current_user, limit=3)
-            fallback_map = {
-                DepotRules.normalize_work_order(str(row["work_order"] or "")): str(row["category"] or "").strip()
-                for row in rows
-                if DepotRules.normalize_work_order(str(row["work_order"] or ""))
-            }
-            category_map = self.tracker.resolve_work_order_categories_bulk(list(fallback_map.keys()), fallback_map)
         except Exception as exc:
             _runtime_log_event(
                 "ui.agent_recent_submissions_query_failed",
@@ -1313,20 +1260,14 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 exc=exc,
                 context={"user_id": str(self.current_user)},
             )
-            self._recent_submission_rows_by_id = {}
             self.recent_submissions_heading_label.setText("Recent submissions: unavailable")
-            for index, (delete_btn, text_label) in enumerate(self._recent_submission_row_widgets, start=1):
-                delete_btn.hide()
-                delete_btn.setProperty("submissionId", 0)
+            for index, text_label in enumerate(self._recent_submission_row_widgets, start=1):
                 text_label.setText(f"{index}. (unavailable)")
             return
 
         self.recent_submissions_heading_label.setText("Latest 3 submissions:")
         if not rows:
-            self._recent_submission_rows_by_id = {}
-            for index, (delete_btn, text_label) in enumerate(self._recent_submission_row_widgets, start=1):
-                delete_btn.hide()
-                delete_btn.setProperty("submissionId", 0)
+            for index, text_label in enumerate(self._recent_submission_row_widgets, start=1):
                 text_label.setText(f"{index}. (none)")
             self._mark_depot_view_refreshed(
                 "agent_recent",
@@ -1341,33 +1282,23 @@ class DepotAgentWindow(DepotFramelessToolWindow):
         rendered_rows: list[dict[str, Any]] = []
         for index, row in enumerate(rows, start=1):
             row_payload = dict(row)
-            submission_id = int(max(0, safe_int(row_payload.get("id", 0), 0)))
             wo = str(row["work_order"] or "").strip()
             touch = str(row["touch"] or "").strip()
-            category = category_map.get(DepotRules.normalize_work_order(wo), "") or str(row["category"] or "").strip() or "Other"
+            category = str(row_payload.get("category", "") or "").strip() or "Other"
             client_marker = " | Client" if int(row["client_unit"] or 0) else ""
             serial_number = str(row_payload.get("serial_number", "") or "").strip()
             serial_marker = f" | SN {serial_number}" if serial_number else ""
             stamp = self._format_submission_stamp(str(row["latest_stamp"] or ""))
             if index <= len(self._recent_submission_row_widgets):
-                delete_btn, text_label = self._recent_submission_row_widgets[index - 1]
-                delete_btn.show()
-                delete_btn.setProperty("submissionId", submission_id)
-                delete_btn.setToolTip(f"Remove {wo} ({touch})")
+                text_label = self._recent_submission_row_widgets[index - 1]
                 text_label.setText(f"{index}. {wo} ({touch} | {category}{client_marker}{serial_marker}) [{stamp}]")
             rendered_rows.append(row_payload)
 
         for index in range(len(rows) + 1, 4):
             if index <= len(self._recent_submission_row_widgets):
-                delete_btn, text_label = self._recent_submission_row_widgets[index - 1]
-                delete_btn.hide()
-                delete_btn.setProperty("submissionId", 0)
-                delete_btn.setToolTip("Remove this recent submission")
+                text_label = self._recent_submission_row_widgets[index - 1]
                 text_label.setText(f"{index}. (none)")
 
-        self._recent_submission_rows_by_id = {
-            int(max(0, safe_int(row_payload.get("id", 0), 0))): row_payload for row_payload in rendered_rows
-        }
         self._mark_depot_view_refreshed(
             "agent_recent",
             state_key,
@@ -1531,7 +1462,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 urgent_count += 1
         return urgent_count, in_progress_count
 
-    def _refresh_flag_alert_watchdog(self) -> None:
+    def _refresh_flag_alert_watchdog(self, *, reason: str = "") -> None:
         if not self.isVisible():
             return
         try:
@@ -1571,7 +1502,7 @@ class DepotAgentWindow(DepotFramelessToolWindow):
                 severity="warning",
                 summary="Failed refreshing agent flag alert watchdog state.",
                 exc=exc,
-                context={"user_id": str(self.current_user)},
+                context={"user_id": str(self.current_user), "reason": str(reason or "")},
             )
 
     @staticmethod
