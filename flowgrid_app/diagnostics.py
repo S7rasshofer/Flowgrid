@@ -718,19 +718,12 @@ def _run_ui_smoke_under_manifest(temp_paths: dict[str, Path]) -> list[Diagnostic
                 expected_config_path.unlink()
 
         clipboard = QApplication.clipboard()
-        clipboard_snapshot = window._clone_clipboard_mime_data()
-        if clipboard_snapshot is None:
-            _record(results, "Quick input clipboard restore", "failed", "Could not snapshot clipboard before restore diagnostic.", expected_config_path)
+        clipboard.setText("Flowgrid smoke clipboard sentinel")
+        window._execute_macro_sequence("Temporary quick input text", send_paste_keys=False)
+        if str(clipboard.text() or "") == "Temporary quick input text":
+            _record(results, "Quick input clipboard staging", "ok", "Text-only input sequence stages text on the clipboard like TapHub macro sequence.", expected_config_path)
         else:
-            try:
-                clipboard.setText("Flowgrid smoke clipboard sentinel")
-                window._execute_macro_sequence("Temporary quick input text", send_paste_keys=False)
-                if str(clipboard.text() or "") == "Flowgrid smoke clipboard sentinel":
-                    _record(results, "Quick input clipboard restore", "ok", "Text-only input sequence restored the previous clipboard content.", expected_config_path)
-                else:
-                    _record(results, "Quick input clipboard restore", "failed", "Clipboard content changed after text-only input sequence execution.", expected_config_path)
-            finally:
-                window._restore_clipboard_mime_data(clipboard_snapshot)
+            _record(results, "Quick input clipboard staging", "failed", f"Clipboard contained {clipboard.text()!r} after text-only input sequence execution.", expected_config_path)
 
         added_index = window._add_quick_task_tab_named("DiagTemp")
         window.rename_quick_task_tab_named("DiagSmoke", added_index)

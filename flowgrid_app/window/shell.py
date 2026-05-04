@@ -16,13 +16,11 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import (
-    QByteArray,
     QBuffer,
     QDate,
     QEvent,
     QEasingCurve,
     QIODevice,
-    QMimeData,
     QPoint,
     QPointF,
     QRect,
@@ -4027,46 +4025,34 @@ class QuickInputsWindow(QMainWindow):
             )
         return False
 
-    def _restore_quick_input_target(self) -> bool:
+    def _restore_quick_input_target(self) -> None:
         if os.name != "nt" or user32 is None:
-            event_key = "runtime.quick_input_platform_unsupported"
             _runtime_log_event(
-                event_key,
+                "runtime.quick_input_platform_unsupported",
                 severity="warning",
                 summary="Quick input could not restore a target window because Windows keyboard automation is unavailable.",
             )
-            self._show_quick_input_failure_notice(event_key, "Input Sequence is only available with Windows keyboard automation.")
-            return False
+            return
 
         hwnd = int(self.last_external_hwnd or 0)
         if not hwnd:
-            event_key = "runtime.quick_input_target_missing"
             _runtime_log_event(
-                event_key,
+                "runtime.quick_input_target_missing",
                 severity="warning",
-                summary="Quick input was requested before Flowgrid had captured an external input target.",
+                summary="Quick input is continuing without a captured external target window.",
             )
-            self._show_quick_input_failure_notice(
-                event_key,
-                "Select a text box or email reply, then click the Input Sequence button again.",
-            )
-            return False
+            return
 
         try:
             if not user32.IsWindow(hwnd):
-                event_key = "runtime.quick_input_target_invalid"
                 _runtime_log_event(
-                    event_key,
+                    "runtime.quick_input_target_invalid",
                     severity="warning",
                     summary="Quick input target window no longer exists.",
                     context={"hwnd": hwnd},
                 )
                 self.last_external_hwnd = None
-                self._show_quick_input_failure_notice(
-                    event_key,
-                    "The previously selected input window is no longer available.",
-                )
-                return False
+                return
 
             user32.ShowWindow(hwnd, SW_RESTORE)
             restored = bool(user32.SetForegroundWindow(hwnd))
@@ -4078,17 +4064,14 @@ class QuickInputsWindow(QMainWindow):
                     context={"hwnd": hwnd, "last_error": int(ctypes.get_last_error())},
                 )
             time.sleep(0.05)
-            return True
         except Exception as exc:
-            event_key = "runtime.quick_input_target_restore_failed"
             _runtime_log_event(
-                event_key,
+                "runtime.quick_input_target_restore_failed",
                 severity="warning",
                 summary="Failed restoring the previous target window before sending quick input; continuing best-effort.",
                 exc=exc,
                 context={"hwnd": hwnd},
             )
-            return True
 
     def _is_shift_pressed(self) -> bool:
         return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -4222,7 +4205,7 @@ class QuickInputsWindow(QMainWindow):
                 cmd_name = cmd_type.strip().lower()
                 raw_value = cmd_value.strip()
                 if cmd_name == "type":
-                    commands.append({"action": "type", "text": cmd_value})
+                    commands.append({"action": "type", "text": raw_value})
                     handled = True
                 elif cmd_name == "key":
                     key_name = raw_value.lower()
@@ -4278,63 +4261,12 @@ class QuickInputsWindow(QMainWindow):
 
         return commands
 
-    def _clone_clipboard_mime_data(self) -> QMimeData | None:
-        try:
-            source = QGuiApplication.clipboard().mimeData()
-            clone = QMimeData()
-            if source is None:
-                return clone
-            if source.hasText():
-                clone.setText(source.text())
-            if source.hasHtml():
-                clone.setHtml(source.html())
-            if source.hasUrls():
-                clone.setUrls(source.urls())
-            if source.hasImage():
-                clone.setImageData(source.imageData())
-            if source.hasColor():
-                clone.setColorData(source.colorData())
-            for fmt in source.formats():
-                if fmt not in clone.formats():
-                    clone.setData(fmt, QByteArray(source.data(fmt)))
-            return clone
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_clipboard_snapshot_failed",
-                severity="critical",
-                summary="Quick input could not snapshot the clipboard before temporary paste.",
-                exc=exc,
-            )
-            _escalate_runtime_issue_once(
-                "runtime.quick_input_clipboard_snapshot_failed",
-                "Quick input could not safely preserve the clipboard.",
-                details=f"{type(exc).__name__}: {exc}",
-            )
-            return None
-
-    def _restore_clipboard_mime_data(self, snapshot: QMimeData | None) -> None:
-        if snapshot is None:
-            return
-        try:
-            QGuiApplication.clipboard().setMimeData(snapshot)
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_clipboard_restore_failed",
-                severity="critical",
-                summary="Quick input failed to restore the previous clipboard content.",
-                exc=exc,
-            )
-            _escalate_runtime_issue_once(
-                "runtime.quick_input_clipboard_restore_failed",
-                "Quick input could not restore the previous clipboard.",
-                details=f"{type(exc).__name__}: {exc}",
-            )
-
     def _paste_input_sequence_text(self, text: str, *, send_paste_keys: bool = True) -> bool:
         if not text:
             return True
         try:
             QGuiApplication.clipboard().setText(text)
+            QApplication.processEvents()
         except Exception as exc:
             _runtime_log_event(
                 "runtime.quick_input_clipboard_set_failed",
@@ -4357,7 +4289,7 @@ class QuickInputsWindow(QMainWindow):
             time.sleep(0.05)
             if not self._send_ctrl_v():
                 return False
-            time.sleep(0.14)
+            time.sleep(0.05)
             return True
         except Exception as exc:
             _runtime_log_event(
@@ -4376,42 +4308,42 @@ class QuickInputsWindow(QMainWindow):
 
     def _execute_macro_sequence(self, sequence: str, *, send_paste_keys: bool = True) -> None:
         """Execute a parsed input sequence."""
-        if send_paste_keys and not self._restore_quick_input_target():
+        if send_paste_keys and (os.name != "nt" or user32 is None):
+            _runtime_log_event(
+                "runtime.input_sequence_platform_unsupported",
+                severity="warning",
+                summary="Input Sequence could not execute because Windows keyboard automation is unavailable.",
+            )
             return
+
+        if send_paste_keys:
+            self._restore_quick_input_target()
 
         commands = self._parse_macro_sequence(sequence)
-        needs_clipboard = any(cmd.get("action") == "type" and str(cmd.get("text", "")) for cmd in commands)
-        clipboard_snapshot = self._clone_clipboard_mime_data() if needs_clipboard else None
-        if needs_clipboard and clipboard_snapshot is None:
-            return
 
-        try:
-            for cmd in commands:
-                action = cmd.get("action", "")
+        for cmd in commands:
+            action = cmd.get("action", "")
 
-                if action == "type":
-                    text = str(cmd.get("text", ""))
-                    if text and not self._paste_input_sequence_text(text, send_paste_keys=send_paste_keys):
+            if action == "type":
+                text = str(cmd.get("text", ""))
+                if text and not self._paste_input_sequence_text(text, send_paste_keys=send_paste_keys):
+                    return
+
+            elif action == "key":
+                key_name = str(cmd.get("key", ""))
+                shift_held = bool(cmd.get("shift", False))
+                alt_held = bool(cmd.get("alt", False))
+
+                if send_paste_keys and key_name in KEY_CODES:
+                    key_code = KEY_CODES[key_name]
+                    if not self._send_key(key_code, shift_held=shift_held, alt_held=alt_held):
                         return
+                    time.sleep(0.06)
 
-                elif action == "key":
-                    key_name = str(cmd.get("key", ""))
-                    shift_held = bool(cmd.get("shift", False))
-                    alt_held = bool(cmd.get("alt", False))
-
-                    if send_paste_keys and key_name in KEY_CODES:
-                        key_code = KEY_CODES[key_name]
-                        if not self._send_key(key_code, shift_held=shift_held, alt_held=alt_held):
-                            return
-                        time.sleep(0.06)
-
-                elif action == "delay":
-                    delay_ms = safe_int(cmd.get("ms", 0), 0)
-                    if send_paste_keys:
-                        time.sleep(delay_ms / 1000.0)
-        finally:
-            if needs_clipboard:
-                self._restore_clipboard_mime_data(clipboard_snapshot)
+            elif action == "delay":
+                delay_ms = safe_int(cmd.get("ms", 0), 0)
+                if send_paste_keys:
+                    time.sleep(delay_ms / 1000.0)
 
     def _quick_action_kind(self, entry: dict[str, Any]) -> str:
         action = str(entry.get("action", QUICK_ACTION_INPUT_SEQUENCE)).strip().lower()
