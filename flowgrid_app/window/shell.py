@@ -193,7 +193,6 @@ VK_CONTROL = 0x11
 VK_V = 0x56
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_EXTENDEDKEY = 0x0001
-INPUT_KEYBOARD = 1
 GA_ROOT = 2
 SW_RESTORE = 9
 VK_TAB = 0x09
@@ -257,27 +256,6 @@ class GUITHREADINFO(ctypes.Structure):
     ]
 
 
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", ULONG_PTR),
-    ]
-
-
-class INPUT_UNION(ctypes.Union):
-    _fields_ = [("ki", KEYBDINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [
-        ("type", wintypes.DWORD),
-        ("union", INPUT_UNION),
-    ]
-
-
 def _hwnd_to_int(hwnd: Any) -> int:
     raw_value = getattr(hwnd, "value", hwnd)
     try:
@@ -286,14 +264,25 @@ def _hwnd_to_int(hwnd: Any) -> int:
         return 0
 
 
+def _configure_kernel32_api(kernel32_api: Any) -> None:
+    try:
+        kernel32_api.GetCurrentThreadId.argtypes = []
+        kernel32_api.GetCurrentThreadId.restype = wintypes.DWORD
+    except Exception as exc:
+        _runtime_log_event(
+            "runtime.kernel32_api_config_failed",
+            severity="warning",
+            summary="Failed configuring Windows thread API bindings; quick input focus attachment will be best effort.",
+            exc=exc,
+        )
+
+
 def _configure_user32_api(user32_api: Any) -> None:
     try:
         user32_api.GetForegroundWindow.argtypes = []
         user32_api.GetForegroundWindow.restype = wintypes.HWND
         user32_api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         user32_api.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32_api.GetCurrentThreadId.argtypes = []
-        user32_api.GetCurrentThreadId.restype = wintypes.DWORD
         user32_api.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
         user32_api.GetGUIThreadInfo.restype = wintypes.BOOL
         user32_api.IsWindow.argtypes = [wintypes.HWND]
@@ -314,8 +303,6 @@ def _configure_user32_api(user32_api: Any) -> None:
         user32_api.SetForegroundWindow.restype = wintypes.BOOL
         user32_api.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
         user32_api.AttachThreadInput.restype = wintypes.BOOL
-        user32_api.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-        user32_api.SendInput.restype = wintypes.UINT
         user32_api.keybd_event.argtypes = [
             wintypes.BYTE,
             wintypes.BYTE,
@@ -344,8 +331,20 @@ if os.name == "nt":
             exc=exc,
         )
         user32 = None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _configure_kernel32_api(kernel32)
+    except Exception as exc:
+        _runtime_log_event(
+            "runtime.kernel32_load_failed",
+            severity="warning",
+            summary="Failed loading Windows thread API; quick input focus attachment will be best effort.",
+            exc=exc,
+        )
+        kernel32 = None
 else:
     user32 = None
+    kernel32 = None
 
 
 def _escalate_runtime_issue_once(
@@ -4167,12 +4166,28 @@ class QuickInputsWindow(QMainWindow):
             )
         return False
 
+    def _current_windows_thread_id(self) -> int:
+        if os.name != "nt" or kernel32 is None:
+            return 0
+        try:
+            return int(kernel32.GetCurrentThreadId() or 0)
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_current_thread_failed",
+                severity="warning",
+                summary="Failed reading Flowgrid's current Windows thread id; quick input focus attachment will be skipped.",
+                exc=exc,
+            )
+            return 0
+
     def _attach_quick_input_threads(self, target_thread_id: int) -> list[int]:
         if os.name != "nt" or user32 is None:
             return []
         attached: list[int] = []
         try:
-            current_thread_id = int(user32.GetCurrentThreadId() or 0)
+            current_thread_id = self._current_windows_thread_id()
+            if not current_thread_id:
+                return attached
             foreground = _hwnd_to_int(user32.GetForegroundWindow())
             foreground_thread_id, _pid = self._quick_input_thread_for_window(foreground)
             for thread_id in {int(target_thread_id or 0), int(foreground_thread_id or 0)}:
@@ -4195,7 +4210,9 @@ class QuickInputsWindow(QMainWindow):
         if os.name != "nt" or user32 is None or not attached_thread_ids:
             return
         try:
-            current_thread_id = int(user32.GetCurrentThreadId() or 0)
+            current_thread_id = self._current_windows_thread_id()
+            if not current_thread_id:
+                return
             for thread_id in reversed(attached_thread_ids):
                 if thread_id and thread_id != current_thread_id:
                     user32.AttachThreadInput(current_thread_id, int(thread_id), False)
@@ -4419,65 +4436,26 @@ class QuickInputsWindow(QMainWindow):
         if not events:
             return True
         try:
-            input_items = (INPUT * len(events))()
-            for index, (vk_code, key_up) in enumerate(events):
-                flags = KEYEVENTF_KEYUP if key_up else 0
-                if int(vk_code) in EXTENDED_KEY_CODES:
-                    flags |= KEYEVENTF_EXTENDEDKEY
-                input_items[index].type = INPUT_KEYBOARD
-                input_items[index].union.ki = KEYBDINPUT(
-                    wintypes.WORD(int(vk_code)),
-                    wintypes.WORD(0),
-                    wintypes.DWORD(flags),
-                    wintypes.DWORD(0),
-                    ULONG_PTR(0),
-                )
-            sent = int(user32.SendInput(len(events), input_items, ctypes.sizeof(INPUT)) or 0)
-            if sent == len(events):
-                return True
-            _runtime_log_event(
-                "runtime.quick_input_send_keys_failed",
-                severity="critical",
-                summary="Windows did not accept all synthetic keystrokes for quick input.",
-                context={
-                    "context": str(context_label or ""),
-                    "requested": len(events),
-                    "sent": sent,
-                    "last_error": int(ctypes.get_last_error()),
-                },
-            )
-            if sent > 0:
-                for cleanup_vk in (VK_CONTROL, VK_SHIFT, VK_ALT):
-                    try:
-                        user32.keybd_event(cleanup_vk, 0, KEYEVENTF_KEYUP, 0)
-                    except Exception:
-                        pass
-                return False
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_send_keys_failed",
-                severity="critical",
-                summary="Quick input failed while sending synthetic keystrokes.",
-                exc=exc,
-                context={"context": str(context_label or ""), "event_count": len(events)},
-            )
-            return False
-
-        try:
             for vk_code, key_up in events:
                 flags = KEYEVENTF_KEYUP if key_up else 0
                 if int(vk_code) in EXTENDED_KEY_CODES:
                     flags |= KEYEVENTF_EXTENDEDKEY
                 user32.keybd_event(int(vk_code), 0, flags, 0)
+                time.sleep(0.01)
             return True
         except Exception as exc:
             _runtime_log_event(
-                "runtime.quick_input_keybd_event_fallback_failed",
+                "runtime.quick_input_keybd_event_failed",
                 severity="critical",
-                summary="Quick input SendInput fallback failed while sending keystrokes.",
+                summary="Quick input failed while sending synthetic keystrokes.",
                 exc=exc,
                 context={"context": str(context_label or ""), "event_count": len(events)},
             )
+            for cleanup_vk in (VK_CONTROL, VK_SHIFT, VK_ALT):
+                try:
+                    user32.keybd_event(cleanup_vk, 0, KEYEVENTF_KEYUP, 0)
+                except Exception:
+                    pass
             return False
 
     def _send_ctrl_v(self) -> bool:
