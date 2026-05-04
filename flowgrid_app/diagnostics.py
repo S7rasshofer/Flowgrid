@@ -674,6 +674,19 @@ def _run_ui_smoke_under_manifest(temp_paths: dict[str, Path]) -> list[Diagnostic
         else:
             _record(results, "Input sequence command parsing", "failed", f"Parser returned {parsed_compound!r}.", expected_config_path)
 
+        parsed_key_command = window._parse_macro_sequence("[key: tab]")
+        if parsed_key_command == [{"action": "key", "key": "tab"}]:
+            _record(results, "Input sequence key command", "ok", "[key: tab] parses as a tab key press.", expected_config_path)
+        else:
+            _record(results, "Input sequence key command", "failed", f"Parser returned {parsed_key_command!r}.", expected_config_path)
+
+        parsed_press_command = window._parse_macro_sequence("[press: tab, shift]")
+        expected_press_command = [{"action": "key", "key": "tab", "shift": True, "alt": False}]
+        if parsed_press_command == expected_press_command:
+            _record(results, "Input sequence press command", "ok", "[press: tab, shift] parses as Shift+Tab.", expected_config_path)
+        else:
+            _record(results, "Input sequence press command", "failed", f"Parser returned {parsed_press_command!r}.", expected_config_path)
+
         original_config_text = expected_config_path.read_text(encoding="utf-8") if expected_config_path.exists() else ""
         try:
             legacy_payload = json.loads(original_config_text) if original_config_text else dict(window.config)

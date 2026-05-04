@@ -192,8 +192,6 @@ _RUNTIME_ESCALATED_EVENTS: set[str] = set()
 VK_CONTROL = 0x11
 VK_V = 0x56
 KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_EXTENDEDKEY = 0x0001
-GA_ROOT = 2
 SW_RESTORE = 9
 VK_TAB = 0x09
 VK_ENTER = 0x0D
@@ -239,21 +237,6 @@ QUICK_ACTION_OPEN_APP = "open_app"
 QUICK_ACTIONS = {QUICK_ACTION_INPUT_SEQUENCE, QUICK_ACTION_OPEN_URL, QUICK_ACTION_OPEN_APP}
 LEGACY_QUICK_INPUT_ACTIONS = {"paste_text", "macro_sequence"}
 ULONG_PTR = getattr(wintypes, "ULONG_PTR", wintypes.WPARAM)
-EXTENDED_KEY_CODES = {VK_DELETE, VK_HOME, VK_END, VK_PAGE_UP, VK_PAGE_DOWN, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN}
-
-
-class GUITHREADINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wintypes.DWORD),
-        ("flags", wintypes.DWORD),
-        ("hwndActive", wintypes.HWND),
-        ("hwndFocus", wintypes.HWND),
-        ("hwndCapture", wintypes.HWND),
-        ("hwndMenuOwner", wintypes.HWND),
-        ("hwndMoveSize", wintypes.HWND),
-        ("hwndCaret", wintypes.HWND),
-        ("rcCaret", wintypes.RECT),
-    ]
 
 
 def _hwnd_to_int(hwnd: Any) -> int:
@@ -264,45 +247,18 @@ def _hwnd_to_int(hwnd: Any) -> int:
         return 0
 
 
-def _configure_kernel32_api(kernel32_api: Any) -> None:
-    try:
-        kernel32_api.GetCurrentThreadId.argtypes = []
-        kernel32_api.GetCurrentThreadId.restype = wintypes.DWORD
-    except Exception as exc:
-        _runtime_log_event(
-            "runtime.kernel32_api_config_failed",
-            severity="warning",
-            summary="Failed configuring Windows thread API bindings; quick input focus attachment will be best effort.",
-            exc=exc,
-        )
-
-
 def _configure_user32_api(user32_api: Any) -> None:
     try:
         user32_api.GetForegroundWindow.argtypes = []
         user32_api.GetForegroundWindow.restype = wintypes.HWND
         user32_api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
         user32_api.GetWindowThreadProcessId.restype = wintypes.DWORD
-        user32_api.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
-        user32_api.GetGUIThreadInfo.restype = wintypes.BOOL
         user32_api.IsWindow.argtypes = [wintypes.HWND]
         user32_api.IsWindow.restype = wintypes.BOOL
-        user32_api.IsChild.argtypes = [wintypes.HWND, wintypes.HWND]
-        user32_api.IsChild.restype = wintypes.BOOL
-        user32_api.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-        user32_api.GetAncestor.restype = wintypes.HWND
         user32_api.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         user32_api.ShowWindow.restype = wintypes.BOOL
-        user32_api.BringWindowToTop.argtypes = [wintypes.HWND]
-        user32_api.BringWindowToTop.restype = wintypes.BOOL
-        user32_api.SetActiveWindow.argtypes = [wintypes.HWND]
-        user32_api.SetActiveWindow.restype = wintypes.HWND
-        user32_api.SetFocus.argtypes = [wintypes.HWND]
-        user32_api.SetFocus.restype = wintypes.HWND
         user32_api.SetForegroundWindow.argtypes = [wintypes.HWND]
         user32_api.SetForegroundWindow.restype = wintypes.BOOL
-        user32_api.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
-        user32_api.AttachThreadInput.restype = wintypes.BOOL
         user32_api.keybd_event.argtypes = [
             wintypes.BYTE,
             wintypes.BYTE,
@@ -331,20 +287,8 @@ if os.name == "nt":
             exc=exc,
         )
         user32 = None
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        _configure_kernel32_api(kernel32)
-    except Exception as exc:
-        _runtime_log_event(
-            "runtime.kernel32_load_failed",
-            severity="warning",
-            summary="Failed loading Windows thread API; quick input focus attachment will be best effort.",
-            exc=exc,
-        )
-        kernel32 = None
 else:
     user32 = None
-    kernel32 = None
 
 
 def _escalate_runtime_issue_once(
@@ -406,7 +350,6 @@ class QuickInputsWindow(QMainWindow):
         self.admin_dialog: DepotAdminDialog | None = None
         self.depot_dashboard_dialog: DepotDashboardDialog | None = None
         self.last_external_hwnd: int | None = None
-        self._quick_input_target: dict[str, Any] | None = None
         self._quick_input_failure_notices: set[str] = set()
         self._saving_timer = QTimer(self)
         self._saving_timer.setInterval(220)
@@ -4041,77 +3984,6 @@ class QuickInputsWindow(QMainWindow):
         self._editing_index = None
         self.quick_editor_dialog.hide()
 
-    def _quick_input_thread_for_window(self, hwnd: int) -> tuple[int, int]:
-        if os.name != "nt" or user32 is None or not hwnd:
-            return 0, 0
-        pid = wintypes.DWORD(0)
-        thread_id = int(user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid)) or 0)
-        return thread_id, int(pid.value or 0)
-
-    def _read_gui_thread_info(self, thread_id: int) -> dict[str, int]:
-        if os.name != "nt" or user32 is None or not thread_id:
-            return {}
-        try:
-            info = GUITHREADINFO()
-            info.cbSize = ctypes.sizeof(GUITHREADINFO)
-            if not user32.GetGUIThreadInfo(int(thread_id), ctypes.byref(info)):
-                return {}
-            return {
-                "active_hwnd": _hwnd_to_int(info.hwndActive),
-                "focus_hwnd": _hwnd_to_int(info.hwndFocus),
-                "caret_hwnd": _hwnd_to_int(info.hwndCaret),
-                "capture_hwnd": _hwnd_to_int(info.hwndCapture),
-            }
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_gui_thread_info_failed",
-                severity="warning",
-                summary="Failed reading focused control details for the quick input target.",
-                exc=exc,
-                context={"thread_id": int(thread_id)},
-            )
-            return {}
-
-    def _window_matches_quick_input_target(self, candidate_hwnd: int, target_hwnd: int) -> bool:
-        if os.name != "nt" or user32 is None:
-            return False
-        candidate = _hwnd_to_int(candidate_hwnd)
-        target = _hwnd_to_int(target_hwnd)
-        if not candidate or not target:
-            return False
-        if candidate == target:
-            return True
-        try:
-            root = _hwnd_to_int(user32.GetAncestor(candidate, GA_ROOT))
-            if root and root == target:
-                return True
-            return bool(user32.IsChild(target, candidate))
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_target_compare_failed",
-                severity="warning",
-                summary="Failed comparing foreground window to the quick input target.",
-                exc=exc,
-                context={"candidate_hwnd": candidate, "target_hwnd": target},
-            )
-            return False
-
-    def _quick_input_target_context(self, target: dict[str, Any] | None = None) -> dict[str, Any]:
-        active_target = target if isinstance(target, dict) else self._quick_input_target
-        if not isinstance(active_target, dict):
-            return {"hwnd": int(self.last_external_hwnd or 0)}
-        return {
-            "hwnd": int(active_target.get("hwnd") or 0),
-            "thread_id": int(active_target.get("thread_id") or 0),
-            "pid": int(active_target.get("pid") or 0),
-            "focus_hwnd": int(active_target.get("focus_hwnd") or 0),
-            "caret_hwnd": int(active_target.get("caret_hwnd") or 0),
-            "captured_age_s": round(
-                max(0.0, time.monotonic() - float(active_target.get("captured_monotonic", time.monotonic()))),
-                3,
-            ),
-        }
-
     def _show_quick_input_failure_notice(self, event_key: str, message: str) -> None:
         notice_key = str(event_key or "runtime.quick_input_failed")
         if notice_key in self._quick_input_failure_notices:
@@ -4141,21 +4013,10 @@ class QuickInputsWindow(QMainWindow):
             if not hwnd:
                 return False
 
-            thread_id, pid = self._quick_input_thread_for_window(hwnd)
-            if pid and int(pid) != int(os.getpid()):
-                gui_info = self._read_gui_thread_info(thread_id)
-                target = {
-                    "hwnd": int(hwnd),
-                    "thread_id": int(thread_id),
-                    "pid": int(pid),
-                    "active_hwnd": int(gui_info.get("active_hwnd", 0)),
-                    "focus_hwnd": int(gui_info.get("focus_hwnd", 0)),
-                    "caret_hwnd": int(gui_info.get("caret_hwnd", 0)),
-                    "capture_hwnd": int(gui_info.get("capture_hwnd", 0)),
-                    "captured_monotonic": time.monotonic(),
-                }
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value or 0) != int(os.getpid()):
                 self.last_external_hwnd = int(hwnd)
-                self._quick_input_target = target
                 return True
         except Exception as exc:
             _runtime_log_event(
@@ -4164,114 +4025,6 @@ class QuickInputsWindow(QMainWindow):
                 summary="Failed capturing the external input target for quick input buttons.",
                 exc=exc,
             )
-        return False
-
-    def _current_windows_thread_id(self) -> int:
-        if os.name != "nt" or kernel32 is None:
-            return 0
-        try:
-            return int(kernel32.GetCurrentThreadId() or 0)
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_current_thread_failed",
-                severity="warning",
-                summary="Failed reading Flowgrid's current Windows thread id; quick input focus attachment will be skipped.",
-                exc=exc,
-            )
-            return 0
-
-    def _attach_quick_input_threads(self, target_thread_id: int) -> list[int]:
-        if os.name != "nt" or user32 is None:
-            return []
-        attached: list[int] = []
-        try:
-            current_thread_id = self._current_windows_thread_id()
-            if not current_thread_id:
-                return attached
-            foreground = _hwnd_to_int(user32.GetForegroundWindow())
-            foreground_thread_id, _pid = self._quick_input_thread_for_window(foreground)
-            for thread_id in {int(target_thread_id or 0), int(foreground_thread_id or 0)}:
-                if not thread_id or thread_id == current_thread_id:
-                    continue
-                if bool(user32.AttachThreadInput(current_thread_id, thread_id, True)):
-                    attached.append(thread_id)
-            return attached
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_attach_thread_failed",
-                severity="warning",
-                summary="Failed attaching input threads while restoring quick input target focus.",
-                exc=exc,
-                context={"target_thread_id": int(target_thread_id or 0)},
-            )
-            return attached
-
-    def _detach_quick_input_threads(self, attached_thread_ids: list[int]) -> None:
-        if os.name != "nt" or user32 is None or not attached_thread_ids:
-            return
-        try:
-            current_thread_id = self._current_windows_thread_id()
-            if not current_thread_id:
-                return
-            for thread_id in reversed(attached_thread_ids):
-                if thread_id and thread_id != current_thread_id:
-                    user32.AttachThreadInput(current_thread_id, int(thread_id), False)
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_detach_thread_failed",
-                severity="warning",
-                summary="Failed detaching input threads after restoring quick input target focus.",
-                exc=exc,
-                context={"attached_thread_ids": [int(thread_id) for thread_id in attached_thread_ids]},
-            )
-
-    def _send_alt_focus_nudge(self) -> None:
-        try:
-            if os.name == "nt" and user32 is not None:
-                user32.keybd_event(VK_ALT, 0, 0, 0)
-                user32.keybd_event(VK_ALT, 0, KEYEVENTF_KEYUP, 0)
-        except Exception as exc:
-            _runtime_log_event(
-                "runtime.quick_input_alt_nudge_failed",
-                severity="warning",
-                summary="Failed sending the Windows foreground-permission key nudge.",
-                exc=exc,
-            )
-
-    def _focus_quick_input_child(self, target: dict[str, Any]) -> None:
-        if os.name != "nt" or user32 is None:
-            return
-        hwnd = int(target.get("hwnd") or 0)
-        focus_candidates = [
-            int(target.get("focus_hwnd") or 0),
-            int(target.get("caret_hwnd") or 0),
-            int(target.get("active_hwnd") or 0),
-        ]
-        for focus_hwnd in focus_candidates:
-            if not focus_hwnd or focus_hwnd == hwnd:
-                continue
-            try:
-                if bool(user32.IsWindow(focus_hwnd)):
-                    user32.SetFocus(focus_hwnd)
-                    return
-            except Exception as exc:
-                _runtime_log_event(
-                    "runtime.quick_input_child_focus_failed",
-                    severity="warning",
-                    summary="Failed restoring a focused child control for quick input.",
-                    exc=exc,
-                    context={"hwnd": hwnd, "focus_hwnd": focus_hwnd},
-                )
-
-    def _wait_for_quick_input_foreground(self, hwnd: int, timeout_s: float = 0.45) -> bool:
-        if os.name != "nt" or user32 is None:
-            return False
-        deadline = time.monotonic() + max(0.05, float(timeout_s))
-        while time.monotonic() < deadline:
-            foreground = _hwnd_to_int(user32.GetForegroundWindow())
-            if self._window_matches_quick_input_target(foreground, hwnd):
-                return True
-            time.sleep(0.03)
         return False
 
     def _restore_quick_input_target(self) -> bool:
@@ -4285,8 +4038,7 @@ class QuickInputsWindow(QMainWindow):
             self._show_quick_input_failure_notice(event_key, "Input Sequence is only available with Windows keyboard automation.")
             return False
 
-        target = self._quick_input_target if isinstance(self._quick_input_target, dict) else {}
-        hwnd = int(target.get("hwnd") or self.last_external_hwnd or 0)
+        hwnd = int(self.last_external_hwnd or 0)
         if not hwnd:
             event_key = "runtime.quick_input_target_missing"
             _runtime_log_event(
@@ -4303,94 +4055,40 @@ class QuickInputsWindow(QMainWindow):
         try:
             if not user32.IsWindow(hwnd):
                 event_key = "runtime.quick_input_target_invalid"
-                context = self._quick_input_target_context(target)
                 _runtime_log_event(
                     event_key,
                     severity="warning",
                     summary="Quick input target window no longer exists.",
-                    context=context,
+                    context={"hwnd": hwnd},
                 )
                 self.last_external_hwnd = None
-                self._quick_input_target = None
                 self._show_quick_input_failure_notice(
                     event_key,
                     "The previously selected input window is no longer available.",
                 )
                 return False
 
-            target_thread_id = int(target.get("thread_id") or self._quick_input_thread_for_window(hwnd)[0] or 0)
-            if target_thread_id and not target.get("focus_hwnd") and not target.get("caret_hwnd"):
-                target.update(self._read_gui_thread_info(target_thread_id))
-
-            attached_threads = self._attach_quick_input_threads(target_thread_id)
-            try:
-                user32.ShowWindow(hwnd, SW_RESTORE)
-                user32.BringWindowToTop(hwnd)
-                user32.SetActiveWindow(hwnd)
-                restored = bool(user32.SetForegroundWindow(hwnd))
-                if not restored:
-                    self._send_alt_focus_nudge()
-                    restored = bool(user32.SetForegroundWindow(hwnd))
-                self._focus_quick_input_child(target)
-            finally:
-                self._detach_quick_input_threads(attached_threads)
-
-            foreground_ok = self._wait_for_quick_input_foreground(hwnd)
-            if not foreground_ok:
-                self._send_alt_focus_nudge()
-                attached_threads = self._attach_quick_input_threads(target_thread_id)
-                try:
-                    user32.ShowWindow(hwnd, SW_RESTORE)
-                    user32.BringWindowToTop(hwnd)
-                    restored = bool(user32.SetForegroundWindow(hwnd)) or bool(restored)
-                    self._focus_quick_input_child(target)
-                finally:
-                    self._detach_quick_input_threads(attached_threads)
-                foreground_ok = self._wait_for_quick_input_foreground(hwnd, timeout_s=0.35)
-
-            if not foreground_ok:
-                event_key = "runtime.quick_input_target_restore_failed"
-                context = self._quick_input_target_context(target)
-                context.update(
-                    {
-                        "last_error": int(ctypes.get_last_error()),
-                        "foreground_hwnd": _hwnd_to_int(user32.GetForegroundWindow()),
-                        "restored": bool(restored),
-                        "foreground_ok": bool(foreground_ok),
-                    }
-                )
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            restored = bool(user32.SetForegroundWindow(hwnd))
+            if not restored:
                 _runtime_log_event(
-                    event_key,
+                    "runtime.quick_input_target_restore_best_effort_failed",
                     severity="warning",
-                    summary="Quick input could not restore the previous target window before sending text.",
-                    context=context,
+                    summary="Windows did not confirm quick input target foreground restore; continuing with best-effort input.",
+                    context={"hwnd": hwnd, "last_error": int(ctypes.get_last_error())},
                 )
-                self._show_quick_input_failure_notice(
-                    event_key,
-                    "Flowgrid could not return focus to the selected text box before sending the Input Sequence.",
-                )
-                return False
-            attached_threads = self._attach_quick_input_threads(target_thread_id)
-            try:
-                self._focus_quick_input_child(target)
-            finally:
-                self._detach_quick_input_threads(attached_threads)
-            time.sleep(0.08)
+            time.sleep(0.05)
             return True
         except Exception as exc:
             event_key = "runtime.quick_input_target_restore_failed"
             _runtime_log_event(
                 event_key,
                 severity="warning",
-                summary="Failed restoring the previous target window before sending quick input.",
+                summary="Failed restoring the previous target window before sending quick input; continuing best-effort.",
                 exc=exc,
-                context=self._quick_input_target_context(target),
+                context={"hwnd": hwnd},
             )
-            self._show_quick_input_failure_notice(
-                event_key,
-                "Flowgrid hit an error while restoring the selected input target.",
-            )
-            return False
+            return True
 
     def _is_shift_pressed(self) -> bool:
         return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -4430,26 +4128,22 @@ class QuickInputsWindow(QMainWindow):
             return self._open_app_target(str(script_path))
         return False
 
-    def _send_keyboard_sequence(self, events: list[tuple[int, bool]], context_label: str) -> bool:
+    def _send_ctrl_v(self) -> bool:
         if os.name != "nt" or user32 is None:
             return False
-        if not events:
-            return True
         try:
-            for vk_code, key_up in events:
-                flags = KEYEVENTF_KEYUP if key_up else 0
-                if int(vk_code) in EXTENDED_KEY_CODES:
-                    flags |= KEYEVENTF_EXTENDEDKEY
-                user32.keybd_event(int(vk_code), 0, flags, 0)
-                time.sleep(0.01)
+            user32.keybd_event(VK_CONTROL, 0, 0, 0)
+            user32.keybd_event(VK_V, 0, 0, 0)
+            user32.keybd_event(VK_V, 0, KEYEVENTF_KEYUP, 0)
+            user32.keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0)
             return True
         except Exception as exc:
             _runtime_log_event(
                 "runtime.quick_input_keybd_event_failed",
                 severity="critical",
-                summary="Quick input failed while sending synthetic keystrokes.",
+                summary="Quick input failed while sending Ctrl+V.",
                 exc=exc,
-                context={"context": str(context_label or ""), "event_count": len(events)},
+                context={"context": "ctrl_v"},
             )
             for cleanup_vk in (VK_CONTROL, VK_SHIFT, VK_ALT):
                 try:
@@ -4457,17 +4151,6 @@ class QuickInputsWindow(QMainWindow):
                 except Exception:
                     pass
             return False
-
-    def _send_ctrl_v(self) -> bool:
-        return self._send_keyboard_sequence(
-            [
-                (VK_CONTROL, False),
-                (VK_V, False),
-                (VK_V, True),
-                (VK_CONTROL, True),
-            ],
-            "ctrl_v",
-        )
 
     def _send_key(self, key_code: int, shift_held: bool = False, alt_held: bool = False) -> bool:
         """Send a single key press with optional modifiers."""
@@ -4483,14 +4166,34 @@ class QuickInputsWindow(QMainWindow):
         if key_code == VK_ENTER:
             key_code = VK_RETURN
 
-        events: list[tuple[int, bool]] = []
-        for mod in modifiers:
-            events.append((mod, False))
-        events.append((key_code, False))
-        events.append((key_code, True))
-        for mod in reversed(modifiers):
-            events.append((mod, True))
-        return self._send_keyboard_sequence(events, f"key:{int(key_code)}")
+        pressed_modifiers: list[int] = []
+        try:
+            for mod in modifiers:
+                user32.keybd_event(mod, 0, 0, 0)
+                pressed_modifiers.append(mod)
+            user32.keybd_event(key_code, 0, 0, 0)
+            user32.keybd_event(key_code, 0, KEYEVENTF_KEYUP, 0)
+            for mod in reversed(pressed_modifiers):
+                user32.keybd_event(mod, 0, KEYEVENTF_KEYUP, 0)
+            return True
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_keybd_event_failed",
+                severity="critical",
+                summary="Quick input failed while sending a synthetic key.",
+                exc=exc,
+                context={
+                    "key_code": int(key_code),
+                    "shift_held": bool(shift_held),
+                    "alt_held": bool(alt_held),
+                },
+            )
+            for cleanup_vk in [key_code, *pressed_modifiers, VK_CONTROL, VK_SHIFT, VK_ALT]:
+                try:
+                    user32.keybd_event(int(cleanup_vk), 0, KEYEVENTF_KEYUP, 0)
+                except Exception:
+                    pass
+            return False
 
     @staticmethod
     def _append_input_sequence_text(commands: list[dict[str, Any]], text: str) -> None:
@@ -4516,10 +4219,32 @@ class QuickInputsWindow(QMainWindow):
             handled = False
             if ":" in content:
                 cmd_type, cmd_value = content.split(":", 1)
-                if cmd_type.strip().lower() == "delay":
-                    raw_delay = cmd_value.strip()
+                cmd_name = cmd_type.strip().lower()
+                raw_value = cmd_value.strip()
+                if cmd_name == "type":
+                    commands.append({"action": "type", "text": cmd_value})
+                    handled = True
+                elif cmd_name == "key":
+                    key_name = raw_value.lower()
+                    if key_name in KEY_CODES:
+                        commands.append({"action": "key", "key": "enter" if key_name == "return" else key_name})
+                        handled = True
+                elif cmd_name == "press":
+                    parts = [part.strip().lower() for part in raw_value.split(",") if part.strip()]
+                    key_name = parts[0] if parts else ""
+                    if key_name in KEY_CODES:
+                        commands.append(
+                            {
+                                "action": "key",
+                                "key": "enter" if key_name == "return" else key_name,
+                                "shift": "shift" in parts[1:],
+                                "alt": "alt" in parts[1:],
+                            }
+                        )
+                        handled = True
+                elif cmd_name == "delay":
                     try:
-                        delay_ms = int(raw_delay)
+                        delay_ms = int(raw_value)
                         if 0 <= delay_ms <= 60000:
                             commands.append({"action": "delay", "ms": delay_ms})
                             handled = True
@@ -4528,7 +4253,7 @@ class QuickInputsWindow(QMainWindow):
                                 "runtime.input_sequence_delay_out_of_range",
                                 severity="warning",
                                 summary="Input Sequence delay command was outside the supported 0-60000 ms range and will be pasted literally.",
-                                context={"raw_value": raw_delay},
+                                context={"raw_value": raw_value},
                             )
                     except ValueError as exc:
                         _runtime_log_event(
@@ -4536,15 +4261,12 @@ class QuickInputsWindow(QMainWindow):
                             severity="warning",
                             summary="Invalid Input Sequence delay command value; command will be pasted literally.",
                             exc=exc,
-                            context={"raw_value": raw_delay},
+                            context={"raw_value": raw_value},
                         )
             else:
                 cmd_name = content.lower()
-                if cmd_name == "tab":
-                    commands.append({"action": "key", "key": "tab"})
-                    handled = True
-                elif cmd_name in {"enter", "return"}:
-                    commands.append({"action": "key", "key": "enter"})
+                if cmd_name in KEY_CODES:
+                    commands.append({"action": "key", "key": "enter" if cmd_name == "return" else cmd_name})
                     handled = True
 
             if not handled:
