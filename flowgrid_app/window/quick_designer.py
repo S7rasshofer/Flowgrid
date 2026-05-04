@@ -1280,6 +1280,9 @@ class QuickLayoutDialog(QDialog):
         p = self.app_window.palette_data
         bg = rgba_css(p["shell_overlay"], 0.92)
         border = shift(p["control_bg"], -0.30)
+        button_disabled_bg = rgba_css(blend(p["control_bg"], p["button_bg"], 0.18), 0.90)
+        button_disabled_text = rgba_css(p["label_text"], 0.48)
+        button_disabled_border = rgba_css(shift(p["control_bg"], -0.18), 0.95)
         self.setStyleSheet(
             "QDialog {"
             f"background: {bg};"
@@ -1307,7 +1310,7 @@ class QuickLayoutDialog(QDialog):
             "border-radius: 3px;"
             "}"
             "QPushButton {"
-            f"background-color: {rgba_css(p['button_bg'], 0.78)};"
+            f"background-color: {rgba_css(p['button_bg'], 1.0)};"
             f"color: {p['button_text']};"
             f"border: 1px solid {shift(p['button_bg'], -0.40)};"
             "border-radius: 4px;"
@@ -1317,9 +1320,14 @@ class QuickLayoutDialog(QDialog):
             "font-weight: 700;"
             "}"
             "QPushButton[actionRole='save'] {"
-            f"background-color: {rgba_css(p['accent'], 0.78)};"
+            f"background-color: {rgba_css(p['accent'], 1.0)};"
             f"color: {readable_text(p['accent'])};"
             f"border: 1px solid {shift(p['accent'], -0.42)};"
+            "}"
+            "QPushButton:disabled {"
+            f"background-color: {button_disabled_bg};"
+            f"color: {button_disabled_text};"
+            f"border: 1px solid {button_disabled_border};"
             "}"
         )
         self.canvas.setStyleSheet(
@@ -1822,8 +1830,11 @@ class ImageLayersDialog(QDialog):
         input_bg = rgba_css(p["input_bg"], 0.86)
         border = shift(p["control_bg"], -0.30)
         field_border = shift(p["input_bg"], -0.38)
-        button_bg = rgba_css(p["button_bg"], 0.78)
-        button_hover = rgba_css(shift(p["button_bg"], 0.08), 0.86)
+        button_bg = rgba_css(p["button_bg"], 1.0)
+        button_hover = rgba_css(shift(p["button_bg"], 0.08), 1.0)
+        button_disabled_bg = rgba_css(blend(p["control_bg"], p["button_bg"], 0.18), 0.90)
+        button_disabled_text = rgba_css(p["label_text"], 0.48)
+        button_disabled_border = rgba_css(shift(p["control_bg"], -0.18), 0.95)
         self.setStyleSheet(
             "QDialog {"
             f"background: {dialog_bg};"
@@ -1857,14 +1868,19 @@ class ImageLayersDialog(QDialog):
             "}"
             f"QPushButton:hover {{ background: {button_hover}; }}"
             "QPushButton[actionRole='add'] {"
-            f"background-color: {rgba_css(p['primary'], 0.78)};"
+            f"background-color: {rgba_css(p['primary'], 1.0)};"
             f"color: {readable_text(p['primary'])};"
             f"border: 1px solid {shift(p['primary'], -0.42)};"
             "}"
             "QPushButton[actionRole='reset'] {"
-            f"background-color: {rgba_css(p['accent'], 0.78)};"
+            f"background-color: {rgba_css(p['accent'], 1.0)};"
             f"color: {readable_text(p['accent'])};"
             f"border: 1px solid {shift(p['accent'], -0.42)};"
+            "}"
+            "QPushButton:disabled {"
+            f"background-color: {button_disabled_bg};"
+            f"color: {button_disabled_text};"
+            f"border: 1px solid {button_disabled_border};"
             "}"
         )
         self.preview.setStyleSheet(

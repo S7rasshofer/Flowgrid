@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -234,11 +236,48 @@ QUICK_ACTION_OPEN_URL = "open_url"
 QUICK_ACTION_OPEN_APP = "open_app"
 QUICK_ACTIONS = {QUICK_ACTION_INPUT_SEQUENCE, QUICK_ACTION_OPEN_URL, QUICK_ACTION_OPEN_APP}
 LEGACY_QUICK_INPUT_ACTIONS = {"paste_text", "macro_sequence"}
+ULONG_PTR = getattr(wintypes, "ULONG_PTR", wintypes.WPARAM)
+
+
+def _configure_user32_api(user32_api: Any) -> None:
+    try:
+        user32_api.GetForegroundWindow.argtypes = []
+        user32_api.GetForegroundWindow.restype = wintypes.HWND
+        user32_api.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32_api.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32_api.IsWindow.argtypes = [wintypes.HWND]
+        user32_api.IsWindow.restype = wintypes.BOOL
+        user32_api.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32_api.ShowWindow.restype = wintypes.BOOL
+        user32_api.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32_api.SetForegroundWindow.restype = wintypes.BOOL
+        user32_api.keybd_event.argtypes = [
+            wintypes.BYTE,
+            wintypes.BYTE,
+            wintypes.DWORD,
+            ULONG_PTR,
+        ]
+        user32_api.keybd_event.restype = None
+    except Exception as exc:
+        _runtime_log_event(
+            "runtime.user32_api_config_failed",
+            severity="warning",
+            summary="Failed configuring Windows keyboard/focus API bindings; quick input automation may be unreliable.",
+            exc=exc,
+        )
+
 
 if os.name == "nt":
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
-    except Exception:
+        _configure_user32_api(user32)
+    except Exception as exc:
+        _runtime_log_event(
+            "runtime.user32_load_failed",
+            severity="warning",
+            summary="Failed loading Windows keyboard/focus API; quick input automation will be disabled.",
+            exc=exc,
+        )
         user32 = None
 else:
     user32 = None
@@ -332,6 +371,9 @@ class QuickInputsWindow(QMainWindow):
         self._startup_update_check_started = False
         self._pending_update_info: dict[str, Any] = {}
         self._install_status_cache: dict[str, Any] = current_install_status()
+        self._local_commit_comments_cache_loaded = False
+        self._local_commit_comments_cache = ""
+        self._local_commit_comments_warning_logged = False
         self._shutdown_in_progress = False
         self._shutdown_completed = False
         self._shutdown_had_issues = False
@@ -470,7 +512,7 @@ class QuickInputsWindow(QMainWindow):
         self.switch_page("quick")
 
         self._foreground_timer = QTimer(self)
-        self._foreground_timer.setInterval(260)
+        self._foreground_timer.setInterval(160)
         self._foreground_timer.timeout.connect(self._capture_external_target)
         self._foreground_timer.start()
 
@@ -2426,10 +2468,6 @@ class QuickInputsWindow(QMainWindow):
 
         self.always_on_top_check = QCheckBox("Always on top")
         self.always_on_top_check.setToolTip("Keep the main Flowgrid shell above normal windows.")
-        self.compact_mode_check = QCheckBox("Compact mode")
-        self.compact_mode_check.setToolTip(
-            "Use tighter spacing and smaller control padding across Flowgrid and popup windows."
-        )
         self.sidebar_right_switch = QCheckBox()
         self.sidebar_right_switch.setProperty("switch", True)
         self.sidebar_right_switch.setTristate(False)
@@ -2439,7 +2477,6 @@ class QuickInputsWindow(QMainWindow):
         self.sidebar_switch_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.sidebar_switch_status.setMinimumWidth(170)
         layout.addWidget(self.always_on_top_check)
-        layout.addWidget(self.compact_mode_check)
         sidebar_row = QHBoxLayout()
         sidebar_row.setContentsMargins(0, 0, 0, 0)
         sidebar_row.setSpacing(6)
@@ -2469,39 +2506,6 @@ class QuickInputsWindow(QMainWindow):
         icon_row.addWidget(self.clear_icon_button)
         icon_row.addStretch(1)
         layout.addLayout(icon_row)
-
-        updates_title = QLabel("Updates")
-        updates_title.setProperty("section", True)
-        layout.addWidget(updates_title)
-        self.channel_mode_status_label = QLabel("")
-        self.channel_mode_status_label.setProperty("muted", True)
-        self.channel_mode_status_label.setWordWrap(True)
-        layout.addWidget(self.channel_mode_status_label)
-
-        self.update_commit_status_label = QLabel("Installed commit: -")
-        self.update_commit_status_label.setProperty("muted", True)
-        self.update_check_status_label = QLabel("Update status: Not checked yet.")
-        self.update_check_status_label.setProperty("muted", True)
-        self.shared_assets_status_label = QLabel("Shared assets: Not synced yet.")
-        self.shared_assets_status_label.setProperty("muted", True)
-        layout.addWidget(self.update_commit_status_label)
-        layout.addWidget(self.update_check_status_label)
-        layout.addWidget(self.shared_assets_status_label)
-
-        update_actions_row = QHBoxLayout()
-        update_actions_row.setContentsMargins(0, 0, 0, 0)
-        update_actions_row.setSpacing(6)
-        self.check_updates_button = QPushButton("Check for Updates")
-        self.install_update_button = QPushButton("Install Update")
-        self.pull_shared_assets_button = QPushButton("Pull Shared Assets")
-        self.check_updates_button.setProperty("actionRole", "pick")
-        self.install_update_button.setProperty("actionRole", "save")
-        self.pull_shared_assets_button.setProperty("actionRole", "pick")
-        self.install_update_button.setEnabled(False)
-        update_actions_row.addWidget(self.check_updates_button, 1)
-        update_actions_row.addWidget(self.install_update_button, 1)
-        update_actions_row.addWidget(self.pull_shared_assets_button, 1)
-        layout.addLayout(update_actions_row)
         layout.addStretch(1)
 
         self.opacity_slider.valueChanged.connect(self.on_opacity_changed)
@@ -2509,10 +2513,77 @@ class QuickInputsWindow(QMainWindow):
         self.hover_fade_in_slider.valueChanged.connect(self.on_hover_settings_changed)
         self.hover_fade_out_slider.valueChanged.connect(self.on_hover_settings_changed)
         self.always_on_top_check.toggled.connect(self.on_settings_changed)
-        self.compact_mode_check.toggled.connect(self.on_settings_changed)
         self.sidebar_right_switch.toggled.connect(self.on_sidebar_position_changed)
         self.pick_icon_button.clicked.connect(self.pick_custom_icon)
         self.clear_icon_button.clicked.connect(self.clear_custom_icon)
+        return tab
+
+    def _build_updates_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 6, 8, 8)
+        layout.setSpacing(8)
+
+        updates_title = QLabel("Updates")
+        updates_title.setProperty("section", True)
+        layout.addWidget(updates_title)
+
+        updates_form = QFormLayout()
+        updates_form.setContentsMargins(0, 0, 0, 0)
+        updates_form.setHorizontalSpacing(8)
+        updates_form.setVerticalSpacing(7)
+        updates_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        self.channel_mode_status_label = QLabel("")
+        self.channel_mode_status_label.setProperty("muted", True)
+        self.channel_mode_status_label.setWordWrap(True)
+
+        self.update_commit_status_label = QLabel("-")
+        self.update_commit_status_label.setProperty("muted", True)
+        self.update_check_status_label = QLabel("Not checked yet.")
+        self.update_check_status_label.setProperty("muted", True)
+        self.update_check_status_label.setWordWrap(True)
+        self.shared_assets_status_label = QLabel("Not synced yet.")
+        self.shared_assets_status_label.setProperty("muted", True)
+        self.shared_assets_status_label.setWordWrap(True)
+        updates_form.addRow("Channel", self.channel_mode_status_label)
+        updates_form.addRow("Installed", self.update_commit_status_label)
+        updates_form.addRow("Update", self.update_check_status_label)
+        updates_form.addRow("Assets", self.shared_assets_status_label)
+        layout.addLayout(updates_form)
+
+        comments_title = QLabel("Last Commit Comments")
+        comments_title.setProperty("section", True)
+        layout.addWidget(comments_title)
+
+        self.last_commit_comments_label = QLabel("Not available until an update check records commit metadata.")
+        self.last_commit_comments_label.setProperty("muted", True)
+        self.last_commit_comments_label.setWordWrap(True)
+        self.last_commit_comments_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.last_commit_comments_label.setMinimumHeight(62)
+        self.last_commit_comments_label.setMaximumHeight(94)
+        self.last_commit_comments_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.last_commit_comments_label)
+
+        update_actions_grid = QGridLayout()
+        update_actions_grid.setContentsMargins(0, 0, 0, 0)
+        update_actions_grid.setHorizontalSpacing(6)
+        update_actions_grid.setVerticalSpacing(6)
+        update_actions_grid.setColumnStretch(0, 1)
+        update_actions_grid.setColumnStretch(1, 1)
+        self.check_updates_button = QPushButton("Check for Updates")
+        self.install_update_button = QPushButton("Install Update")
+        self.pull_shared_assets_button = QPushButton("Pull Shared Assets")
+        self.check_updates_button.setProperty("actionRole", "pick")
+        self.install_update_button.setProperty("actionRole", "save")
+        self.pull_shared_assets_button.setProperty("actionRole", "pick")
+        self.install_update_button.setEnabled(False)
+        update_actions_grid.addWidget(self.check_updates_button, 0, 0)
+        update_actions_grid.addWidget(self.install_update_button, 0, 1)
+        update_actions_grid.addWidget(self.pull_shared_assets_button, 1, 0, 1, 2)
+        layout.addLayout(update_actions_grid)
+        layout.addStretch(1)
+
         self.check_updates_button.clicked.connect(self.on_check_updates_clicked)
         self.install_update_button.clicked.connect(self.on_install_update_clicked)
         self.pull_shared_assets_button.clicked.connect(self.on_pull_shared_assets_clicked)
@@ -2539,6 +2610,98 @@ class QuickInputsWindow(QMainWindow):
         branch = str(self.runtime_options.branch or "main").strip() or "main"
         return f"GitHub {branch}"
 
+    def _load_local_git_commit_comments(self) -> str:
+        if self._local_commit_comments_cache_loaded:
+            return self._local_commit_comments_cache
+        self._local_commit_comments_cache_loaded = True
+
+        repo_root = _local_data_root()
+        if not (repo_root / ".git").exists():
+            self._local_commit_comments_cache = ""
+            return ""
+
+        run_kwargs: dict[str, Any] = {
+            "cwd": str(repo_root),
+            "capture_output": True,
+            "text": True,
+            "timeout": 2.5,
+        }
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        try:
+            completed = subprocess.run(["git", "log", "-1", "--format=%s%n%b"], **run_kwargs)
+        except Exception as exc:
+            if not self._local_commit_comments_warning_logged:
+                self._local_commit_comments_warning_logged = True
+                _runtime_log_event(
+                    "update.local_git_commit_comments_failed",
+                    severity="warning",
+                    summary="Failed reading local Git commit comments for the Updates tab.",
+                    exc=exc,
+                    context={"repo_root": str(repo_root)},
+                )
+            self._local_commit_comments_cache = ""
+            return ""
+
+        if int(completed.returncode) != 0:
+            if not self._local_commit_comments_warning_logged:
+                self._local_commit_comments_warning_logged = True
+                _runtime_log_event(
+                    "update.local_git_commit_comments_failed",
+                    severity="warning",
+                    summary="Local Git commit comments command returned a non-zero exit code.",
+                    context={
+                        "repo_root": str(repo_root),
+                        "returncode": int(completed.returncode),
+                        "stderr": str(completed.stderr or "").strip()[:800],
+                    },
+                )
+            self._local_commit_comments_cache = ""
+            return ""
+
+        self._local_commit_comments_cache = str(completed.stdout or "").strip()
+        return self._local_commit_comments_cache
+
+    def _update_commit_comments_text(self) -> str:
+        local_comments = self._load_local_git_commit_comments()
+        if local_comments:
+            return local_comments
+
+        remote_comments = str(self._install_status_cache.get("last_remote_commit_message") or "").strip()
+        if remote_comments:
+            return remote_comments
+
+        installed_comments = str(self._install_status_cache.get("installed_commit_message") or "").strip()
+        if installed_comments:
+            return installed_comments
+
+        return "Not available until an update check records commit metadata."
+
+    @staticmethod
+    def _compact_update_comments(text: str, *, max_lines: int = 5, max_chars: int = 420) -> str:
+        normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not normalized:
+            return "Not available until an update check records commit metadata."
+
+        lines = [line.rstrip() for line in normalized.splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        truncated = False
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            truncated = True
+        compact = "\n".join(lines).strip()
+        if len(compact) > max_chars:
+            compact = compact[: max(0, max_chars - 3)].rstrip()
+            truncated = True
+        if truncated:
+            compact = f"{compact}\n..."
+        return compact or "Not available until an update check records commit metadata."
+
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -2551,12 +2714,15 @@ class QuickInputsWindow(QMainWindow):
         main_tab_bar = self.settings_tabs.tabBar()
         main_tab_bar.setObjectName("SettingsMainTabBar")
         main_tab_bar.setElideMode(Qt.TextElideMode.ElideNone)
-        self.settings_tabs.addTab(self._wrap_scrollable_page(self._build_app_settings_tab()), "Settings")
+        self.settings_tabs.addTab(self._build_app_settings_tab(), "Settings")
+        self.settings_tabs.addTab(self._build_updates_tab(), "Updates")
         self.settings_tabs.addTab(self._build_theme_page(), "Themes")
         self.settings_tabs.setTabIcon(0, self._resolve_standard_icon("SP_FileDialogDetailedView", "SP_FileIcon"))
-        self.settings_tabs.setTabIcon(1, self._resolve_standard_icon("SP_DirOpenIcon", "SP_FileIcon"))
+        self.settings_tabs.setTabIcon(1, self._resolve_standard_icon("SP_BrowserReload", "SP_FileDialogInfoView"))
+        self.settings_tabs.setTabIcon(2, self._resolve_standard_icon("SP_DirOpenIcon", "SP_FileIcon"))
         self.settings_tabs.setTabToolTip(0, "General app behavior and window controls.")
-        self.settings_tabs.setTabToolTip(1, "Theme colors, backgrounds, and popup styling.")
+        self.settings_tabs.setTabToolTip(1, "Update status, commit notes, and shared asset sync.")
+        self.settings_tabs.setTabToolTip(2, "Theme colors, backgrounds, and popup styling.")
         layout.addWidget(self.settings_tabs, 1)
         return page
 
@@ -2842,17 +3008,23 @@ class QuickInputsWindow(QMainWindow):
         slider_handle_margin = "-3px 0px" if compact_mode else "-4px 0px"
         sidebar_color = QColor(p["sidebar_overlay"])
         sidebar_color.setAlpha(125)
-        shared_button_bg = rgba_css(p["button_bg"], 0.75)  # 25% transparent for non-quick buttons.
-        shared_button_hover = rgba_css(shift(p["button_bg"], 0.08), 0.82)
+        shared_button_bg = rgba_css(p["button_bg"], 1.0)
+        shared_button_hover = rgba_css(shift(p["button_bg"], 0.08), 1.0)
+        shared_button_pressed = rgba_css(shift(p["button_bg"], -0.06), 1.0)
+        disabled_button_bg = rgba_css(blend(p["control_bg"], p["button_bg"], 0.18), 0.90)
+        disabled_button_text = rgba_css(p["label_text"], 0.48)
+        disabled_button_border = rgba_css(shift(p["control_bg"], -0.18), 0.95)
         add_base = p["primary"]
         apply_base = p["accent"]
         pick_base = blend(p["primary"], p["surface"], 0.45)
         save_base = blend(p["primary"], p["accent"], 0.22)
         new_base = blend(p["surface"], p["primary"], 0.35)
         reset_base = shift(p["surface"], -0.45)
-        title_min_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.20), 0.62)
-        title_min_border = rgba_css(shift(p["accent"], -0.42), 0.84)
-        title_min_hover = rgba_css(shift(blend(p["button_bg"], p["surface"], 0.20), 0.10), 0.76)
+        title_min_base = blend(p["button_bg"], p["surface"], 0.20)
+        title_min_bg = rgba_css(title_min_base, 0.92)
+        title_min_border = rgba_css(shift(p["accent"], -0.42), 0.95)
+        title_min_hover = rgba_css(shift(title_min_base, 0.10), 1.0)
+        title_min_text = readable_text(title_min_base)
         titlebar_bg = rgba_css(blend(p["shell_overlay"], p["surface"], 0.18), 0.84)
         title_badge_bg = rgba_css(blend(p["button_bg"], p["surface"], 0.15), 0.74)
         title_badge_border = rgba_css(shift(p["accent"], -0.42), 0.82)
@@ -2895,19 +3067,21 @@ class QuickInputsWindow(QMainWindow):
             "QToolButton#TitleMinButton {"
             f"background: {title_min_bg};"
             f"border: 1px solid {title_min_border};"
+            f"color: {title_min_text};"
             "border-radius: 11px;"
             "font-size: 12px;"
             "font-weight: 800;"
             "}"
             f"QToolButton#TitleMinButton:hover {{ background: {title_min_hover}; }}"
             "QToolButton#TitleCloseButton {"
-            "background: rgba(225,80,80,110);"
-            "border: 1px solid rgba(255,135,135,175);"
+            "background: rgba(225,80,80,220);"
+            "border: 1px solid rgba(255,135,135,235);"
+            "color: #FFFFFF;"
             "border-radius: 11px;"
             "font-size: 12px;"
             "font-weight: 800;"
             "}"
-            "QToolButton#TitleCloseButton:hover { background: rgba(235,95,95,155); }"
+            "QToolButton#TitleCloseButton:hover { background: rgba(235,95,95,240); }"
         )
 
         global_style = (
@@ -2998,37 +3172,42 @@ class QuickInputsWindow(QMainWindow):
             "font-weight: 700;"
             "}"
             f"QPushButton:hover {{ background-color: {shared_button_hover}; }}"
-            f"QPushButton:pressed {{ background-color: {shared_button_hover}; }}"
-            f"QPushButton:checked {{ background-color: {rgba_css(p['accent'], 0.78)}; color: {readable_text(p['accent'])}; border: 1px solid {shift(p['accent'], -0.42)}; }}"
+            f"QPushButton:pressed {{ background-color: {shared_button_pressed}; }}"
+            f"QPushButton:checked {{ background-color: {rgba_css(p['accent'], 1.0)}; color: {readable_text(p['accent'])}; border: 1px solid {shift(p['accent'], -0.42)}; }}"
             "QPushButton[actionRole='add'] {"
-            f"background-color: {rgba_css(add_base, 0.75)};"
+            f"background-color: {rgba_css(add_base, 1.0)};"
             f"color: {readable_text(add_base)};"
             f"border: 1px solid {shift(add_base, -0.42)};"
             "}"
             "QPushButton[actionRole='apply'] {"
-            f"background-color: {rgba_css(apply_base, 0.75)};"
+            f"background-color: {rgba_css(apply_base, 1.0)};"
             f"color: {readable_text(apply_base)};"
             f"border: 1px solid {shift(apply_base, -0.42)};"
             "}"
             "QPushButton[actionRole='pick'] {"
-            f"background-color: {rgba_css(pick_base, 0.75)};"
+            f"background-color: {rgba_css(pick_base, 1.0)};"
             f"color: {readable_text(pick_base)};"
             f"border: 1px solid {shift(pick_base, -0.42)};"
             "}"
             "QPushButton[actionRole='new'] {"
-            f"background-color: {rgba_css(new_base, 0.75)};"
+            f"background-color: {rgba_css(new_base, 1.0)};"
             f"color: {readable_text(new_base)};"
             f"border: 1px solid {shift(new_base, -0.42)};"
             "}"
             "QPushButton[actionRole='save'] {"
-            f"background-color: {rgba_css(save_base, 0.75)};"
+            f"background-color: {rgba_css(save_base, 1.0)};"
             f"color: {readable_text(save_base)};"
             f"border: 1px solid {shift(save_base, -0.42)};"
             "}"
             "QPushButton[actionRole='reset'] {"
-            f"background-color: {rgba_css(reset_base, 0.75)};"
+            f"background-color: {rgba_css(reset_base, 1.0)};"
             f"color: {readable_text(reset_base)};"
             f"border: 1px solid {shift(reset_base, -0.42)};"
+            "}"
+            "QPushButton:disabled {"
+            f"background-color: {disabled_button_bg};"
+            f"color: {disabled_button_text};"
+            f"border: 1px solid {disabled_button_border};"
             "}"
         )
         self.setStyleSheet(global_style)
@@ -3065,6 +3244,9 @@ class QuickInputsWindow(QMainWindow):
             opaque_button_hover = rgba_css(shift(p["button_bg"], 0.08), 1.0)
             opaque_button_pressed = rgba_css(shift(p["button_bg"], -0.06), 1.0)
             opaque_border = shift(p["button_bg"], -0.62)
+            depot_disabled_bg = rgba_css(blend(p["control_bg"], p["button_bg"], 0.18), 0.92)
+            depot_disabled_text = rgba_css(p["label_text"], 0.48)
+            depot_disabled_border = rgba_css(shift(p["control_bg"], -0.18), 0.95)
             depot_button_css = (
                 "QPushButton {"
                 f"background-color: {opaque_button_bg};"
@@ -3078,6 +3260,11 @@ class QuickInputsWindow(QMainWindow):
                 "}"
                 f"QPushButton:hover {{ background-color: {opaque_button_hover}; border: 2px solid {shift(opaque_border, -0.08)}; }}"
                 f"QPushButton:pressed {{ background-color: {opaque_button_pressed}; border: 2px solid {shift(opaque_border, -0.12)}; }}"
+                "QPushButton:disabled {"
+                f"background-color: {depot_disabled_bg};"
+                f"color: {depot_disabled_text};"
+                f"border: 2px solid {depot_disabled_border};"
+                "}"
             )
             self.depot_page.setStyleSheet(depot_button_css)
             self._refresh_depot_dashboard_combo_popup_width()
@@ -3788,18 +3975,79 @@ class QuickInputsWindow(QMainWindow):
         self._editing_index = None
         self.quick_editor_dialog.hide()
 
-    def _capture_external_target(self) -> None:
+    def _capture_external_target(self) -> bool:
         if os.name != "nt" or user32 is None:
-            return
+            return False
 
-        hwnd = user32.GetForegroundWindow()
-        if not hwnd:
-            return
+        try:
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return False
 
-        pid = ctypes.c_ulong(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value != os.getpid():
-            self.last_external_hwnd = int(hwnd)
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if int(pid.value) != int(os.getpid()):
+                self.last_external_hwnd = int(hwnd)
+                return True
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_target_capture_failed",
+                severity="warning",
+                summary="Failed capturing the external input target for quick input buttons.",
+                exc=exc,
+            )
+        return False
+
+    def _restore_quick_input_target(self) -> bool:
+        if os.name != "nt" or user32 is None:
+            _runtime_log_event(
+                "runtime.quick_input_platform_unsupported",
+                severity="warning",
+                summary="Quick input could not restore a target window because Windows keyboard automation is unavailable.",
+            )
+            return False
+
+        if not self.last_external_hwnd:
+            _runtime_log_event(
+                "runtime.quick_input_target_missing",
+                severity="warning",
+                summary="Quick input was requested before Flowgrid had captured an external input target.",
+            )
+            return False
+
+        hwnd = int(self.last_external_hwnd)
+        try:
+            if not user32.IsWindow(hwnd):
+                _runtime_log_event(
+                    "runtime.quick_input_target_invalid",
+                    severity="warning",
+                    summary="Quick input target window no longer exists.",
+                    context={"hwnd": hwnd},
+                )
+                self.last_external_hwnd = None
+                return False
+
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            restored = bool(user32.SetForegroundWindow(hwnd))
+            time.sleep(0.08)
+            if not restored:
+                _runtime_log_event(
+                    "runtime.quick_input_target_restore_failed",
+                    severity="warning",
+                    summary="Quick input could not restore the previous target window before sending text.",
+                    context={"hwnd": hwnd, "last_error": int(ctypes.get_last_error())},
+                )
+                return False
+            return True
+        except Exception as exc:
+            _runtime_log_event(
+                "runtime.quick_input_target_restore_failed",
+                severity="warning",
+                summary="Failed restoring the previous target window before sending quick input.",
+                exc=exc,
+                context={"hwnd": hwnd},
+            )
+            return False
 
     def _is_shift_pressed(self) -> bool:
         return bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
@@ -4035,28 +4283,8 @@ class QuickInputsWindow(QMainWindow):
 
     def _execute_macro_sequence(self, sequence: str, *, send_paste_keys: bool = True) -> None:
         """Execute a parsed input sequence."""
-        if send_paste_keys and (os.name != "nt" or user32 is None):
-            _runtime_log_event(
-                "runtime.input_sequence_platform_unsupported",
-                severity="warning",
-                summary="Input Sequence could not execute because Windows keyboard automation is unavailable.",
-            )
+        if send_paste_keys and not self._restore_quick_input_target():
             return
-
-        if send_paste_keys and self.last_external_hwnd:
-            hwnd = int(self.last_external_hwnd)
-            try:
-                user32.ShowWindow(hwnd, SW_RESTORE)
-                user32.SetForegroundWindow(hwnd)
-                time.sleep(0.05)
-            except Exception as exc:
-                _runtime_log_event(
-                    "runtime.input_sequence_restore_foreground_failed",
-                    severity="warning",
-                    summary="Failed restoring foreground window before executing input sequence.",
-                    exc=exc,
-                    context={"hwnd": hwnd},
-                )
 
         commands = self._parse_macro_sequence(sequence)
         needs_clipboard = any(cmd.get("action") == "type" and str(cmd.get("text", "")) for cmd in commands)
@@ -4726,13 +4954,16 @@ class QuickInputsWindow(QMainWindow):
         new_bg = blend(self.palette_data["primary"], button_bg, 0.45)
         new_border = shift(new_bg, -0.40)
         new_text = readable_text(new_bg)
-        button_bg_css = rgba_css(button_bg, 0.78)
-        button_hover_css = rgba_css(button_hover, 0.90)
-        button_pressed_css = rgba_css(button_pressed, 0.92)
-        save_bg_css = rgba_css(save_bg, 0.82)
-        new_bg_css = rgba_css(new_bg, 0.82)
-        pick_bg_css = rgba_css(pick_bg, 0.82)
-        reset_bg_css = rgba_css(reset_bg, 0.82)
+        button_bg_css = rgba_css(button_bg, 1.0)
+        button_hover_css = rgba_css(button_hover, 1.0)
+        button_pressed_css = rgba_css(button_pressed, 1.0)
+        save_bg_css = rgba_css(save_bg, 1.0)
+        new_bg_css = rgba_css(new_bg, 1.0)
+        pick_bg_css = rgba_css(pick_bg, 1.0)
+        reset_bg_css = rgba_css(reset_bg, 1.0)
+        disabled_button_bg = rgba_css(blend(field_bg, bg, 0.56), 0.92)
+        disabled_button_text = rgba_css(text, 0.46)
+        disabled_button_border = rgba_css(shift(field_bg, -0.28), 0.90)
         title_badge_bg = rgba_css(blend(header_bg, bg, 0.18), 0.82 if effective_transparent else 0.62)
         title_badge_border = rgba_css(shift(header_bg, -0.38), 0.90)
         checkbox_fill = rgba_css(blend(field_bg, bg, 0.16), 0.88 if effective_transparent else 0.94)
@@ -4843,19 +5074,19 @@ class QuickInputsWindow(QMainWindow):
             f"padding: {button_padding};"
             "}"
             "QPushButton#DepotFramelessCloseButton {"
-            "background-color: rgba(225,80,80,110);"
-            "border: 1px solid rgba(255,135,135,175);"
+            "background-color: rgba(225,80,80,220);"
+            "border: 1px solid rgba(255,135,135,235);"
             "border-radius: 11px;"
-            f"color: {readable_text('#E15050')};"
+            "color: #FFFFFF;"
             "font-size: 12px;"
             "font-weight: 800;"
             "padding: 0px;"
             "}"
             "QPushButton#DepotFramelessCloseButton:hover {"
-            "background-color: rgba(235,95,95,155);"
+            "background-color: rgba(235,95,95,240);"
             "}"
             "QPushButton#DepotFramelessCloseButton:pressed {"
-            "background-color: rgba(198,74,74,178);"
+            "background-color: rgba(198,74,74,240);"
             "}"
             "QPushButton:hover {"
             f"background-color: {button_hover_css};"
@@ -4882,6 +5113,11 @@ class QuickInputsWindow(QMainWindow):
             f"background-color: {reset_bg_css};"
             f"color: {reset_text};"
             f"border: 1px solid {reset_border};"
+            "}"
+            "QPushButton:disabled {"
+            f"background-color: {disabled_button_bg};"
+            f"color: {disabled_button_text};"
+            f"border: 1px solid {disabled_button_border};"
             "}"
             )
         )
@@ -5283,6 +5519,7 @@ class QuickInputsWindow(QMainWindow):
         updater_path = str(self._install_status_cache.get("local_updater_path") or "").strip()
         update_summary = str(self._install_status_cache.get("last_check_summary") or "").strip() or "Not checked yet."
         asset_summary = str(self._install_status_cache.get("last_shared_asset_sync_summary") or "").strip() or "Not synced yet."
+        commit_comments = self._update_commit_comments_text()
 
         if self._update_check_in_progress:
             update_summary = f"Checking {source_label} for updates..."
@@ -5290,18 +5527,21 @@ class QuickInputsWindow(QMainWindow):
             asset_summary = "Syncing shared assets..."
 
         if hasattr(self, "channel_mode_status_label"):
-            mode_text = f"Channel: {channel_display_name} | Data mode: {'Read-only snapshot' if read_only_db else 'Read/write shared root'}"
+            mode_text = f"{channel_display_name} | {'Read-only snapshot' if read_only_db else 'Read/write shared root'}"
             if snapshot_source_root and read_only_db:
                 mode_text += f" | Snapshot source: {snapshot_source_root}"
             self.channel_mode_status_label.setText(mode_text)
             self.channel_mode_status_label.setToolTip(updater_path or mode_text)
         if hasattr(self, "update_commit_status_label"):
-            self.update_commit_status_label.setText(f"Installed commit: {installed_short}")
+            self.update_commit_status_label.setText(installed_short)
             self.update_commit_status_label.setToolTip(updater_path or "Local updater path unavailable.")
         if hasattr(self, "update_check_status_label"):
-            self.update_check_status_label.setText(f"Update status: {update_summary}")
+            self.update_check_status_label.setText(update_summary)
         if hasattr(self, "shared_assets_status_label"):
-            self.shared_assets_status_label.setText(f"Shared assets: {asset_summary}")
+            self.shared_assets_status_label.setText(asset_summary)
+        if hasattr(self, "last_commit_comments_label"):
+            self.last_commit_comments_label.setText(self._compact_update_comments(commit_comments))
+            self.last_commit_comments_label.setToolTip(commit_comments)
 
         pending_update = bool(self._pending_update_info.get("can_install"))
         if hasattr(self, "check_updates_button"):
@@ -5491,7 +5731,6 @@ class QuickInputsWindow(QMainWindow):
         self.hover_fade_in_slider.blockSignals(True)
         self.hover_fade_out_slider.blockSignals(True)
         self.always_on_top_check.blockSignals(True)
-        self.compact_mode_check.blockSignals(True)
         self.sidebar_right_switch.blockSignals(True)
 
         opacity = float(clamp(float(self.config.get("window_opacity", 1.0)), 0.0, 1.0))
@@ -5507,7 +5746,6 @@ class QuickInputsWindow(QMainWindow):
         self.hover_fade_in_value.setText(f"{fade_in_s}s")
         self.hover_fade_out_value.setText(f"{fade_out_s}s")
         self.always_on_top_check.setChecked(bool(self.config.get("always_on_top", False)))
-        self.compact_mode_check.setChecked(bool(self.config.get("compact_mode", True)))
         self.sidebar_right_switch.setChecked(bool(self.config.get("sidebar_on_right", False)))
 
         self.opacity_slider.blockSignals(False)
@@ -5515,14 +5753,12 @@ class QuickInputsWindow(QMainWindow):
         self.hover_fade_in_slider.blockSignals(False)
         self.hover_fade_out_slider.blockSignals(False)
         self.always_on_top_check.blockSignals(False)
-        self.compact_mode_check.blockSignals(False)
         self.sidebar_right_switch.blockSignals(False)
         self._refresh_sidebar_switch_caption()
         self._refresh_update_status_labels()
 
     def on_settings_changed(self) -> None:
         self.config["always_on_top"] = bool(self.always_on_top_check.isChecked())
-        self.config["compact_mode"] = bool(self.compact_mode_check.isChecked())
         self._apply_window_flags()
         self.apply_theme_styles()
         self.refresh_all_views()
@@ -5765,6 +6001,7 @@ class QuickInputsWindow(QMainWindow):
         super().resizeEvent(event)
 
     def enterEvent(self, event) -> None:  # noqa: N802
+        self._capture_external_target()
         self._hover_inside = True
         self._hover_delay_timer.stop()
         self._popup_leave_timer.stop()

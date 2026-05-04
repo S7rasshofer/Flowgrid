@@ -104,11 +104,17 @@ def _default_install_state() -> dict[str, Any]:
         "read_only_db": bool(channel_defaults.get("read_only_db", False)),
         "snapshot_source_root": str(channel_defaults.get("snapshot_source_root") or ""),
         "installed_commit_sha": "",
+        "installed_git_commit_sha": "",
+        "installed_commit_message": "",
+        "installed_commit_url": "",
         "installed_at_utc": "",
         "last_check_at_utc": "",
         "last_check_status": "",
         "last_check_summary": "",
         "last_remote_commit_sha": "",
+        "last_remote_git_commit_sha": "",
+        "last_remote_commit_message": "",
+        "last_remote_commit_url": "",
         "last_shared_asset_sync_at_utc": "",
         "last_shared_asset_sync_status": "",
         "last_shared_asset_sync_summary": "",
@@ -306,6 +312,60 @@ def _build_github_contents_url(owner: str, repo_name: str, relative_path: str, b
     return f"https://api.github.com/repos/{owner}/{repo_name}/contents?ref={encoded_branch}"
 
 
+def _build_github_commit_url(owner: str, repo_name: str, branch: str) -> str:
+    encoded_branch = quote(_normalize_branch(branch), safe="")
+    return f"https://api.github.com/repos/{owner}/{repo_name}/commits/{encoded_branch}"
+
+
+def _normalize_commit_message(value: Any) -> str:
+    message = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return message[:4000]
+
+
+def _fetch_branch_commit_metadata(
+    *,
+    repo_url: str,
+    branch: str,
+    timeout_seconds: float = UPDATE_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    owner, repo_name = _split_github_repo_parts(repo_url)
+    payload = _json_request(_build_github_commit_url(owner, repo_name, branch), timeout_seconds=timeout_seconds)
+    if not isinstance(payload, dict):
+        raise RuntimeError("GitHub commit metadata returned an unexpected payload.")
+    commit = payload.get("commit")
+    commit = commit if isinstance(commit, dict) else {}
+    message = _normalize_commit_message(commit.get("message"))
+    return {
+        "git_commit_sha": str(payload.get("sha") or "").strip(),
+        "git_short_sha": _short_sha(payload.get("sha", "")),
+        "commit_message": message,
+        "commit_html_url": str(payload.get("html_url") or "").strip(),
+    }
+
+
+def _try_fetch_branch_commit_metadata(
+    *,
+    repo_url: str,
+    branch: str,
+    timeout_seconds: float = UPDATE_TIMEOUT_SECONDS,
+) -> dict[str, str]:
+    try:
+        return _fetch_branch_commit_metadata(
+            repo_url=repo_url,
+            branch=branch,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as exc:
+        _runtime_log_event(
+            "update.commit_metadata_fetch_failed",
+            severity="warning",
+            summary="Failed fetching GitHub commit metadata; update checks will continue without commit comments.",
+            exc=exc,
+            context={"repo_url": str(repo_url), "branch": str(branch)},
+        )
+        return {}
+
+
 def _fetch_repo_tree(
     *,
     repo_url: str,
@@ -422,13 +482,20 @@ def _fetch_remote_revision_info(
     if not managed_files:
         raise RuntimeError("Repository listing returned no managed runtime files.")
     sha = _calculate_repo_revision(managed_files)
-    return {
+    metadata = _try_fetch_branch_commit_metadata(
+        repo_url=resolved_repo_url,
+        branch=resolved_branch,
+        timeout_seconds=timeout_seconds,
+    )
+    result = {
         "repo_url": resolved_repo_url,
         "branch": resolved_branch,
         "sha": sha,
         "short_sha": _short_sha(sha),
         "file_count": len(managed_files),
     }
+    result.update(metadata)
+    return result
 
 
 def fetch_remote_commit_info(
@@ -448,7 +515,12 @@ def fetch_remote_commit_info(
     if not managed_files:
         raise RuntimeError("Repository listing returned no managed runtime files.")
     sha = _calculate_repo_revision(managed_files)
-    return {
+    metadata = _try_fetch_branch_commit_metadata(
+        repo_url=resolved_repo_url,
+        branch=resolved_branch,
+        timeout_seconds=timeout_seconds,
+    )
+    result = {
         "repo_url": resolved_repo_url,
         "branch": resolved_branch,
         "sha": sha,
@@ -456,6 +528,8 @@ def fetch_remote_commit_info(
         "files": managed_files,
         "file_count": len(managed_files),
     }
+    result.update(metadata)
+    return result
 
 
 def check_for_updates(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dict[str, Any]:
@@ -486,16 +560,26 @@ def check_for_updates(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
             status = "update_available"
             summary = f"Remote {source_label} revision {remote['short_sha']} is available; local install version is unknown."
             can_install = True
-        state.update(
-            {
-                "repo_url": remote["repo_url"],
-                "branch": remote["branch"],
-                "last_check_at_utc": checked_at,
-                "last_check_status": status,
-                "last_check_summary": summary,
-                "last_remote_commit_sha": remote["sha"],
-            }
-        )
+        state_update = {
+            "repo_url": remote["repo_url"],
+            "branch": remote["branch"],
+            "last_check_at_utc": checked_at,
+            "last_check_status": status,
+            "last_check_summary": summary,
+            "last_remote_commit_sha": remote["sha"],
+            "last_remote_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+            "last_remote_commit_message": _normalize_commit_message(remote.get("commit_message")),
+            "last_remote_commit_url": str(remote.get("commit_html_url") or "").strip(),
+        }
+        if status == "up_to_date":
+            state_update.update(
+                {
+                    "installed_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+                    "installed_commit_message": _normalize_commit_message(remote.get("commit_message")),
+                    "installed_commit_url": str(remote.get("commit_html_url") or "").strip(),
+                }
+            )
+        state.update(state_update)
         save_install_state(state)
         return {
             "status": status,
@@ -508,6 +592,9 @@ def check_for_updates(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
             "installed_commit_sha": installed_sha,
             "remote_commit_sha": remote["sha"],
             "remote_short_sha": remote["short_sha"],
+            "remote_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+            "remote_commit_message": _normalize_commit_message(remote.get("commit_message")),
+            "remote_commit_url": str(remote.get("commit_html_url") or "").strip(),
             "repo_url": remote["repo_url"],
             "branch": remote["branch"],
             "update_source_label": source_label,
@@ -537,6 +624,9 @@ def check_for_updates(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
             "installed_commit_sha": str(state.get("installed_commit_sha") or "").strip(),
             "remote_commit_sha": str(state.get("last_remote_commit_sha") or "").strip(),
             "remote_short_sha": _short_sha(state.get("last_remote_commit_sha", "")),
+            "remote_git_commit_sha": str(state.get("last_remote_git_commit_sha") or "").strip(),
+            "remote_commit_message": _normalize_commit_message(state.get("last_remote_commit_message")),
+            "remote_commit_url": str(state.get("last_remote_commit_url") or "").strip(),
             "repo_url": str(state.get("repo_url", DEFAULT_REPO_URL)),
             "branch": str(state.get("branch", DEFAULT_REPO_BRANCH)),
             "update_source_label": source_label,
@@ -798,6 +888,9 @@ def _apply_repo_manifest(
             "repo_url": str(remote_info.get("repo_url") or DEFAULT_REPO_URL).strip() or DEFAULT_REPO_URL,
             "branch": str(remote_info.get("branch") or DEFAULT_REPO_BRANCH).strip() or DEFAULT_REPO_BRANCH,
             "installed_commit_sha": str(remote_info.get("sha") or "").strip(),
+            "installed_git_commit_sha": str(remote_info.get("git_commit_sha") or "").strip(),
+            "installed_commit_message": _normalize_commit_message(remote_info.get("commit_message")),
+            "installed_commit_url": str(remote_info.get("commit_html_url") or "").strip(),
             "installed_at_utc": _utc_now_iso(),
             "last_check_at_utc": _utc_now_iso(),
             "last_check_status": "up_to_date",
@@ -806,6 +899,9 @@ def _apply_repo_manifest(
                 f"{_update_source_label(previous_state)} at {remote_info.get('short_sha', '')}."
             ),
             "last_remote_commit_sha": str(remote_info.get("sha") or "").strip(),
+            "last_remote_git_commit_sha": str(remote_info.get("git_commit_sha") or "").strip(),
+            "last_remote_commit_message": _normalize_commit_message(remote_info.get("commit_message")),
+            "last_remote_commit_url": str(remote_info.get("commit_html_url") or "").strip(),
             REPO_MANAGED_HASHES_KEY: new_manifest,
         }
     )
@@ -859,6 +955,12 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
                 "last_check_status": "up_to_date",
                 "last_check_summary": pre_sync_summary,
                 "last_remote_commit_sha": str(remote.get("sha") or "").strip(),
+                "last_remote_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+                "last_remote_commit_message": _normalize_commit_message(remote.get("commit_message")),
+                "last_remote_commit_url": str(remote.get("commit_html_url") or "").strip(),
+                "installed_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+                "installed_commit_message": _normalize_commit_message(remote.get("commit_message")),
+                "installed_commit_url": str(remote.get("commit_html_url") or "").strip(),
             }
         )
         save_install_state(state)
@@ -874,6 +976,9 @@ def apply_repo_update(*, timeout_seconds: float = UPDATE_TIMEOUT_SECONDS) -> dic
                 "last_check_status": "up_to_date",
                 "last_check_summary": final_summary,
                 "last_remote_commit_sha": str(remote.get("sha") or "").strip(),
+                "last_remote_git_commit_sha": str(remote.get("git_commit_sha") or "").strip(),
+                "last_remote_commit_message": _normalize_commit_message(remote.get("commit_message")),
+                "last_remote_commit_url": str(remote.get("commit_html_url") or "").strip(),
             }
         )
         save_install_state(final_state)
@@ -1138,11 +1243,19 @@ def current_install_status() -> dict[str, Any]:
         "branch": str(state.get("branch", DEFAULT_REPO_BRANCH)),
         "installed_commit_sha": str(state.get("installed_commit_sha") or "").strip(),
         "installed_short_sha": _short_sha(state.get("installed_commit_sha", "")),
+        "installed_git_commit_sha": str(state.get("installed_git_commit_sha") or "").strip(),
+        "installed_git_short_sha": _short_sha(state.get("installed_git_commit_sha", "")),
+        "installed_commit_message": _normalize_commit_message(state.get("installed_commit_message")),
+        "installed_commit_url": str(state.get("installed_commit_url") or "").strip(),
         "last_check_at_utc": str(state.get("last_check_at_utc") or "").strip(),
         "last_check_status": str(state.get("last_check_status") or "").strip(),
         "last_check_summary": str(state.get("last_check_summary") or "").strip(),
         "last_remote_commit_sha": str(state.get("last_remote_commit_sha") or "").strip(),
         "last_remote_short_sha": _short_sha(state.get("last_remote_commit_sha", "")),
+        "last_remote_git_commit_sha": str(state.get("last_remote_git_commit_sha") or "").strip(),
+        "last_remote_git_short_sha": _short_sha(state.get("last_remote_git_commit_sha", "")),
+        "last_remote_commit_message": _normalize_commit_message(state.get("last_remote_commit_message")),
+        "last_remote_commit_url": str(state.get("last_remote_commit_url") or "").strip(),
         "last_shared_asset_sync_at_utc": str(state.get("last_shared_asset_sync_at_utc") or "").strip(),
         "last_shared_asset_sync_status": str(state.get("last_shared_asset_sync_status") or "").strip(),
         "last_shared_asset_sync_summary": str(state.get("last_shared_asset_sync_summary") or "").strip(),
